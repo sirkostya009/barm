@@ -1,0 +1,74 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # style nitpicks that fight this codebase's conventions rather than catch bugs
+    - varnamelen # short receiver/loop names are the norm here (db, tx, q, k, v)
+    - ireturn # builders and terminals intentionally return concrete types
+    - exhaustruct # most structs here are built incrementally, not literal-initialized
+    - exhaustruct_v5
+    - wsl # whitespace/blank-line style is too aggressive for this code
+    - wsl_v5
+    - nlreturn
+    - gochecknoglobals # schema cache, stmt cache etc. are legitimate package-level state
+    - depguard # zero-dependency policy is already enforced structurally, not per-import
+    - gomodguard # superseded by gomodguard_v2, kept disabled to silence the deprecation warning
+    - tagliatelle # struct tags follow db/sql conventions, not JSON casing rules
+    - exhaustive # switches over dialect/op kinds intentionally have defaults
+    - testpackage # internal tests (_internal_test.go) are intentional for unexported coverage
+    - godox # TODO/FIXME comments are fine to leave in place
+    - lll # long lines happen in generated SQL builders; not worth enforcing
+    - cyclop # reflect-based scan/build code is inherently branchy
+    - gocyclo
+    - gocognit
+    - funlen
+    - nestif
+    - dupl # builder methods legitimately look similar across select/insert/update/delete
+    - wrapcheck # this package wraps database/sql; passing its errors through unwrapped is the point
+    - err113 # errors.New with a "barm: ..." prefix is this package's static-error convention
+    - nonamedreturns # named returns are used deliberately here for godoc clarity
+    - funcorder # unexported helpers are grouped near their callers, not alphabetized by export status
+    - inamedparam # generic/adapter interfaces here intentionally leave params unnamed
+    - mnd # bases (10) and hash constants are not "magic numbers" needing named constants
+    - testableexamples # examples in example_test.go are illustrative, not meant to have Output: blocks
+    - embeddedstructfieldcheck # embedding order here follows logical grouping, not this rule
+    - contextcheck # false positives on Begin/Run helpers that intentionally derive their own context
+    - containedctx # session intentionally carries a context by design
+    - dogsled # multi-value test assertions with blank identifiers are fine
+    - godoclint # exported-comment format nitpicks disabled alongside revive's exported rule
+    - goconst # forcing shared constants onto incidentally-equal test literals adds indirection, not clarity
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true # keep default godoc comments optional for now
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
