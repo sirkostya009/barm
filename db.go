@@ -147,6 +147,10 @@ func (h Handle) Delete[T any]() *DeleteQuery[T] { return newDelete[T](h.runner()
 // NewRaw starts a hand-written query on whatever this handle wraps.
 func (h Handle) NewRaw(query string, args ...any) *RawQuery { return newRaw(h.runner(), query, args) }
 
+// Values renders rows as a VALUES list, for a CTE or a subquery. See
+// [ValuesQuery].
+func (h Handle) Values[T any](rows []T) *ValuesQuery[T] { return newValues(h.runner(), rows) }
+
 // Option configures a DB.
 type Option func(*DB)
 
@@ -245,6 +249,10 @@ func (db *DB) Delete[T any]() *DeleteQuery[T] { return newDelete[T](db.runner())
 // Reading rows is Select's job — Table and ColumnExpr take SQL barm does not
 // parse, and they come back typed.
 func (db *DB) NewRaw(query string, args ...any) *RawQuery { return newRaw(db.runner(), query, args) }
+
+// Values renders rows as a VALUES list, for a CTE or a subquery. See
+// [ValuesQuery].
+func (db *DB) Values[T any](rows []T) *ValuesQuery[T] { return newValues(db.runner(), rows) }
 
 // Batch starts a batch on this DB, sent on whichever connection the pool hands
 // out for it.

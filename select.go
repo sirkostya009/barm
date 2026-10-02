@@ -185,7 +185,7 @@ func (q *SelectQuery[T]) Where(expr string, args ...any) *SelectQuery[T] {
 }
 
 func (q *SelectQuery[T]) WhereOr(expr string, args ...any) *SelectQuery[T] {
-	q.wheres = append(q.wheres, frag{sql: expr, args: args, or: true})
+	q.wheres = append(q.wheres, frag{sql: expr, args: args, kind: fragOr})
 	return q
 }
 

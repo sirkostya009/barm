@@ -3734,3 +3734,33 @@ func TestArrayTag(t *testing.T) {
 		}
 	}
 }
+
+// SQLite takes UPDATE … FROM a VALUES list too, uncast: its columns have no
+// fixed types to match.
+func TestUpdateFromValuesSQLite(t *testing.T) {
+	ctx := t.Context()
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/from.db", barm.SQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Insert[User]().Values(&User{Name: "ann", Age: 1}, &User{Name: "bo", Age: 2}).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	type change struct {
+		Name string `barm:"name"`
+		Age  int    `barm:"age"`
+	}
+	q := db.Update[User]().With("data", db.Values([]change{{"ann", 10}, {"bo", 20}})).From("data").
+		Set("age = data.age").Where("users.name = data.name")
+	if _, err := q.Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ages, err := db.Select[int]().Table("users").Column("age").OrderBy("name").Slice(ctx)
+	if err != nil || !slices.Equal(ages, []int{10, 20}) {
+		t.Errorf("ages = %v, %v", ages, err)
+	}
+}

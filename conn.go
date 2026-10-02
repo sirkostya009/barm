@@ -47,6 +47,10 @@ func (c *Conn) Delete[T any]() *DeleteQuery[T] { return newDelete[T](c.runner())
 // NewRaw starts a hand-written query on this connection.
 func (c *Conn) NewRaw(query string, args ...any) *RawQuery { return newRaw(c.runner(), query, args) }
 
+// Values renders rows as a VALUES list, for a CTE or a subquery. See
+// [ValuesQuery].
+func (c *Conn) Values[T any](rows []T) *ValuesQuery[T] { return newValues(c.runner(), rows) }
+
 // Exec runs SQL as written on this connection, in the driver's own placeholders.
 func (c *Conn) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	r := c.runner()

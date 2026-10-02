@@ -35,7 +35,7 @@ func newDelete[T any](r runner) *DeleteQuery[T] {
 // WHERE of any other shape could match anything, and a wrong guess is worse than
 // none.
 func (q *DeleteQuery[T]) rowHint() int64 {
-	if len(q.wheres) == 1 && q.wheres[0].pk {
+	if len(q.wheres) == 1 && q.wheres[0].pk() {
 		return 1
 	}
 	return 0
@@ -107,13 +107,21 @@ func (q *DeleteQuery[T]) Value(v *T) *DeleteQuery[T] {
 	return q
 }
 
+// Using adds a table the delete matches rows against, as SQL written out,
+// joined to the deleted table by Where: Using("data") for a CTE. Several are
+// listed in order.
+func (q *DeleteQuery[T]) Using(expr string, args ...any) *DeleteQuery[T] {
+	q.wheres = append(q.wheres, frag{sql: expr, args: args, kind: fragFrom})
+	return q
+}
+
 func (q *DeleteQuery[T]) Where(expr string, args ...any) *DeleteQuery[T] {
 	q.wheres = append(q.wheres, frag{sql: expr, args: args})
 	return q
 }
 
 func (q *DeleteQuery[T]) WhereOr(expr string, args ...any) *DeleteQuery[T] {
-	q.wheres = append(q.wheres, frag{sql: expr, args: args, or: true})
+	q.wheres = append(q.wheres, frag{sql: expr, args: args, kind: fragOr})
 	return q
 }
 
@@ -122,7 +130,7 @@ func (q *DeleteQuery[T]) WhereOr(expr string, args ...any) *DeleteQuery[T] {
 // row only if its version still matches. The key is read when the query is
 // built, so Value may come after.
 func (q *DeleteQuery[T]) WherePK() *DeleteQuery[T] {
-	q.wheres = append(q.wheres, frag{pk: true})
+	q.wheres = append(q.wheres, frag{kind: fragPK})
 	return q
 }
 
@@ -177,7 +185,7 @@ func (q *DeleteQuery[T]) argCount() int {
 	n := q.withClause.argCount()
 	for _, f := range q.wheres {
 		n += len(f.args)
-		if f.pk {
+		if f.pk() {
 			n += len(q.model.pks)
 		}
 	}
@@ -201,6 +209,7 @@ func (q *DeleteQuery[T]) render(b *builder) error {
 		return err
 	}
 	b.str("DELETE FROM ").table(q.schema, q.tableName())
+	b.from(" USING ", q.wheres)
 	err = b.where(q.wheres, q.model, q.value)
 	if err != nil {
 		return err

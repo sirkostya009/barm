@@ -144,6 +144,7 @@ type User struct {
 | `nullzero`                   | field                    | a zero value is written as `NULL`, and `NULL` reads back as the zero value                           |
 | `json`                       | field                    | the value is stored encoded as JSON (see [JSON columns](#json-columns))                              |
 | `array`                      | field                    | a slice is stored as a Postgres array (see [Array columns](#array-columns))                          |
+| `type:sqltype`               | field                    | the type a `VALUES` list casts the column to (see [Other tables](#writing-from-other-tables))        |
 | `scanonly`                   | field                    | a column a query computes: never written or selected by default (see below)                          |
 | `skipupdate`                 | field                    | left out of an update built from `Value`, for columns maintained elsewhere; `Column` still writes it |
 | `rel:parent_col=child_col`   | field                    | a relation, not a column (see [Relations](#relations))                                               |
@@ -562,6 +563,54 @@ for row, err := range db.Delete[User]().Where("stale").Seq(ctx) { ... } // too m
   parse.
 - **`Seq` on a write** streams the returned rows. The write has already happened when the
   first row arrives, so breaking early stops the reading, not the write.
+
+### Writing from other tables
+
+`From` adds a table an `UPDATE` reads from, and `Using` one a `DELETE` matches against. Both
+take SQL as written, like `Join`, and the condition joining them goes in `Where`:
+
+```go
+db.Update[User]().From("teams AS t").Set("plan = t.plan").Where("users.team_id = t.id").Exec(ctx)
+db.Delete[User]().Using("bans AS b").Where("users.email = b.email").Exec(ctx)
+```
+
+The table is often a `VALUES` list of your own rows. `Values` builds one from a slice of
+structs, one column per tagged field, and as a CTE it names those columns:
+
+```go
+type rename struct {
+	ID   int64  `barm:"id"`
+	Name string `barm:"name"`
+}
+
+db.Update[User]().
+	With("data", db.Values(renames)).
+	From("data").
+	Set("name = data.name").
+	Where("users.id = data.id").
+	Exec(ctx)
+// WITH "data" ("id", "name") AS (VALUES ($1::bigint, $2::text), ($3, $4))
+// UPDATE "users" SET name = data.name FROM data WHERE users.id = data.id
+```
+
+- **The first row is cast, on Postgres.** Postgres reads an untyped parameter in a
+  `VALUES` list as `text`, and the first row fixes each column's type. Without a cast an
+  integer column could not be compared with `users.id`, and pgx could not send an `int64`
+  for it at all. Each field is cast to the type its Go type maps to: integers to
+  `smallint`, `integer`, `bigint` or `numeric` by size, `string` to `text`, `bool`,
+  floats, `time.Time` to `timestamptz`, `[]byte` to `bytea`, `json` fields to `jsonb`,
+  slices to arrays, and `sql.Null*` types to what they hold.
+- **`type:` overrides it**, and covers what barm cannot map — a `driver.Valuer` of your own,
+  a struct, a map. Such a field without the tag stays uncast:
+
+    ```go
+    ID [16]byte `barm:"id,type:uuid"`
+    ```
+
+- **SQLite and MySQL get no casts.** Neither needs one.
+- **`Values` goes wherever a query does**, a subquery included:
+  `Where("(id, name) IN (?)", db.Values(pairs))`.
+- **An empty slice is an error**: `VALUES` with no rows does not parse.
 
 ## Reusing and composing queries
 
@@ -1237,6 +1286,7 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 | relation keys             | `= ANY($1)`    | `IN (?, ?, ...)`     | `IN (?, ?, ...)`         |
 | `DEFAULT` inside `VALUES` | yes            | yes                  | no, the tag's expression |
 | `OFFSET` without `LIMIT`  | as is          | adds the max `LIMIT` | adds `LIMIT -1`          |
+| first `VALUES` row        | cast           | as is                | as is                    |
 
 `Dialect` is an interface, so you can supply your own.
 
@@ -1244,11 +1294,7 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 
 What barm does not do yet, for anyone coming from bun:
 
-- **Postgres array columns on `database/sql`.** On pgx's pool they read and write natively.
-  Through `database/sql`, the driver hands an array over as text, which a `[]int64` field
-  cannot take.
-- **Statement shapes:** `UPDATE … FROM`, `DELETE … USING`, `INSERT … SELECT`, a `VALUES` list
-  built from structs, multi-row update and delete by key, `DISTINCT ON`.
+- **Statement shapes:** `INSERT … SELECT`, multi-row update and delete by key, `DISTINCT ON`.
 - **Grouped conditions.** `WhereOr` joins at the top level, so a parenthesized `OR` group
   goes in a single `Where` string.
 - **Identifier and raw-SQL arguments**, bun's `Ident` and `Safe`.

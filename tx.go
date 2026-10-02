@@ -206,6 +206,10 @@ func (tx *Tx) Delete[T any]() *DeleteQuery[T] { return newDelete[T](tx.runner())
 // NewRaw starts a hand-written query on this transaction.
 func (tx *Tx) NewRaw(query string, args ...any) *RawQuery { return newRaw(tx.runner(), query, args) }
 
+// Values renders rows as a VALUES list, for a CTE or a subquery. See
+// [ValuesQuery].
+func (tx *Tx) Values[T any](rows []T) *ValuesQuery[T] { return newValues(tx.runner(), rows) }
+
 // Batch starts a batch inside this transaction, so the queued queries are part
 // of it and roll back with it.
 func (tx *Tx) Batch() *Batch { return newBatch(tx.tx, &tx.session, true, true) }

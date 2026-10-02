@@ -44,6 +44,9 @@ type field struct {
 	json bool
 	// array stores a slice as a Postgres array literal, and parses it back.
 	array bool
+	// cast is the SQL type a VALUES list casts the column to: from `type:`, or
+	// else from the Go type, empty when there is none to infer.
+	cast string
 	// scanonly is a column a query computes rather than one the table has.
 	scanonly bool
 	// skipupdate keeps the column out of an update built from a value, for
@@ -260,7 +263,7 @@ func (m *model) collect(t reflect.Type, index []int) {
 			def = autoDefault
 		}
 		m.fields = append(m.fields, field{
-			name: tag, index: idx, def: def, pk: opts.pk, auto: opts.auto, nullzero: opts.null, json: opts.json, array: opts.array, scanonly: opts.read, skipupdate: opts.keep,
+			name: tag, index: idx, def: def, pk: opts.pk, auto: opts.auto, nullzero: opts.null, json: opts.json, array: opts.array, cast: castOf(sf.Type, opts), scanonly: opts.read, skipupdate: opts.keep,
 		})
 	}
 }
@@ -308,8 +311,9 @@ type tagOpts struct {
 	null  bool // nullzero
 	json  bool
 	array bool
-	read  bool // scanonly
-	keep  bool // skipupdate
+	typ   string // type:
+	read  bool   // scanonly
+	keep  bool   // skipupdate
 }
 
 // parseTag splits `name,opt,opt:value`. The name is the leading part when it
@@ -343,6 +347,8 @@ func parseTag(tag string) (name string, opts tagOpts) {
 			opts.json = true
 		case "array":
 			opts.array = true
+		case "type":
+			opts.typ = v
 		case "scanonly":
 			opts.read = true
 		case "skipupdate":

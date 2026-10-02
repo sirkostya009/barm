@@ -34,6 +34,10 @@ type Dialect interface {
 	// and MySQL take OFFSET only as part of a LIMIT clause. Empty where OFFSET
 	// stands alone.
 	NoLimit() string
+	// AppendCast appends a cast of what was just written to the SQL type typ,
+	// or nothing where a VALUES list needs none. Postgres reads an untyped
+	// parameter in one as text, so its first row is cast to the columns' types.
+	AppendCast(b []byte, typ string) []byte
 }
 
 type postgres struct{}
@@ -65,6 +69,10 @@ func (sqlite) HasAnyArray() bool   { return false }
 func (postgres) NoLimit() string { return "" }
 func (mysql) NoLimit() string    { return "18446744073709551615" } // the largest BIGINT UNSIGNED, as MySQL's manual spells it
 func (sqlite) NoLimit() string   { return "-1" }
+
+func (postgres) AppendCast(b []byte, typ string) []byte { return append(append(b, "::"...), typ...) }
+func (mysql) AppendCast(b []byte, _ string) []byte      { return b }
+func (sqlite) AppendCast(b []byte, _ string) []byte     { return b }
 
 func (postgres) HasDefaultKeyword() bool { return true }
 func (mysql) HasDefaultKeyword() bool    { return true }

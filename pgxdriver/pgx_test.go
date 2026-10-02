@@ -2609,3 +2609,102 @@ func TestArrayTagOnPgx(t *testing.T) {
 		})
 	}
 }
+
+type ageChange struct {
+	Name  string    `barm:"name"`
+	Age   int       `barm:"age"`
+	Since time.Time `barm:"since"`
+}
+
+// An update reading a VALUES list matches its rows by columns that are not all
+// text, as tms's do: the first row's casts give them their types, so pgx can
+// encode them however the statement runs.
+func TestUpdateFromValuesOnPgx(t *testing.T) {
+	ctx := t.Context()
+	since := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		db   func(*testing.T) *barm.DB
+	}{
+		{"pgx default", func(t *testing.T) *barm.DB { return open(t) }},
+		{"exec mode", func(t *testing.T) *barm.DB { return openDSN(t, dsn(), 0, execMode) }},
+		{"database/sql", func(t *testing.T) *barm.DB {
+			sqldb, err := sql.Open("pgx", dsn())
+			if err != nil {
+				t.Fatal(err)
+			}
+			db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.Postgres)
+			t.Cleanup(func() { db.Close() })
+			if _, err := db.Exec(ctx, `DROP TABLE IF EXISTS batch_users`); err != nil {
+				t.Skipf("no postgres: %v", err)
+			}
+			if _, err := db.Exec(ctx, `CREATE TABLE batch_users (id bigserial PRIMARY KEY, name text NOT NULL,
+				email text NOT NULL, age int NOT NULL, created_at timestamptz NOT NULL)`); err != nil {
+				t.Fatal(err)
+			}
+			return db
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := tc.db(t)
+			seed(t, db)
+			update := func(changes []ageChange) *barm.UpdateQuery[User] {
+				return db.Update[User]().
+					With("data", db.Values(changes)).
+					From("data").
+					Set("age = data.age, created_at = data.since").
+					Where("batch_users.name = data.name AND batch_users.age < data.age")
+			}
+			if _, err := update([]ageChange{{"ann", 21, since}, {"bo", 1, since}}).Exec(ctx); err != nil {
+				t.Fatalf("plain: %v", err)
+			}
+			if _, err := update([]ageChange{{"bo", 31, since}}).Prepare("upd_from").Exec(ctx); err != nil {
+				t.Fatalf("prepared: %v", err)
+			}
+			b := db.Batch()
+			r := b.Exec(update([]ageChange{{"cy", 41, since}, {"nobody", 1, since}}))
+			if err := b.Run(ctx); err != nil {
+				t.Fatalf("batch: %v", err)
+			}
+			if r.Value().RowsAffected != 1 {
+				t.Errorf("batch updated %d rows", r.Value().RowsAffected)
+			}
+			us, err := db.Select[User]().OrderBy("name").Slice(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, want := range []int{21, 31, 41} {
+				if us[i].Age != want || !us[i].CreatedAt.Equal(since) {
+					t.Errorf("%s: age %d at %v, want %d at %v", us[i].Name, us[i].Age, us[i].CreatedAt, want, since)
+				}
+			}
+		})
+	}
+}
+
+// A delete matches a VALUES list on two columns at once, as tms deletes custom
+// field values by test case and version.
+func TestDeleteUsingValuesOnPgx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	type key struct {
+		Name string `barm:"name"`
+		Age  int    `barm:"age"`
+	}
+	res, err := db.Delete[User]().
+		With("data", db.Values([]key{{"ann", 20}, {"bo", 99}, {"cy", 40}})).
+		Using("data").
+		Where("batch_users.name = data.name AND batch_users.age = data.age").
+		Exec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 2 {
+		t.Errorf("deleted %d rows, want ann and cy", n)
+	}
+	left, err := db.Select[User]().Slice(ctx)
+	if err != nil || len(left) != 1 || left[0].Name != "bo" {
+		t.Errorf("left %+v, %v", left, err)
+	}
+}

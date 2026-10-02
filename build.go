@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -19,9 +20,26 @@ import (
 type frag struct {
 	sql  string
 	args []any
-	or   bool // for WHERE/HAVING groups
-	pk   bool // where WherePK sits among the conditions
+	// One byte rather than a bool each: frags pass by value, and every field
+	// takes a register of its own, so a third bool alone measured 6% slower
+	// on a select's build.
+	kind fragKind
 }
+
+type fragKind uint8
+
+const (
+	fragOr fragKind = 1 << iota // joined to the one before with OR, in WHERE/HAVING
+	fragPK                      // where WherePK sits among the conditions
+	// fragFrom is a table an UPDATE reads FROM, or a DELETE USING, kept among
+	// the assignments or the conditions rather than in a slice of its own,
+	// which would grow the builder past its size class.
+	fragFrom
+)
+
+func (f frag) or() bool   { return f.kind&fragOr != 0 }
+func (f frag) pk() bool   { return f.kind&fragPK != 0 }
+func (f frag) from() bool { return f.kind&fragFrom != 0 }
 
 // builder accumulates SQL text and bind arguments.
 type builder struct {
@@ -244,11 +262,15 @@ func (b *builder) frag(f frag) *builder {
 	next := 0
 
 	for i := 0; i < len(f.sql); i++ {
-		c := f.sql[i]
-		if c != '?' {
-			b.b = append(b.b, c)
-			continue
+		// Text up to the next marker goes in one append: a byte at a time was
+		// the hottest loop of a build.
+		j := strings.IndexByte(f.sql[i:], '?')
+		if j < 0 {
+			b.b = append(b.b, f.sql[i:]...)
+			break
 		}
+		b.b = append(b.b, f.sql[i:i+j]...)
+		i += j
 		if i+1 < len(f.sql) && f.sql[i+1] == '?' {
 			b.b = append(b.b, '?')
 			i++
@@ -406,7 +428,7 @@ func (b *builder) conds(kw string, conds []frag) *builder { //nolint:unparam // 
 // around it, out of a tenant filter, say.
 func (b *builder) cond(i int, c frag, wrap bool) {
 	if i > 0 {
-		if c.or {
+		if c.or() {
 			b.str(" OR ")
 		} else {
 			b.str(" AND ")
@@ -424,13 +446,24 @@ func (b *builder) cond(i int, c frag, wrap bool) {
 // is written straight into the builder rather than as fragments, which would
 // need their text and argument lists allocated per key.
 func (b *builder) where(conds []frag, m *model, v reflect.Value) error {
-	if len(conds) == 0 {
+	n := len(conds)
+	for _, c := range conds {
+		if c.from() {
+			n--
+		}
+	}
+	if n == 0 {
 		return errors.New("barm: no WHERE clause — say which rows, with Where or WherePK")
 	}
 	b.str(" WHERE ")
-	for i, c := range conds {
-		if !c.pk {
-			b.cond(i, c, len(conds) > 1)
+	i := -1
+	for _, c := range conds {
+		if c.from() {
+			continue
+		}
+		i++
+		if !c.pk() {
+			b.cond(i, c, n > 1)
 			continue
 		}
 		if !v.IsValid() {
@@ -440,14 +473,14 @@ func (b *builder) where(conds []frag, m *model, v reflect.Value) error {
 			return fmt.Errorf("barm: WherePK needs a primary key, and %s has none", m.typ)
 		}
 		if i > 0 {
-			if c.or {
+			if c.or() {
 				b.str(" OR ")
 			} else {
 				b.str(" AND ")
 			}
 		}
 		// A composite key is several conditions, kept together beside others.
-		wrap := len(m.pks) > 1 && len(conds) > 1
+		wrap := len(m.pks) > 1 && n > 1
 		if wrap {
 			b.byte('(')
 		}
@@ -465,6 +498,23 @@ func (b *builder) where(conds []frag, m *model, v reflect.Value) error {
 		}
 	}
 	return nil
+}
+
+// from writes the tables marked from among fs, after kw, if there are any.
+func (b *builder) from(kw string, fs []frag) {
+	n := 0
+	for _, f := range fs {
+		if !f.from() {
+			continue
+		}
+		if n == 0 {
+			b.str(kw)
+		} else {
+			b.str(", ")
+		}
+		b.frag(f)
+		n++
+	}
 }
 
 // returning writes a RETURNING clause, if there is one.
@@ -540,7 +590,11 @@ func (b *builder) with(w withClause) error {
 			b.frag(c.expr)
 			continue
 		}
-		b.ident(c.name).str(" AS (")
+		b.ident(c.name)
+		if v, ok := c.sub.(interface{ withColumns(*builder) }); ok {
+			v.withColumns(b)
+		}
+		b.str(" AS (")
 		err := c.sub.render(b)
 		if err != nil {
 			return err

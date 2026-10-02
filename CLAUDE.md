@@ -42,6 +42,7 @@ allocations are — that reasoning has been wrong here before.
 | `hook.go`                                       | `QueryHook`, `TxHook`                                             |
 | `dialect.go`                                    | `Dialect` and the three built-ins                                 |
 | `array.go`                                      | Postgres array literals, for the `array` tag                      |
+| `values.go`                                     | `ValuesQuery` — a VALUES list from structs, and its casts         |
 | `stmt.go`                                       | statement names, and `database/sql`'s prepared statement cache    |
 
 A method starting a query on a handle (`Select`, `NewRaw`, `Batch`, …) lives in
@@ -114,6 +115,15 @@ reports both only in modes that type every argument: under exec mode or the
 simple protocol a plain query's arguments go untyped, and pgx can neither tell a
 map is JSON nor encode a slice of slices.
 
+A `VALUES` list casts its first row on Postgres, to the field's `type:` tag or
+else the type its Go type maps to: an untyped parameter there is `text`, which
+no join to a non-text column survives, and which pgx refuses to encode an
+`int64` for. The mapping is computed once per field, with the model.
+
+`From` and `Using` tables ride in the update's `sets` and the delete's `wheres`,
+flagged in `frag.kind`, rather than in slices of their own that would push the
+builders past their size class.
+
 Struct size is part of performance: a builder that grows past an allocator size
 class costs B/op on every query, and a B/op regression is a reason to rework or
 revert a change. Check `unsafe.Sizeof` before adding a field to a builder. A
@@ -149,7 +159,9 @@ check caught them. For anything about what reaches the database, watch the wire
 output.
 
 Benchmark differences of a few percent are below this machine's run-to-run
-noise. Compare two versions by building a test binary of each and interleaving
+noise, and code layout alone moves them further: adding code no benchmark calls
+has made a select build 8% slower. Before blaming a change for a few percent,
+benchmark the old version with only the new code added and nothing calling it. Compare two versions by building a test binary of each and interleaving
 their runs, then reading the result with `benchstat`; separate runs have shown
 10% swings that were not there.
 

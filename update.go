@@ -39,7 +39,7 @@ func newUpdate[T any](r runner) *UpdateQuery[T] {
 // WHERE of any other shape could match anything, and a wrong guess is worse than
 // none.
 func (q *UpdateQuery[T]) rowHint() int64 {
-	if len(q.wheres) == 1 && q.wheres[0].pk {
+	if len(q.wheres) == 1 && q.wheres[0].pk() {
 		return 1
 	}
 	return 0
@@ -125,6 +125,14 @@ func (q *UpdateQuery[T]) Column(names ...string) *UpdateQuery[T] {
 	return q
 }
 
+// From adds a table the update reads from, as SQL written out, joined to the
+// updated table by Where: From("data") for a CTE, From("teams AS t"). Several
+// are listed in order.
+func (q *UpdateQuery[T]) From(expr string, args ...any) *UpdateQuery[T] {
+	q.sets = append(q.sets, frag{sql: expr, args: args, kind: fragFrom})
+	return q
+}
+
 // Set adds a raw assignment, e.g. Set("hits = hits + ?", 1).
 func (q *UpdateQuery[T]) Set(expr string, args ...any) *UpdateQuery[T] {
 	q.sets = append(q.sets, frag{sql: expr, args: args})
@@ -137,7 +145,7 @@ func (q *UpdateQuery[T]) Where(expr string, args ...any) *UpdateQuery[T] {
 }
 
 func (q *UpdateQuery[T]) WhereOr(expr string, args ...any) *UpdateQuery[T] {
-	q.wheres = append(q.wheres, frag{sql: expr, args: args, or: true})
+	q.wheres = append(q.wheres, frag{sql: expr, args: args, kind: fragOr})
 	return q
 }
 
@@ -146,7 +154,7 @@ func (q *UpdateQuery[T]) WhereOr(expr string, args ...any) *UpdateQuery[T] {
 // that row only if its version still matches. The key is read when the query is
 // built, so Value may come after.
 func (q *UpdateQuery[T]) WherePK() *UpdateQuery[T] {
-	q.wheres = append(q.wheres, frag{pk: true})
+	q.wheres = append(q.wheres, frag{kind: fragPK})
 	return q
 }
 
@@ -246,6 +254,9 @@ func (q *UpdateQuery[T]) render(b *builder) error {
 		}
 	}
 	for _, s := range q.sets {
+		if s.from() {
+			continue
+		}
 		if n > 0 {
 			b.str(", ")
 		}
@@ -255,6 +266,7 @@ func (q *UpdateQuery[T]) render(b *builder) error {
 	if n == 0 {
 		return errors.New("barm: Update has nothing to set")
 	}
+	b.from(" FROM ", q.sets)
 
 	err = b.where(q.wheres, q.model, value)
 	if err != nil {
