@@ -421,7 +421,7 @@ func (q *InsertQuery[T]) scanReturning(rows Rows) (int64, error) {
 		return q.scanMatched(rows, p, len(cols))
 	}
 	dest := make([]any, len(cols))
-	hs := p.holders()
+	hs := p.holders(rows)
 	sink := new(any)
 
 	var n int64
@@ -487,7 +487,7 @@ func endsFold(s, suffix string) bool {
 // came back, and otherwise none do, rather than land in the wrong ones.
 func (q *InsertQuery[T]) scanMatched(rows Rows, p *plan, ncols int) (int64, error) {
 	dest := make([]any, ncols)
-	hs := p.holders()
+	hs := p.holders(rows)
 	sink := new(any)
 	var got []reflect.Value
 	for rows.Next() {

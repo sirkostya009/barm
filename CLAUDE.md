@@ -41,6 +41,7 @@ allocations are — that reasoning has been wrong here before.
 | `batch.go`                                      | `Batch`, its results, and the statements a batch transaction uses |
 | `hook.go`                                       | `QueryHook`, `TxHook`                                             |
 | `dialect.go`                                    | `Dialect` and the three built-ins                                 |
+| `array.go`                                      | Postgres array literals, for the `array` tag                      |
 | `stmt.go`                                       | statement names, and `database/sql`'s prepared statement cache    |
 
 A method starting a query on a handle (`Select`, `NewRaw`, `Batch`, …) lives in
@@ -100,9 +101,18 @@ with `= ANY(?)`. `In(slice)` is the opt-in that spells it out inside the
 parentheses the SQL wrote. A `Query` passed as an argument renders in place and
 shares the enclosing query's placeholder numbering.
 
-Every read goes through `*sql.Rows` and maps columns by the names the result
-reports; `*sql.Row` is not used anywhere. A `nullzero` or `json` column reads
-through a `holder` from the scan plan, and a plan without one pays nothing.
+Every read goes through the driver's `Rows` and maps columns by the names the
+result reports; `*sql.Row` is not used anywhere. A `nullzero`, `json` or `array`
+column reads through a `holder` from the scan plan, and a plan without one pays
+nothing.
+
+The `json` and `array` tags exist for `database/sql`, which has neither type.
+A pool and rows reporting `NativeJSON` or `NativeArrays` get those values as
+they are — pgx's codecs do better — except that a nil one is still written as
+NULL. They are separate so a driver can take one and not the other. pgx's pool
+reports both only in modes that type every argument: under exec mode or the
+simple protocol a plain query's arguments go untyped, and pgx can neither tell a
+map is JSON nor encode a slice of slices.
 
 Struct size is part of performance: a builder that grows past an allocator size
 class costs B/op on every query, and a B/op regression is a reason to rework or

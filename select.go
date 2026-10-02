@@ -517,7 +517,7 @@ func scanRow(rows Rows, v any) error {
 	if err != nil {
 		return err
 	}
-	dest, err := rowDest(v, cols)
+	dest, err := rowDest(rows, v, cols)
 	if err != nil {
 		return err
 	}
@@ -532,7 +532,7 @@ func scanRow(rows Rows, v any) error {
 }
 
 // rowDest points one row's Scan destinations at v's fields, by column name.
-func rowDest(v any, names []string) ([]any, error) {
+func rowDest(rows Rows, v any, names []string) ([]any, error) {
 	rv := reflect.ValueOf(v).Elem()
 	p, err := planFor(rv.Type(), names)
 	if err != nil {
@@ -545,7 +545,7 @@ func rowDest(v any, names []string) ([]any, error) {
 		return []any{v}, nil
 	}
 	dest := make([]any, len(names))
-	hs := p.holders()
+	hs := p.holders(rows)
 	var sink *any // only when some column has no field, which is rare
 	for i, path := range p.paths {
 		if path == nil {

@@ -31,6 +31,18 @@ type Executor interface {
 	SendBatch(ctx context.Context, qs []BatchQuery, read func(BatchReader) error) error
 }
 
+// NativeJSON is implemented by a Pool whose driver encodes JSON from Go values
+// itself, and by Rows that decode it into them. barm leaves the json tag to
+// whichever reports true, other than writing a nil value as NULL.
+type NativeJSON interface {
+	NativeJSON() bool
+}
+
+// NativeArrays is NativeJSON for Postgres arrays and the array tag.
+type NativeArrays interface {
+	NativeArrays() bool
+}
+
 // Pool is the database a DB runs on.
 type Pool interface {
 	Executor

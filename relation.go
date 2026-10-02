@@ -199,7 +199,7 @@ func groupRelation[U any](
 		dest  = make([]any, len(cols))
 		sink  any
 		key   = reflect.New(keyType) // the parent's own type, so the keys compare
-		hs    = p.holders()
+		hs    = p.holders(rows)
 	)
 	convert, deref := false, false
 	if inRow {

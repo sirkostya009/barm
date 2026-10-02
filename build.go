@@ -37,6 +37,8 @@ type builder struct {
 	// one; done reports it.
 	err   error
 	dedup bool
+	// Leave json, or array, values to the driver.
+	nativeJSON, nativeArrays bool
 }
 
 // boundArg is a dedupable argument already bound, with its 1-based placeholder.
@@ -74,7 +76,9 @@ func (r *runner) builder() *builder {
 	b := builderPool.Get().(*builder) //nolint:forcetypeassert // the pool's New only ever stores *builder
 	d := r.Dialect()
 	b.d, b.b, b.args = d, b.b[:0], nil
-	b.dedup, b.bound, b.index, b.err = r.h.sess().dedup && r.name == "" && d.NumberedArgs(), b.bound[:0], nil, nil
+	s := r.h.sess()
+	b.dedup, b.bound, b.index, b.err = s.dedup && r.name == "" && d.NumberedArgs(), b.bound[:0], nil, nil
+	b.nativeJSON, b.nativeArrays = s.nativeJSON, s.nativeArrays
 	return b
 }
 
@@ -336,13 +340,14 @@ func (b *builder) sub(q Query) {
 }
 
 // value is what field f's value v binds as: v itself, NULL for a nullzero
-// field at its zero, or v encoded as JSON for a json field. A nil pointer, map
-// or slice there is NULL too, rather than the JSON literal null.
+// field at its zero, or v encoded as JSON or as an array literal for a json or
+// array field. A nil pointer, map or slice there is NULL too, rather than the
+// JSON literal null or an empty array.
 func (b *builder) value(f *field, v reflect.Value) any {
 	if f.nullzero && v.IsZero() {
 		return nil
 	}
-	if !f.json {
+	if !f.json && !f.array {
 		return v.Interface()
 	}
 	switch v.Kind() {
@@ -351,7 +356,16 @@ func (b *builder) value(f *field, v reflect.Value) any {
 			return nil
 		}
 	}
-	data, err := json.Marshal(v.Interface())
+	if f.json && b.nativeJSON || f.array && b.nativeArrays {
+		return v.Interface()
+	}
+	var data []byte
+	var err error
+	if f.array {
+		data, err = appendArray(nil, v)
+	} else {
+		data, err = json.Marshal(v.Interface())
+	}
 	if err != nil {
 		b.fail(fmt.Errorf("barm: column %q: %w", f.name, err))
 		return nil

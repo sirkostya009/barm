@@ -110,8 +110,8 @@ type plan struct {
 	// need a fresh value per row — a reused one would have every row's copy
 	// sharing the pointee, so they would all show the last row's data.
 	viaPointer bool
-	// held marks the columns read through a holder, nullzero or json, nil when
-	// there are none.
+	// held marks the columns read through a holder, nullzero, json or array,
+	// nil when there are none.
 	held   []bool
 	fields []*field // the held columns' fields
 }
@@ -120,7 +120,7 @@ type plan struct {
 // behind hs[i] when the column needs a holder. hs comes from holders.
 func (p *plan) at(rv reflect.Value, i int, hs []holder) any {
 	d := fieldAt(rv, p.paths[i])
-	if hs != nil && p.held[i] {
+	if hs != nil && p.held[i] && !hs[i].direct {
 		hs[i].v = reflect.ValueOf(d).Elem()
 		return &hs[i]
 	}
@@ -128,32 +128,66 @@ func (p *plan) at(rv reflect.Value, i int, hs []holder) any {
 }
 
 // holders is what at needs, one set per destination slice; nil, and free, when
-// the plan has no column that needs one.
-func (p *plan) holders() []holder {
+// no column of the plan needs one from rows.
+//
+// Rows that decode arrays themselves take an array column straight, NULL being
+// a nil slice there too, and rows that decode JSON a json one, unless it is
+// nullzero.
+func (p *plan) holders(rows Rows) []holder {
 	if p.held == nil {
 		return nil
 	}
-	hs := make([]holder, len(p.paths))
+	nj, ok := rows.(NativeJSON)
+	nativeJSON := ok && nj.NativeJSON()
+	na, ok := rows.(NativeArrays)
+	nativeArrays := ok && na.NativeArrays()
+	var hs []holder
 	for i, f := range p.fields {
-		if f != nil {
-			hs[i].json = f.json
+		if f == nil {
+			continue
 		}
+		direct := f.array && nativeArrays || f.json && nativeJSON && !f.nullzero
+		if direct && hs == nil {
+			continue
+		}
+		if hs == nil {
+			hs = make([]holder, len(p.paths))
+			for j := range i {
+				hs[j].direct = true
+			}
+		}
+		hs[i].json, hs[i].array, hs[i].direct = f.json, f.array, direct
 	}
 	return hs
 }
 
 // holder reads a column the field cannot take as it comes. NULL is the field's
-// zero value either way. A json column is decoded into the field; anything else
-// converts as database/sql would convert it into the field.
+// zero value either way. A json column is decoded into the field, an array one
+// parsed from its literal; anything else converts as database/sql would convert
+// it into the field.
 type holder struct {
-	v    reflect.Value
-	json bool
+	v      reflect.Value
+	json   bool
+	array  bool
+	direct bool // the column scans straight into the field after all
 }
 
 func (n *holder) Scan(src any) error {
 	if src == nil {
 		n.v.SetZero()
 		return nil
+	}
+	if n.array {
+		var s string
+		switch src := src.(type) {
+		case string:
+			s = src
+		case []byte:
+			s = string(src) // elements keep pieces of it, and the driver reuses src
+		default:
+			return fmt.Errorf("barm: cannot read %T as an array into %s", src, n.v.Type())
+		}
+		return decodeArray(s, n.v)
 	}
 	if n.json {
 		var data []byte
@@ -264,7 +298,7 @@ func buildPlan(t reflect.Type, cols []string) (*plan, error) {
 			continue
 		}
 		p.paths[i] = f.index
-		if f.nullzero || f.json {
+		if f.nullzero || f.json || f.array {
 			if p.held == nil {
 				p.held, p.fields = make([]bool, len(cols)), make([]*field, len(cols))
 			}
@@ -341,7 +375,7 @@ func newScanner[T any](rows Rows) (*scanner[T], error) {
 		var t T
 		return nil, fmt.Errorf("barm: cannot scan %d columns into %T", len(cols), t)
 	}
-	s := &scanner[T]{p: p, dest: make([]any, len(cols)), hs: p.holders()}
+	s := &scanner[T]{p: p, dest: make([]any, len(cols)), hs: p.holders(rows)}
 	if !p.direct && !p.viaPointer {
 		s.bind(reflect.ValueOf(&s.row).Elem()) // one address for every row
 	}

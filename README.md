@@ -143,6 +143,7 @@ type User struct {
 | `default:expr`               | field                    | the column has a database default, so a zero value means "use it" (see [Defaults](#defaults))        |
 | `nullzero`                   | field                    | a zero value is written as `NULL`, and `NULL` reads back as the zero value                           |
 | `json`                       | field                    | the value is stored encoded as JSON (see [JSON columns](#json-columns))                              |
+| `array`                      | field                    | a slice is stored as a Postgres array (see [Array columns](#array-columns))                          |
 | `scanonly`                   | field                    | a column a query computes: never written or selected by default (see below)                          |
 | `skipupdate`                 | field                    | left out of an update built from `Value`, for columns maintained elsewhere; `Column` still writes it |
 | `rel:parent_col=child_col`   | field                    | a relation, not a column (see [Relations](#relations))                                               |
@@ -224,16 +225,46 @@ type Account struct {
 - **Any column that holds JSON text works:** `json` or `jsonb` in Postgres, `JSON` in
   MySQL, `TEXT` in SQLite. The value is bound as a string, and Postgres stores it as a
   proper JSON value, not a JSON string.
-- **On pgx, the tag is optional:** pgx encodes and decodes `json`/`jsonb` itself, from the
-  column types the server reports. It is needed for writes only where a query runs
-  unprepared, under `QueryExecModeExec` or `QueryExecModeSimpleProtocol`, since pgx then
-  does not know the parameter is JSON. A query named with `Prepare` is never one of those.
+- **On pgx, the tag is optional, and left to pgx:** pgx encodes and decodes `json`/`jsonb`
+  itself, from the column types the server reports, so barm hands it the value as it is.
+  Only under `QueryExecModeExec` or `QueryExecModeSimpleProtocol`, where a plain query's
+  arguments go untyped and pgx cannot know a map is meant as JSON, does barm encode it.
 - **Nil is `NULL`.** A nil pointer, map or slice is written as SQL `NULL`, not as the JSON
   literal `null`. With `nullzero` as well, a zero struct is `NULL` too.
 - **`NULL` reads back as the zero value.**
 - **Decoding replaces.** The field is reset before decoding, so a map or struct that already
   held something does not keep stale keys.
 - **Errors:** a value `encoding/json` cannot encode fails the build, naming the column.
+
+### Array columns
+
+`array` stores a slice as a Postgres array, and reads it back:
+
+```go
+type Post struct {
+	barm.BaseModel `barm:"table:posts"`
+
+	ID     int64     `barm:"id,pk"`
+	Tags   []string  `barm:"tags,array"`   // text[]
+	Scores []float64 `barm:"scores,array"` // float8[]
+	Grid   [][]int32 `barm:"grid,array"`   // int4[][]
+}
+```
+
+- **It is for `database/sql`,** which has no array type: the slice is bound as an array
+  literal, `{"a","b"}`, which Postgres parses into the column's type, and the literal that
+  comes back is parsed into the slice. This is how arrays work through pgx's stdlib driver,
+  go-txdb included, or `lib/pq`. In SQLite the literal is stored as text and reads back the
+  same.
+- **On pgx, it is left to pgx,** which sends and reads slices as arrays natively. Under
+  `QueryExecModeExec` or `QueryExecModeSimpleProtocol` barm writes the literal, as it does
+  for `json`.
+- **Elements:** strings, booleans, integers, floats, `time.Time`, `[]byte` (`bytea[]`), a
+  `driver.Valuer` or `sql.Scanner`, pointers to any of those for elements that may be
+  `NULL`, and slices of them for more dimensions.
+- **Nil is `NULL`, and `NULL` reads back as nil.** An empty slice is `{}`.
+- **The field must be a slice,** or a pointer to one, and cannot also be `json`; the model
+  fails otherwise.
 
 ## Reading
 
@@ -1127,13 +1158,16 @@ two:
 |                | `pgxdriver.Pool(pool)`                                     | `barm.SQL(sqldb)`                                      |
 | -------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
 | databases      | Postgres                                                   | anything with a `database/sql` driver                  |
-| column types   | everything pgx encodes and decodes: arrays, JSON, UUIDs, … | what `database/sql` converts; `json` tag for JSON      |
+| column types   | everything pgx encodes and decodes: arrays, JSON, UUIDs, … | what `database/sql` converts; `json` and `array` tags  |
 | batches        | pipelined, one round trip                                  | `ErrNoBatcher`, or one by one with `SequentialBatches` |
 | plain queries  | as the pool's `DefaultQueryExecMode` says                  | as the driver runs them                                |
 | last insert id | none; use `RETURNING`                                      | where the driver reports one                           |
 
-- **JSON on pgx** needs no tag under pgx's default mode, reading or writing. See
+- **JSON and arrays on pgx** need no tag under pgx's default mode, reading or writing. See
   [JSON columns](#json-columns) for the modes where writing does.
+- **`NativeJSON` and `NativeArrays`:** a pool reports through them whether its driver
+  encodes JSON or arrays itself, and its rows whether they decode them. barm then leaves
+  the `json` or `array` tag to the driver.
 - **Reaching the driver:** `db.Pool()` returns the pool, `*barm.SQLPool` has `DB()` for the
   `*sql.DB`, and `Driver()` on a `Conn` or `Tx` returns the driver's own connection or
   transaction.

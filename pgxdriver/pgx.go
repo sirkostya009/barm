@@ -39,12 +39,23 @@ import (
 )
 
 // Pool runs barm on p. DB.Close closes it.
-func Pool(p *pgxpool.Pool) barm.Pool { return &pool{p: p, t: &types{}} }
+func Pool(p *pgxpool.Pool) barm.Pool {
+	mode := p.Config().ConnConfig.DefaultQueryExecMode
+	return &pool{p: p, t: &types{}, typed: mode != pgx.QueryExecModeExec && mode != pgx.QueryExecModeSimpleProtocol}
+}
 
 type pool struct {
-	p *pgxpool.Pool
-	t *types
+	p     *pgxpool.Pool
+	t     *types
+	typed bool // every argument is encoded for its parameter's type
 }
+
+// NativeJSON and NativeArrays report whether pgx encodes every argument for its
+// parameter's type, which is when barm can leave JSON and arrays to it. In exec
+// mode and the simple protocol a plain query's arguments go untyped, and pgx
+// cannot tell a map is meant as JSON, nor encode a slice of slices at all.
+func (p *pool) NativeJSON() bool   { return p.typed }
+func (p *pool) NativeArrays() bool { return p.typed }
 
 func (p *pool) Query(ctx context.Context, query string, args []any) (barm.Rows, error) {
 	rows, err := p.p.Query(ctx, query, args...)
@@ -712,6 +723,11 @@ func (r *reader) Exec() (barm.ExecResult, error) {
 
 // pgxRows presents pgx.Rows as barm.Rows.
 type pgxRows struct{ pgx.Rows }
+
+// NativeJSON and NativeArrays report that pgx decodes JSON and arrays itself:
+// the result says what each column's type is.
+func (pgxRows) NativeJSON() bool   { return true }
+func (pgxRows) NativeArrays() bool { return true }
 
 func (r pgxRows) Columns() ([]string, error) {
 	fds := r.FieldDescriptions()

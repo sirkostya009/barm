@@ -42,6 +42,8 @@ type field struct {
 	nullzero bool
 	// json stores the value encoded as JSON, and decodes it on the way back.
 	json bool
+	// array stores a slice as a Postgres array literal, and parses it back.
+	array bool
 	// scanonly is a column a query computes rather than one the table has.
 	scanonly bool
 	// skipupdate keeps the column out of an update built from a value, for
@@ -171,6 +173,17 @@ func modelOfType(t reflect.Type) (*model, error) {
 	if err != nil {
 		return m, err
 	}
+	for _, f := range m.fields {
+		if !f.array {
+			continue
+		}
+		if f.json {
+			return m, fmt.Errorf("barm: column %q cannot be both json and array", f.name)
+		}
+		if ft := deref(t.FieldByIndex(f.index).Type); ft.Kind() != reflect.Slice {
+			return m, fmt.Errorf("barm: column %q is an array, but %s is not a slice", f.name, ft)
+		}
+	}
 	if slices.ContainsFunc(m.fields, func(f field) bool { return f.scanonly }) {
 		all := m.fields
 		m.fields = make([]field, 0, len(all))
@@ -247,7 +260,7 @@ func (m *model) collect(t reflect.Type, index []int) {
 			def = autoDefault
 		}
 		m.fields = append(m.fields, field{
-			name: tag, index: idx, def: def, pk: opts.pk, auto: opts.auto, nullzero: opts.null, json: opts.json, scanonly: opts.read, skipupdate: opts.keep,
+			name: tag, index: idx, def: def, pk: opts.pk, auto: opts.auto, nullzero: opts.null, json: opts.json, array: opts.array, scanonly: opts.read, skipupdate: opts.keep,
 		})
 	}
 }
@@ -294,6 +307,7 @@ type tagOpts struct {
 	auto  bool // filled by the database: autoincrement or identity
 	null  bool // nullzero
 	json  bool
+	array bool
 	read  bool // scanonly
 	keep  bool // skipupdate
 }
@@ -327,6 +341,8 @@ func parseTag(tag string) (name string, opts tagOpts) {
 			opts.null = true
 		case "json":
 			opts.json = true
+		case "array":
+			opts.array = true
 		case "scanonly":
 			opts.read = true
 		case "skipupdate":

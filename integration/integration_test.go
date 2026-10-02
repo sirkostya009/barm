@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -3679,5 +3680,57 @@ func TestSQLBatchPreparesNamed(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type arrayRow struct {
+	barm.BaseModel `barm:"table:arrays"`
+
+	ID    int64     `barm:"id,pk,autoincrement"`
+	Ints  []int64   `barm:"ints,array"`
+	Texts []string  `barm:"texts,array"`
+	Maybe []*string `barm:"maybe,array"`
+	Grid  [][]int   `barm:"grid,array"`
+	Ptr   *[]bool   `barm:"ptr,array"`
+	Empty []int64   `barm:"empty,array,nullzero"`
+}
+
+// An array field goes through database/sql as an array literal and comes back
+// as the slice it was. A nil slice is NULL, and NULL reads back as nil.
+func TestArrayTag(t *testing.T) {
+	ctx := t.Context()
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/arr.db", barm.SQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE arrays (id INTEGER PRIMARY KEY AUTOINCREMENT, ints TEXT, texts TEXT, maybe TEXT, grid TEXT, ptr TEXT, empty TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	s := `q"u,o{t}e\`
+	in := []*arrayRow{
+		{Ints: []int64{1, -2}, Texts: []string{"a", "", "NULL", s}, Maybe: []*string{&s, nil}, Grid: [][]int{{1, 2}, {3, 4}}, Ptr: &[]bool{true}, Empty: []int64{}},
+		{},
+	}
+	if _, err := db.Insert[arrayRow]().Values(in...).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := queryRow(ctx, db, `SELECT texts FROM arrays WHERE id = 1`).Scan(&stored); err != nil || stored != `{"a","","NULL","q\"u,o{t}e\\"}` {
+		t.Errorf("stored %s, %v", stored, err)
+	}
+	var nulls int
+	if err := queryRow(ctx, db, `SELECT count(*) FROM arrays WHERE id = 2 AND ints IS NULL AND ptr IS NULL AND empty IS NULL`).Scan(&nulls); err != nil || nulls != 1 {
+		t.Errorf("nil slices: %d rows of NULLs, %v", nulls, err)
+	}
+	out, err := db.Select[arrayRow]().OrderBy("id").Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in[0].ID, in[1].ID = 1, 2 // an empty slice is not nil, so nullzero leaves it {}
+	for i := range in {
+		if !reflect.DeepEqual(out[i], *in[i]) {
+			t.Errorf("row %d = %+v, want %+v", i, out[i], *in[i])
+		}
 	}
 }

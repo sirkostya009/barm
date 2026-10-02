@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sirkostya009/barm"
 	"github.com/sirkostya009/barm/pgxdriver"
 )
@@ -2451,5 +2453,159 @@ func TestReturningCountMismatch(t *testing.T) {
 	_, err := db.Insert[User]().Values(rows...).Returning("id").Exec(ctx)
 	if err == nil {
 		t.Error("a RETURNING count short of the values should be reported")
+	}
+}
+
+type pgArrayRow struct {
+	barm.BaseModel `barm:"table:pg_arrays"`
+
+	ID     int64       `barm:"id,pk,autoincrement"`
+	Ints   []int64     `barm:"ints,array"`
+	Texts  []string    `barm:"texts,array"`
+	Maybe  []*string   `barm:"maybe,array"`
+	Floats []float64   `barm:"floats,array"`
+	Flags  []bool      `barm:"flags,array"`
+	Grid   [][]int32   `barm:"grid,array"`
+	Blobs  [][]byte    `barm:"blobs,array"`
+	Times  []time.Time `barm:"times,array"`
+	Nulled []int64     `barm:"nulled,array,nullzero"`
+}
+
+func createArrays(t *testing.T, db *barm.DB) {
+	t.Helper()
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS pg_arrays`,
+		`CREATE TABLE pg_arrays (id bigserial PRIMARY KEY, ints int8[], texts text[], maybe text[],
+			floats float8[], flags bool[], grid int4[][], blobs bytea[], times timestamptz[], nulled int8[])`,
+	} {
+		if _, err := db.Exec(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS pg_arrays`) })
+}
+
+// roundTripArrays writes rows through every way a query reaches the database —
+// plain, prepared and batched — and checks they read back as written.
+func roundTripArrays(t *testing.T, db *barm.DB) {
+	t.Helper()
+	ctx := t.Context()
+	createArrays(t, db)
+	s := `q"u,o{t}e\ NULL`
+	at := time.Date(2026, 1, 2, 3, 4, 5, 6000, time.UTC)
+	row := func() *pgArrayRow {
+		return &pgArrayRow{
+			Ints: []int64{1, -2}, Texts: []string{"a", "", "NULL", s}, Maybe: []*string{&s, nil},
+			Floats: []float64{1.5, -0.25}, Flags: []bool{true, false}, Grid: [][]int32{{1, 2}, {3, 4}},
+			Blobs: [][]byte{{0, 0xff}}, Times: []time.Time{at}, Nulled: []int64{},
+		}
+	}
+	if _, err := db.Insert[pgArrayRow]().Values(row(), &pgArrayRow{}).Exec(ctx); err != nil {
+		t.Fatalf("plain: %v", err)
+	}
+	if _, err := db.Insert[pgArrayRow]().Values(row()).Prepare("arr_ins").Exec(ctx); err != nil {
+		t.Fatalf("prepared: %v", err)
+	}
+	b := db.Batch()
+	b.Exec(db.Insert[pgArrayRow]().Values(row()))
+	if err := b.Run(ctx); err != nil && !errors.Is(err, barm.ErrNoBatcher) {
+		t.Fatalf("batch: %v", err)
+	}
+	var nulls int
+	if err := queryRow(ctx, db, `SELECT count(*) FROM pg_arrays WHERE ints IS NULL AND nulled IS NULL`).Scan(&nulls); err != nil || nulls != 1 {
+		t.Errorf("nil slices: %d rows of NULLs, %v", nulls, err)
+	}
+	var stored string
+	if err := queryRow(ctx, db, `SELECT texts[4] FROM pg_arrays WHERE id = 1`).Scan(&stored); err != nil || stored != s {
+		t.Errorf("stored %q, %v, want %q", stored, err, s)
+	}
+
+	for _, q := range []*barm.SelectQuery[pgArrayRow]{
+		db.Select[pgArrayRow]().OrderBy("id"),
+		db.Select[pgArrayRow]().OrderBy("id").Prepare("arr_sel"),
+	} {
+		out, err := q.Slice(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) < 3 {
+			t.Fatalf("%d rows", len(out))
+		}
+		for i, got := range out {
+			if i == 1 {
+				if !reflect.DeepEqual(got, pgArrayRow{ID: got.ID}) {
+					t.Errorf("the NULL row read as %+v", got)
+				}
+				continue
+			}
+			want := row()
+			want.ID = got.ID
+			if len(got.Times) != 1 || !got.Times[0].Equal(at) {
+				t.Errorf("row %d times = %v", i, got.Times)
+			}
+			got.Times, want.Times = nil, nil
+			if !reflect.DeepEqual(got, *want) {
+				t.Errorf("row %d = %+v\nwant %+v", i, got, *want)
+			}
+		}
+	}
+}
+
+// Over database/sql an array field is an array literal both ways: through pgx's
+// stdlib driver, and through its simple protocol, as go-txdb runs it.
+func TestArrayTagOverSQL(t *testing.T) {
+	for _, mode := range []string{"", "simple_protocol"} {
+		t.Run("mode "+mode, func(t *testing.T) {
+			u, err := url.Parse(dsn())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode != "" {
+				q := u.Query()
+				q.Set("default_query_exec_mode", mode)
+				u.RawQuery = q.Encode()
+			}
+			sqldb, err := sql.Open("pgx", u.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.Postgres)
+			defer db.Close()
+			if err := sqldb.Ping(); err != nil {
+				t.Skipf("no postgres: %v", err)
+			}
+			roundTripArrays(t, db)
+		})
+	}
+}
+
+// On pgx's own pool the tag is left to pgx, which encodes the slice as the
+// array its parameter is, unless the pool's mode sends arguments untyped.
+func TestArrayTagOnPgx(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*pgxpool.Config)
+		native    bool
+	}{
+		{"pgx default", nil, true},
+		{"exec mode", execMode, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asText atomic.Bool
+			hook := barm.WithHook(barm.QueryHook{BeforeQuery: func(ctx context.Context, ev *barm.QueryEvent) context.Context {
+				if strings.HasPrefix(ev.Query, "INSERT") {
+					for _, a := range ev.Args {
+						if _, ok := a.(string); ok {
+							asText.Store(true)
+						}
+					}
+				}
+				return ctx
+			}})
+			roundTripArrays(t, openDSN(t, dsn(), 0, tc.configure, hook))
+			if asText.Load() == tc.native {
+				t.Errorf("arrays sent as literals: %v, want %v", asText.Load(), !tc.native)
+			}
+		})
 	}
 }

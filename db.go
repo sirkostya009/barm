@@ -29,6 +29,8 @@ type session struct {
 	hooks   []QueryHook
 	txHooks *[]txHook
 	dedup   bool
+	// The pool encodes JSON, or arrays, itself.
+	nativeJSON, nativeArrays bool
 }
 
 // own returns a copy of the session with a transaction-hook list of its own, so
@@ -190,6 +192,12 @@ func WithTxHook(hooks ...TxHook) Option {
 //	db := barm.New(pgxdriver.Pool(pgxpool), barm.Postgres)
 func New(pool Pool, d Dialect, opts ...Option) *DB {
 	out := &DB{pool: pool, dialect: d, names: &names{}, txHooks: new([]txHook)}
+	if n, ok := pool.(NativeJSON); ok {
+		out.nativeJSON = n.NativeJSON()
+	}
+	if n, ok := pool.(NativeArrays); ok {
+		out.nativeArrays = n.NativeArrays()
+	}
 	for _, opt := range opts {
 		opt(out)
 	}
