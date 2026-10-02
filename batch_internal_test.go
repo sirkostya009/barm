@@ -2,22 +2,35 @@ package barm
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 )
 
-// The statement each of these queues is decided by what the batch runs on, not
-// by anything it remembers — so the table is worth pinning directly.
-func TestBatchTxStatementsFollowTheBatcher(t *testing.T) {
+// nopExec is an Executor that runs nothing, for batches that are only queued.
+type nopExec struct{}
+
+func (nopExec) Query(context.Context, string, []any) (Rows, error)      { return nil, nil } //nolint:nilnil // never read
+func (nopExec) Exec(context.Context, string, []any) (sql.Result, error) { return rowsAffected(0), nil }
+func (nopExec) ExecPrepared(context.Context, string, string, []any) (sql.Result, error) {
+	return rowsAffected(0), nil
+}
+func (nopExec) QueryPrepared(context.Context, string, string, []any) (Rows, error) {
+	return nil, nil //nolint:nilnil // never read
+}
+func (nopExec) SendBatch(context.Context, []BatchQuery, func(BatchReader) error) error { return nil }
+
+// The statement each of these queues is decided by what the batch runs on.
+func TestBatchTxStatementsFollowWhereItRuns(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name          string
-		on            Batcher
+		inTx, held    bool
 		begin, commit string
 	}{
-		{"pool", &sqlDBBatcher{}, "BEGIN", "COMMIT"},
-		{"held connection", sqlConnBatcher{}, "BEGIN", "COMMIT"},
-		{"transaction", sqlTxBatcher{}, "SAVEPOINT " + BatchSavepoint, "RELEASE SAVEPOINT " + BatchSavepoint},
+		{"pool", false, false, "BEGIN", "COMMIT"},
+		{"held connection", false, true, "BEGIN", "COMMIT"},
+		{"transaction", true, true, "SAVEPOINT " + BatchSavepoint, "RELEASE SAVEPOINT " + BatchSavepoint},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -29,7 +42,7 @@ func TestBatchTxStatementsFollowTheBatcher(t *testing.T) {
 				{"Begin", (*Batch).Begin, tc.begin},
 				{"Commit", (*Batch).Commit, tc.commit},
 			} {
-				b := newBatch(tc.on, nil)
+				b := newBatch(nopExec{}, &session{}, tc.inTx, tc.held)
 				step.queue(b)
 				if len(b.qs) != 1 {
 					t.Fatalf("%s queued %d statements", step.what, len(b.qs))
@@ -42,32 +55,17 @@ func TestBatchTxStatementsFollowTheBatcher(t *testing.T) {
 	}
 }
 
-// Nothing on the batch records the choice, so it is the same answer every time
-// and cannot drift from what the batch is actually running on.
-func TestBatchTxStatementsAreNotRemembered(t *testing.T) {
-	t.Parallel()
-	b := newBatch(sqlTxBatcher{}, nil)
-	b.Begin()
-	b.Commit()
-	want := []string{"SAVEPOINT " + BatchSavepoint, "RELEASE SAVEPOINT " + BatchSavepoint}
-	for i, w := range want {
-		if b.qs[i].Query != w {
-			t.Errorf("query %d = %q, want %q", i, b.qs[i].Query, w)
-		}
-	}
-}
-
 // Rollback runs rather than queueing, so it needs the connection the batch ran
 // on. A batch on the pool has already given that back.
 func TestBatchRollbackNeedsAHeldConnection(t *testing.T) {
 	t.Parallel()
-	b := newBatch(&sqlDBBatcher{}, nil)
+	b := newBatch(nopExec{}, &session{}, false, false)
 	b.Begin()
 	err := b.Rollback(context.Background())
 	if err == nil {
 		t.Fatal("no error rolling back a batch that holds no connection")
 	}
-	if !strings.Contains(err.Error(), "holds one") && !strings.Contains(err.Error(), "does not hold one") {
+	if !strings.Contains(err.Error(), "does not hold one") {
 		t.Errorf("unhelpful error: %v", err)
 	}
 	// and it queued nothing: Begin is the only statement in the batch

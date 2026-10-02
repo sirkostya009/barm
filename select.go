@@ -209,8 +209,24 @@ func (q *SelectQuery[T]) OrderBy(expr string, args ...any) *SelectQuery[T] {
 	return q
 }
 
-func (q *SelectQuery[T]) Limit(n int64) *SelectQuery[T]  { q.limit = n; return q }
-func (q *SelectQuery[T]) Offset(n int64) *SelectQuery[T] { q.offset = n; return q }
+// Limit caps the rows returned. A negative n is an error rather than no limit,
+// so a page size taken from input cannot ask for the whole table.
+func (q *SelectQuery[T]) Limit(n int64) *SelectQuery[T] {
+	if n < 0 {
+		q.fail(fmt.Errorf("barm: negative Limit %d", n))
+	}
+	q.limit = n
+	return q
+}
+
+// Offset skips n rows. A negative n is an error.
+func (q *SelectQuery[T]) Offset(n int64) *SelectQuery[T] {
+	if n < 0 {
+		q.fail(fmt.Errorf("barm: negative Offset %d", n))
+	}
+	q.offset = n
+	return q
+}
 
 // For appends a locking clause, e.g. For("UPDATE").
 func (q *SelectQuery[T]) For(clause string) *SelectQuery[T] { q.lock = clause; return q }
@@ -414,8 +430,8 @@ func (q *SelectQuery[T]) argCount() int {
 	return n
 }
 
-// Rows executes the query and returns the raw *sql.Rows.
-func (q *SelectQuery[T]) Rows(ctx context.Context) (*sql.Rows, error) {
+// Rows runs the query and returns its rows, for the caller to read and close.
+func (q *SelectQuery[T]) Rows(ctx context.Context) (Rows, error) {
 	query, args, err := q.build()
 	if err != nil {
 		return nil, err

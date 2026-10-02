@@ -394,17 +394,7 @@ func (q *InsertQuery[T]) setLastInsertID(res sql.Result) {
 // execReturning scans the returned rows back into the values and reports how
 // many came back.
 func (q *InsertQuery[T]) execReturning(ctx context.Context, query string, args []any) (int64, error) {
-	if q.name != "" {
-		var n int64
-		ok, err := rowsViaDriver(ctx, q.runner, query, args, func(rows Rows) (err error) {
-			n, err = q.scanReturning(rows)
-			return err
-		})
-		if ok {
-			return n, err
-		}
-	}
-	rows, err := q.query(ctx, query, args) //nolint:rowserrcheck // scanReturning checks rows.Err() itself before returning
+	rows, err := q.query(ctx, query, args)
 	if err != nil {
 		return 0, err
 	}
@@ -456,7 +446,13 @@ func (q *InsertQuery[T]) scanReturning(rows Rows) (int64, error) {
 			return n, err
 		}
 	}
-	return n, rows.Err()
+	err = rows.Err()
+	if err == nil && n != int64(len(q.rows)) {
+		// A trigger can drop a row, shifting the ones after it onto the wrong
+		// values: better to say so than to leave keys where they do not belong.
+		err = fmt.Errorf("barm: RETURNING gave %d rows for %d values, so they may have landed on the wrong ones", n, len(q.rows))
+	}
+	return n, err
 }
 
 // renderConflict writes the ON clause and what Set added to it, then RETURNING.

@@ -1,7 +1,6 @@
 // Conn: one connection taken out of the pool and held until Close. Queries
 // built on it all run on that connection, which is what session state needs:
-// SET, temporary tables, advisory locks. It keeps a prepared statement cache of
-// its own, since a statement prepared on the pool could run anywhere.
+// SET, temporary tables, advisory locks.
 
 package barm
 
@@ -9,7 +8,6 @@ import (
 	"context"
 	"database/sql"
 	"slices"
-	"time"
 )
 
 // Conn is one connection taken out of the pool and held until Close. It builds
@@ -20,18 +18,24 @@ import (
 //	c, err := db.Conn(ctx)
 //	defer c.Close()
 //
-//	c.Exec(ctx, "SET LOCAL search_path = tenant_7")
-//	users, err := c.Select[User]().Slice(ctx)
+//	c.Exec(ctx, "CREATE TEMP TABLE seen (id bigint)")
+//	users, err := c.Select[User]().Join("JOIN seen ON seen.id = u.id").Slice(ctx)
 //
-// The embedded *sql.Conn stays reachable, so Raw and PingContext are there too.
+// SET LOCAL belongs inside a transaction begun on it: outside one, Postgres
+// accepts it and ignores it.
 type Conn struct {
-	*sql.Conn
+	c DriverConn
 	session
 	db *DB // where the dialect comes from
 }
 
 // Dialect returns the dialect of the DB the connection came from.
 func (c *Conn) Dialect() Dialect { return c.db.Dialect() }
+
+// Driver returns the driver's own connection.
+func (c *Conn) Driver() DriverConn { return c.c }
+
+func (c *Conn) executor() Executor { return c.c }
 
 func (c *Conn) runner() runner { return runner{h: c} }
 
@@ -42,6 +46,18 @@ func (c *Conn) Delete[T any]() *DeleteQuery[T] { return newDelete[T](c.runner())
 
 // NewRaw starts a hand-written query on this connection.
 func (c *Conn) NewRaw(query string, args ...any) *RawQuery { return newRaw(c.runner(), query, args) }
+
+// Exec runs SQL as written on this connection, in the driver's own placeholders.
+func (c *Conn) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	r := c.runner()
+	return r.exec(ctx, query, args)
+}
+
+// Query runs SQL as written on this connection; the caller closes the rows.
+func (c *Conn) Query(ctx context.Context, query string, args ...any) (Rows, error) {
+	r := c.runner()
+	return r.query(ctx, query, args)
+}
 
 // WithHook registers query hooks on this connection alone, on top of the DB's.
 func (c *Conn) WithHook(hooks ...QueryHook) *Conn {
@@ -59,43 +75,21 @@ func (c *Conn) WithTxHook(hooks ...TxHook) *Conn {
 }
 
 // Batch starts a batch on this connection, which is the one it will be sent on.
-func (c *Conn) Batch(on ...Batcher) *Batch {
-	if len(on) > 0 {
-		return newBatch(on[0], c.hooks)
-	}
-	return newBatch(sqlConnBatcher{c.Conn}, c.hooks)
-}
+func (c *Conn) Batch() *Batch { return newBatch(c.c, &c.session, false, true) }
 
 // BeginTx starts a transaction on this connection. The connection stays the
-// caller's — Close is still the only thing that gives it back — and because the
-// transaction runs on a connection barm can reach, it is the one that can batch.
-//
-// It shadows the embedded *sql.Conn's, which would return a *sql.Tx that builds
-// nothing.
+// caller's — Close is still the only thing that gives it back.
 func (c *Conn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	tx, err := c.Conn.BeginTx(ctx, opts)
+	tx, err := c.c.Begin(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	t := &Tx{
-		Tx: tx, Conn: c, session: c.own(),
-		ctx: ctx, startedAt: time.Now(),
-	}
-	t.seq, t.done = &t._seq, &t._done
-	return t, nil
+	return newTx(tx, c.db, c.own(), ctx), nil
 }
 
 // Begin starts a transaction on this connection with the default isolation, on
 // the background context.
 func (c *Conn) Begin() (*Tx, error) { return c.BeginTx(context.Background(), nil) }
 
-// Close closes the statements prepared on this connection, then gives it back
-// to the pool.
-func (c *Conn) Close() error {
-	err := c.stmts.close()
-	cerr := c.Conn.Close()
-	if cerr != nil {
-		return cerr
-	}
-	return err
-}
+// Close gives the connection back to the pool.
+func (c *Conn) Close() error { return c.c.Release() }

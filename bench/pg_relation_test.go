@@ -7,14 +7,16 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sirkostya009/barm"
-	_ "github.com/sirkostya009/barm/pgxdriver"
+	"github.com/sirkostya009/barm/pgxdriver"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 // openPG seeds Postgres with authors and perAuthor books, tags and awards each.
+// barm runs on pgx's own pool, bun on database/sql over pgx, each as it is used.
 func openPG(b *testing.B, authors, perAuthor int) (*barm.DB, *bun.DB) {
 	b.Helper()
 	dsn := os.Getenv("PGDSN")
@@ -51,7 +53,12 @@ func openPG(b *testing.B, authors, perAuthor int) (*barm.DB, *bun.DB) {
 		}
 	}
 	b.Cleanup(func() { sqldb.Exec(`DROP TABLE IF EXISTS rel_authors, rel_books, rel_tags, rel_awards`) })
-	return barm.New(sqldb, barm.Postgres), bun.NewDB(sqldb, pgdialect.New())
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(pool.Close)
+	return barm.New(pgxdriver.Pool(pool), barm.Postgres), bun.NewDB(sqldb, pgdialect.New())
 }
 
 // barmLoad loads the first n relations through h.

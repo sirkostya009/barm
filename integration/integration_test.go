@@ -6,11 +6,13 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,13 +32,13 @@ type User struct {
 
 func open(t *testing.T) *barm.DB {
 	t.Helper()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/test.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/test.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	_, err = db.Exec(`CREATE TABLE users (
+	_, err = db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		email TEXT NOT NULL,
@@ -163,7 +165,7 @@ type acct struct {
 func TestLastInsertIDAfterConflict(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
-	if _, err := db.Exec(`CREATE TABLE accts (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, name TEXT)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE accts (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, name TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	first, other := &acct{Email: "a@x", Name: "a"}, &acct{Email: "b@x", Name: "b"}
@@ -309,7 +311,7 @@ func (o *ownScan) Scan(src any) error {
 func TestOnReturningWritesBackOnlyWhenComplete(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
-	if _, err := db.Exec(`CREATE TABLE accts (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, name TEXT)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE accts (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, name TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Insert[acct]().Values(&acct{Email: "b@x", Name: "b"}).Exec(ctx); err != nil {
@@ -728,16 +730,19 @@ func (r *recorder) AfterQuery(ctx context.Context, ev *barm.QueryEvent) {
 func TestQueryHooks(t *testing.T) {
 	ctx := t.Context()
 	rec := &recorder{}
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/h.db", barm.SQLite, barm.WithHook(rec.hook()))
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/h.db", barm.SQLite, barm.WithHook(rec.hook()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE users (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER,
 		created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
+	rec.mu.Lock()
+	rec.events = nil // the CREATE above is watched too, and not what this counts
+	rec.mu.Unlock()
 
 	u := &User{Name: "kim", Email: "k@x.io", Age: 30, CreatedAt: time.Now()}
 	if _, err := db.Insert[User]().Values(u).Exec(ctx); err != nil {
@@ -790,16 +795,17 @@ func TestHooksPairOnEveryPath(t *testing.T) {
 		BeforeQuery: func(c context.Context, _ *barm.QueryEvent) context.Context { before++; return c },
 		AfterQuery:  func(_ context.Context, ev *barm.QueryEvent) { after++; errs = append(errs, ev.Err) },
 	})
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/pair.db", barm.SQLite, hook)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/pair.db", barm.SQLite, hook)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE users (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER,
 		created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
+	before, after, errs = 0, 0, nil // the CREATE above is watched too, and not what this counts
 	u := &User{Name: "kim", CreatedAt: time.Now()}
 
 	// prepared, through Query and through Exec
@@ -838,12 +844,12 @@ func TestHooksPairOnEveryPath(t *testing.T) {
 func TestHookSeesInsertResult(t *testing.T) {
 	ctx := t.Context()
 	rec := &recorder{}
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/h2.db", barm.SQLite, barm.WithHook(rec.hook()))
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/h2.db", barm.SQLite, barm.WithHook(rec.hook()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE users (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER,
 		created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
@@ -953,7 +959,7 @@ func TestNestedTx(t *testing.T) {
 func TestNestedTxDoesNotReleaseConn(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
-	db.SetMaxOpenConns(1) // one slot, so an early release would deadlock the next Begin
+	db.Pool().(*barm.SQLPool).DB().SetMaxOpenConns(1) // one slot, so an early release would deadlock the next Begin
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1120,7 +1126,7 @@ func TestPrepareFailureIsRetried(t *testing.T) {
 	if _, err := later.Slice(ctx); err == nil {
 		t.Fatal("expected an error preparing over a missing table")
 	}
-	if _, err := db.Exec(`CREATE TABLE later (id INTEGER, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE later (id INTEGER, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := later.Slice(ctx); err != nil {
@@ -1179,12 +1185,12 @@ func (r *txRecorder) AfterRollback(ctx context.Context, ev *barm.TxEvent) {
 
 func openTx(t *testing.T, rec *txRecorder) *barm.DB {
 	t.Helper()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/tx.db", barm.SQLite, barm.WithTxHook(rec.hook()))
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/tx.db", barm.SQLite, barm.WithTxHook(rec.hook()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	if _, err := db.Exec(`CREATE TABLE users (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER,
 		created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
@@ -1325,7 +1331,7 @@ func TestTxHookVetoesCommit(t *testing.T) {
 func TestTxHookPartial(t *testing.T) {
 	ctx := t.Context()
 	var commits, rollbacks int
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/p.db", barm.SQLite,
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/p.db", barm.SQLite,
 		barm.WithTxHook(barm.TxHook{
 			AfterCommit: func(context.Context, *barm.TxEvent) { commits++ },
 		}),
@@ -1361,7 +1367,7 @@ func TestTxHookPartial(t *testing.T) {
 func TestQueryHookPartial(t *testing.T) {
 	ctx := t.Context()
 	var seen []string
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/q.db", barm.SQLite,
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/q.db", barm.SQLite,
 		barm.WithHook(barm.QueryHook{
 			AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { seen = append(seen, ev.Op) },
 		}))
@@ -1369,7 +1375,7 @@ func TestQueryHookPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE users (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER,
 		created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
@@ -1377,7 +1383,8 @@ func TestQueryHookPartial(t *testing.T) {
 	if _, err := db.Select[User]().Slice(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(seen, []string{"SELECT"}) {
+	// SQL run straight on the handle is watched as much as a built query
+	if !slices.Equal(seen, []string{"CREATE", "SELECT"}) {
 		t.Fatalf("seen = %v", seen)
 	}
 }
@@ -1556,7 +1563,7 @@ func TestTxHooksNestedBookkeeping(t *testing.T) {
 func TestTxHooksDoNotLeakToTheDB(t *testing.T) {
 	ctx := t.Context()
 	var base, scoped int
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/s.db", barm.SQLite,
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/s.db", barm.SQLite,
 		barm.WithTxHook(barm.TxHook{
 			AfterCommit: func(context.Context, *barm.TxEvent) { base++ },
 		}))
@@ -1612,12 +1619,12 @@ func TestInsertAutoKeyMixedRows(t *testing.T) {
 // The point of leaving the column out: the database fills it in.
 func TestInsertDefaultAppliesInTheDatabase(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/d.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/d.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE events (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		created_at TIMESTAMP NOT NULL DEFAULT current_timestamp)`); err != nil {
@@ -1683,10 +1690,10 @@ func TestConnHoldsItsSession(t *testing.T) {
 	defer c.Close()
 
 	// A temporary table lives on the connection that made it.
-	if _, err := c.ExecContext(ctx, `CREATE TEMP TABLE tmp_users (name TEXT)`); err != nil {
+	if _, err := c.Exec(ctx, `CREATE TEMP TABLE tmp_users (name TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.ExecContext(ctx, `INSERT INTO tmp_users VALUES ('held')`); err != nil {
+	if _, err := c.Exec(ctx, `INSERT INTO tmp_users VALUES ('held')`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := c.Select[string]().Table("tmp_users").Column("name").One(ctx)
@@ -1718,7 +1725,7 @@ func TestConnTxLeavesTheConnectionHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, err := c.ExecContext(ctx, `CREATE TEMP TABLE tmp_marker (n INTEGER)`); err != nil {
+	if _, err := c.Exec(ctx, `CREATE TEMP TABLE tmp_marker (n INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1735,7 +1742,7 @@ func TestConnTxLeavesTheConnectionHeld(t *testing.T) {
 	}
 
 	// Still the same connection: the temp table proves it was never released.
-	if _, err := c.ExecContext(ctx, `INSERT INTO tmp_marker VALUES (1)`); err != nil {
+	if _, err := c.Exec(ctx, `INSERT INTO tmp_marker VALUES (1)`); err != nil {
 		t.Fatalf("the connection was returned to the pool by Commit: %v", err)
 	}
 	if n, err := c.Select[User]().Where("name = ?", "in-tx").Count(ctx); err != nil || n != 1 {
@@ -1750,7 +1757,7 @@ func TestConnTxLeavesTheConnectionHeld(t *testing.T) {
 	if err := tx2.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.ExecContext(ctx, `INSERT INTO tmp_marker VALUES (2)`); err != nil {
+	if _, err := c.Exec(ctx, `INSERT INTO tmp_marker VALUES (2)`); err != nil {
 		t.Fatalf("the connection was returned to the pool by Rollback: %v", err)
 	}
 }
@@ -1815,7 +1822,7 @@ type bookLite struct {
 
 func openAuthors(t *testing.T, hook ...barm.Option) *barm.DB {
 	t.Helper()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/rel.db", barm.SQLite, hook...)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/rel.db", barm.SQLite, hook...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1824,7 +1831,7 @@ func openAuthors(t *testing.T, hook ...barm.Option) *barm.DB {
 		`CREATE TABLE authors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT)`,
 		`CREATE TABLE books (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, author_id INTEGER)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2033,7 +2040,7 @@ func TestRelationNested(t *testing.T) {
 			queries = append(queries, ev.Query)
 		},
 	}))
-	if _, err := db.Exec(`CREATE TABLE reviews (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE reviews (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER, body TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -2109,7 +2116,7 @@ type authorTwo struct {
 func TestRelationSiblingsFallBackWithoutABatcher(t *testing.T) {
 	ctx := t.Context()
 	db := openAuthors(t)
-	if _, err := db.Exec(`CREATE TABLE tags (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE tags (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, label TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -2197,9 +2204,8 @@ func TestRelationKeyInProjection(t *testing.T) {
 	}
 }
 
-// Tx embeds both *sql.Tx and *barm.Conn. The transaction is the shallower one,
-// so a query goes to it and rolls back with it rather than landing on the
-// connection outside the transaction.
+// SQL run on a Tx goes into the transaction and rolls back with it, rather than
+// landing on the connection outside it.
 func TestTxQueriesGoToTheTransaction(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -2208,7 +2214,7 @@ func TestTxQueriesGoToTheTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO users (name, email, age, created_at) VALUES ('ghost', 'g@x.io', 1, ?)`,
 		time.Now()); err != nil {
 		t.Fatal(err)
@@ -2218,27 +2224,6 @@ func TestTxQueriesGoToTheTransaction(t *testing.T) {
 	}
 	if n, err := db.Select[User]().Where("name = ?", "ghost").Count(ctx); err != nil || n != 0 {
 		t.Fatalf("count = %d, err = %v — the write escaped the transaction", n, err)
-	}
-}
-
-// Close would otherwise be promoted from the connection and hand it back with
-// the transaction still open on it.
-func TestTxCloseIsRefused(t *testing.T) {
-	ctx := t.Context()
-	db := open(t)
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-
-	if err := tx.Close(); err == nil || !strings.Contains(err.Error(), "Commit or Rollback") {
-		t.Fatalf("Close = %v, want it refused", err)
-	}
-	// and the transaction is untouched
-	if _, err := tx.Select[User]().Count(ctx); err != nil {
-		t.Errorf("the transaction stopped working after Close: %v", err)
 	}
 }
 
@@ -2473,7 +2458,7 @@ func TestRelationBytesKey(t *testing.T) {
 		`INSERT INTO bp VALUES (x'01'), (x'02')`,
 		`INSERT INTO bc VALUES (x'01', 'a'), (x'01', 'b'), (x'02', 'c')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2525,7 +2510,7 @@ func TestPreparedParentWithRelation(t *testing.T) {
 func TestRelationCustomizerJoin(t *testing.T) {
 	ctx := t.Context()
 	db := openAuthors(t)
-	if _, err := db.Exec(`CREATE TABLE awards (id INTEGER PRIMARY KEY, book_id INTEGER, author_id INTEGER, name TEXT)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE awards (id INTEGER PRIMARY KEY, book_id INTEGER, author_id INTEGER, name TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.Select[Author]().OrderBy("id").
@@ -2608,7 +2593,7 @@ func TestRelationPointerParentKey(t *testing.T) {
 		`CREATE TABLE emps (id INTEGER PRIMARY KEY, name TEXT, mgr_id INTEGER)`,
 		`INSERT INTO emps VALUES (1, 'boss', NULL), (2, 'dev', 1)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2658,7 +2643,7 @@ func TestRelationNeedsParentKeySelected(t *testing.T) {
 func TestEmptyRelationIsNotNil(t *testing.T) {
 	ctx := t.Context()
 	db := openAuthors(t)
-	if _, err := db.Exec(`CREATE TABLE reviews (
+	if _, err := db.Exec(t.Context(), `CREATE TABLE reviews (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER, body TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -2804,12 +2789,12 @@ type nullRow struct {
 
 func TestNullable(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/n.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/n.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	if _, err := db.Exec(`CREATE TABLE nulls (id INTEGER PRIMARY KEY AUTOINCREMENT,
+	if _, err := db.Exec(t.Context(), `CREATE TABLE nulls (id INTEGER PRIMARY KEY AUTOINCREMENT,
 		bio TEXT, age INTEGER, rate INTEGER, ptr TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -3054,7 +3039,7 @@ func TestBeginOnIDB(t *testing.T) {
 	if err := inTx(ctx, c, insert("conn")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PingContext(ctx); err != nil {
+	if _, err := c.Exec(ctx, "SELECT 1"); err != nil {
 		t.Errorf("the connection should still be held: %v", err)
 	}
 
@@ -3089,7 +3074,7 @@ type nzParent struct {
 // down every path that scans.
 func TestNullZero(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/nz.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/nz.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3099,7 +3084,7 @@ func TestNullZero(t *testing.T) {
 		`CREATE TABLE nz_parent (id INTEGER PRIMARY KEY)`,
 		`INSERT INTO nz_parent (id) VALUES (7)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3113,7 +3098,7 @@ func TestNullZero(t *testing.T) {
 	}
 
 	var nulls int
-	err = db.QueryRowContext(ctx, `SELECT count(*) FROM nz WHERE name IS NULL AND seen IS NULL AND count IS NULL AND rate IS NULL AND blob IS NULL`).Scan(&nulls)
+	err = queryRow(ctx, db, `SELECT count(*) FROM nz WHERE name IS NULL AND seen IS NULL AND count IS NULL AND rate IS NULL AND blob IS NULL`).Scan(&nulls)
 	if err != nil || nulls != 1 {
 		t.Fatalf("rows written all NULL = %d, %v, want 1", nulls, err)
 	}
@@ -3182,12 +3167,12 @@ type jsonRow struct {
 // go in as NULL, not as the literal null, and NULL comes back as the zero.
 func TestJSONColumns(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/js.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/js.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE js (id INTEGER PRIMARY KEY AUTOINCREMENT, meta TEXT, opt TEXT, attrs TEXT, list TEXT, zeroed TEXT)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE js (id INTEGER PRIMARY KEY AUTOINCREMENT, meta TEXT, opt TEXT, attrs TEXT, list TEXT, zeroed TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3205,12 +3190,12 @@ func TestJSONColumns(t *testing.T) {
 
 	var meta, opt, attrs, list string
 	var zeroed sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT meta, opt, attrs, list, zeroed FROM js WHERE id = ?`, full.ID).Scan(&meta, &opt, &attrs, &list, &zeroed)
+	err = queryRow(ctx, db, `SELECT meta, opt, attrs, list, zeroed FROM js WHERE id = ?`, full.ID).Scan(&meta, &opt, &attrs, &list, &zeroed)
 	if err != nil || meta != `{"tags":["a"],"score":3}` || opt != `{"tags":null,"score":1}` || attrs != `{"x":1}` || list != `[1,2]` || zeroed.String != `{"tags":null,"score":9}` {
 		t.Fatalf("stored %s %s %s %s %v, %v", meta, opt, attrs, list, zeroed, err)
 	}
 	var nulls int
-	err = db.QueryRowContext(ctx, `SELECT count(*) FROM js WHERE id = ? AND opt IS NULL AND attrs IS NULL AND list IS NULL AND zeroed IS NULL`, bare.ID).Scan(&nulls)
+	err = queryRow(ctx, db, `SELECT count(*) FROM js WHERE id = ? AND opt IS NULL AND attrs IS NULL AND list IS NULL AND zeroed IS NULL`, bare.ID).Scan(&nulls)
 	if err != nil || nulls != 1 {
 		t.Fatalf("nil and nullzero stored as NULL = %d, %v, want 1", nulls, err)
 	}
@@ -3277,7 +3262,7 @@ type soTcase struct {
 // query, and left alone by a query that does not ask for them.
 func TestScanOnlyRuns(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/so.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/so.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3287,7 +3272,7 @@ func TestScanOnlyRuns(t *testing.T) {
 		`CREATE TABLE so_tcases (id INTEGER PRIMARY KEY, folder_id INTEGER, title TEXT)`,
 		`INSERT INTO so_tcases (id, folder_id, title) VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3337,19 +3322,19 @@ type suTenant struct {
 // something else wrote there.
 func TestSkipUpdateRuns(t *testing.T) {
 	ctx := t.Context()
-	db, err := barm.Open("sqlite", "file:"+t.TempDir()+"/su.db", barm.SQLite)
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/su.db", barm.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE su_tenants (id INTEGER PRIMARY KEY, name TEXT, total_users INTEGER)`); err != nil {
+	if _, err := db.Exec(t.Context(), `CREATE TABLE su_tenants (id INTEGER PRIMARY KEY, name TEXT, total_users INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
 	v := &suTenant{ID: 1, Name: "acme", Users: 3}
 	if _, err := db.Insert[suTenant]().Values(v).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE su_tenants SET total_users = 10`); err != nil { // the counter moves elsewhere
+	if _, err := db.Exec(t.Context(), `UPDATE su_tenants SET total_users = 10`); err != nil { // the counter moves elsewhere
 		t.Fatal(err)
 	}
 	v.Name = "acme inc" // v.Users is still 3
@@ -3359,5 +3344,340 @@ func TestSkipUpdateRuns(t *testing.T) {
 	got, err := db.Select[suTenant]().One(ctx)
 	if err != nil || got.Name != "acme inc" || got.Users != 10 {
 		t.Errorf("got %+v, %v, want the new name and the counter left at 10", got, err)
+	}
+}
+
+// openSQL opens a database/sql database and runs barm on it.
+func openSQL(driver, dsn string, d barm.Dialect, opts ...barm.Option) (*barm.DB, error) {
+	sqldb, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return barm.New(barm.SQL(sqldb), d, opts...), nil
+}
+
+// row is the first row of a raw query, scanned positionally.
+type row struct {
+	rows barm.Rows
+	err  error
+}
+
+func queryRow(ctx context.Context, h barm.IDB, query string, args ...any) row {
+	rows, err := h.Query(ctx, query, args...)
+	return row{rows, err}
+}
+
+func (r row) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	defer r.rows.Close()
+	if !r.rows.Next() {
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	return r.rows.Scan(dest...)
+}
+
+// A hook that masks a value in place changes what it reports, not what is
+// written.
+func TestHookArgsAreACopy(t *testing.T) {
+	ctx := t.Context()
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/mask.db", barm.SQLite, barm.WithHook(barm.QueryHook{
+		BeforeQuery: func(c context.Context, ev *barm.QueryEvent) context.Context {
+			for i, a := range ev.Args {
+				if a == "hunter2" {
+					ev.Args[i] = "***"
+				}
+			}
+			return c
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Insert[User]().Values(&User{Name: "hunter2", CreatedAt: time.Now()}).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	u, err := db.Select[User]().One(ctx)
+	if err != nil || u.Name != "hunter2" {
+		t.Errorf("stored %q, %v, want what was bound, not what the hook showed", u.Name, err)
+	}
+}
+
+// On a driver that cannot batch, relations run one query at a time, and the
+// hooks see each once, as it ran — not a failed batch first.
+func TestRelationHooksWithoutBatching(t *testing.T) {
+	ctx := t.Context()
+	var errs []error
+	db := openAuthors(t, barm.WithHook(barm.QueryHook{
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { errs = append(errs, ev.Err) },
+	}))
+	if _, err := db.Exec(ctx, `CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, label TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	errs = nil
+	if _, err := db.Select[Author]().Relation[Book]("Books").Relation[tagRow]("Tags").Slice(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) != 3 || slices.ContainsFunc(errs, func(e error) bool { return e != nil }) {
+		t.Errorf("hooks saw %v, want three queries that ran fine", errs)
+	}
+}
+
+type blobKey []byte
+
+type namedKeyOwner struct {
+	barm.BaseModel `barm:"table:nk_owners"`
+
+	Key   blobKey         `barm:"k,pk"`
+	Items []namedKeyChild `barm:"rel:k=owner"`
+}
+
+type namedKeyChild struct {
+	barm.BaseModel `barm:"table:nk_children"`
+
+	Owner blobKey `barm:"owner"`
+	Name  string  `barm:"name"`
+}
+
+// A relation keyed by a named byte slice groups its rows like a plain []byte
+// one, rather than panicking on a key a map cannot hold.
+func TestRelationNamedByteKey(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	for _, q := range []string{
+		`CREATE TABLE nk_owners (k BLOB PRIMARY KEY)`,
+		`CREATE TABLE nk_children (owner BLOB, name TEXT)`,
+		`INSERT INTO nk_owners VALUES (x'01'), (x'02')`,
+		`INSERT INTO nk_children VALUES (x'01', 'a'), (x'01', 'b'), (x'02', 'c')`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owners, err := db.Select[namedKeyOwner]().OrderBy("k").Relation[namedKeyChild]("Items").Slice(ctx)
+	if err != nil || len(owners) != 2 || len(owners[0].Items) != 2 || len(owners[1].Items) != 1 {
+		t.Fatalf("owners = %+v, %v", owners, err)
+	}
+}
+
+// Two DBs on one pool share its prepared statements, so one name meaning two
+// queries is an error rather than one DB running the other's SQL.
+func TestPreparedNameAcrossDBsOnOnePool(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	for _, age := range []int{10, 90} {
+		if _, err := db.Insert[User]().Values(&User{Name: "u", Age: age, CreatedAt: time.Now()}).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := barm.New(db.Pool(), barm.SQLite)
+	if _, err := db.Select[User]().Where("age < ?", 50).Prepare("shared").Slice(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := other.Select[User]().Where("age > ?", 50).Prepare("shared").Slice(ctx)
+	if err == nil {
+		t.Errorf("ran the other DB's statement: %+v", rows)
+	}
+}
+
+// A sequential batch on the pool that fails inside a transaction it began does
+// not hand the next caller a connection still in it.
+func TestFailedPoolBatchDropsItsConnection(t *testing.T) {
+	ctx := t.Context()
+	sqldb, err := sql.Open("sqlite", "file:"+t.TempDir()+"/fail.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	b := db.Batch()
+	b.Begin()
+	b.Exec(db.Insert[User]().Values(&User{Name: "half", CreatedAt: time.Now()}))
+	b.Exec(db.NewRaw("INSERT INTO nope VALUES (1)"))
+	b.Commit()
+	if err := b.Run(ctx); err == nil {
+		t.Fatal("the batch should fail")
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("the next transaction: %v", err)
+	}
+	defer tx.Rollback()
+	if n, err := tx.Select[User]().Count(ctx); err != nil || n != 0 {
+		t.Errorf("count = %d, %v, want the failed batch's insert gone", n, err)
+	}
+}
+
+// A rolled-back nested transaction releases its savepoint, so failing ones in
+// a loop do not pile up, and the deferred Rollback after it is a no-op.
+func TestNestedRollbackReleases(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	inner, err := tx.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+		t.Errorf("second rollback = %v, want ErrTxDone", err)
+	}
+	if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT barm_sp_1"); err == nil {
+		t.Error("the savepoint is still open")
+	}
+}
+
+// countingDriver wraps sqlite's driver and counts the statements it prepares.
+type countingDriver struct {
+	inner    driver.Driver
+	prepares *atomic.Int64
+}
+
+func (d countingDriver) Open(name string) (driver.Conn, error) {
+	c, err := d.inner.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return countingConn{c, d.prepares}, nil
+}
+
+type countingConn struct {
+	driver.Conn
+	prepares *atomic.Int64
+}
+
+func (c countingConn) Prepare(query string) (driver.Stmt, error) {
+	c.prepares.Add(1)
+	return c.Conn.Prepare(query)
+}
+
+func (c countingConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	c.prepares.Add(1)
+	return c.Conn.(driver.ConnPrepareContext).PrepareContext(ctx, query)
+}
+
+func (c countingConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+}
+
+func (c countingConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+}
+
+func (c countingConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+}
+
+var countingPrepares atomic.Int64
+
+func init() {
+	sqldb, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		panic(err)
+	}
+	sql.Register("countingsqlite", countingDriver{sqldb.Driver(), &countingPrepares})
+	sqldb.Close()
+}
+
+// A transaction begun on a held connection binds each named statement once,
+// rather than having database/sql prepare it again on every run.
+func TestSQLTxPreparesOncePerName(t *testing.T) {
+	ctx := t.Context()
+	db, err := openSQL("countingsqlite", "file:"+t.TempDir()+"/count.db", barm.SQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	tx, err := c.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	before := countingPrepares.Load()
+	for range 20 {
+		if _, err := tx.Select[User]().Where("age > ?", 1).Prepare("per_tx").Slice(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countingPrepares.Load() - before; n > 2 {
+		t.Errorf("%d prepares for one name in one transaction, want at most 2", n)
+	}
+}
+
+// A sequential batch runs a named query prepared: once per batch on the pool,
+// whose connection it only borrows, and once for good on a held connection.
+func TestSQLBatchPreparesNamed(t *testing.T) {
+	ctx := t.Context()
+	sqldb, err := sql.Open("countingsqlite", "file:"+t.TempDir()+"/batch.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
+	defer db.Close()
+	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO users (name, email, age, created_at) VALUES ('ann', 'a', 20, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, tc := range []struct {
+		name     string
+		batch    func() *barm.Batch
+		sel      func() *barm.SelectQuery[User]
+		prepares [2]int64
+	}{
+		{"pool", db.Batch, db.Select[User], [2]int64{1, 1}},
+		{"held connection", c.Batch, c.Select[User], [2]int64{1, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for run, want := range tc.prepares {
+				before := countingPrepares.Load()
+				b := tc.batch()
+				rs := make([]*barm.BatchResult[User], 5)
+				for i := range rs {
+					rs[i] = b.One(tc.sel().Where("age >= ?", 10+i).Prepare("seq_" + tc.name))
+				}
+				if err := b.Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if rs[4].Value().Name != "ann" {
+					t.Fatalf("run %d: got %+v", run, rs[4].Value())
+				}
+				if got := countingPrepares.Load() - before; got != want {
+					t.Errorf("run %d: %d prepares, want %d", run, got, want)
+				}
+			}
+		})
 	}
 }

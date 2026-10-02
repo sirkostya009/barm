@@ -2,6 +2,7 @@ package barm_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -35,6 +36,27 @@ func (s *stubBatcher) SendBatch(ctx context.Context, qs []barm.BatchQuery, read 
 	return read(stubReader{})
 }
 
+// stubPool is a Pool whose batches go to the stub; nothing else is called.
+type stubPool struct{ *stubBatcher }
+
+func (stubPool) Query(context.Context, string, []any) (barm.Rows, error) { panic("unused") }
+func (stubPool) Exec(context.Context, string, []any) (sql.Result, error) { panic("unused") }
+func (stubPool) QueryPrepared(context.Context, string, string, []any) (barm.Rows, error) {
+	panic("unused")
+}
+func (stubPool) ExecPrepared(context.Context, string, string, []any) (sql.Result, error) {
+	panic("unused")
+}
+func (stubPool) Acquire(context.Context) (barm.DriverConn, error) { panic("unused") }
+func (stubPool) Begin(context.Context, *sql.TxOptions) (barm.DriverTx, error) {
+	panic("unused")
+}
+func (stubPool) Close() error { return nil }
+
+func stubbed(stub *stubBatcher, opts ...barm.Option) *barm.DB {
+	return barm.New(stubPool{stub}, barm.Postgres, opts...)
+}
+
 type stubReader struct{}
 
 func (stubReader) Rows() (barm.Rows, error)       { return nil, errors.New("stub: no rows") }
@@ -44,10 +66,10 @@ func (stubReader) Exec() (barm.ExecResult, error) { return barm.ExecResult{}, ni
 // empty answer.
 func TestBatchResultBeforeRun(t *testing.T) {
 	t.Parallel()
-	db := barm.NewBuilder(barm.Postgres)
 	stub := &stubBatcher{}
+	db := stubbed(stub)
 
-	b := db.Batch(stub)
+	b := db.Batch()
 	users := b.Slice(db.Select[batchUser]())
 	total := b.Count(db.Select[batchUser]())
 
@@ -71,10 +93,10 @@ func TestBatchResultBeforeRun(t *testing.T) {
 // A failure part-way leaves the queries behind it not-run.
 func TestBatchResultAfterAbort(t *testing.T) {
 	t.Parallel()
-	db := barm.NewBuilder(barm.Postgres)
 	stub := &stubBatcher{}
+	db := stubbed(stub)
 
-	b := db.Batch(stub)
+	b := db.Batch()
 	first := b.Slice(db.Select[batchUser]()) // the stub fails every Rows call
 	second := b.Exec(db.Insert[batchUser]().Values(&batchUser{Name: "x"}))
 
@@ -93,21 +115,44 @@ func TestBatchResultAfterAbort(t *testing.T) {
 	}
 }
 
-func TestBatchWithoutDriver(t *testing.T) {
+// A builder-only DB has nothing to batch on, and says so when queueing.
+func TestBatchWithoutConnection(t *testing.T) {
 	t.Parallel()
 	plain := barm.NewBuilder(barm.Postgres)
 	b := plain.Batch()
 	users := b.Slice(plain.Select[batchUser]())
 
-	if !errors.Is(b.Err(), barm.ErrNoBatcher) {
-		t.Errorf("Err() = %v, want ErrNoBatcher", b.Err())
+	if !errors.Is(b.Err(), barm.ErrNoConn) {
+		t.Errorf("Err() = %v, want ErrNoConn", b.Err())
 	}
-	if !errors.Is(users.Err(), barm.ErrNoBatcher) {
-		t.Errorf("result err = %v, want ErrNoBatcher", users.Err())
+	if !errors.Is(users.Err(), barm.ErrNoConn) {
+		t.Errorf("result err = %v, want ErrNoConn", users.Err())
 	}
 	err := b.Run(t.Context())
-	if !errors.Is(err, barm.ErrNoBatcher) {
-		t.Errorf("Run() = %v, want ErrNoBatcher", err)
+	if !errors.Is(err, barm.ErrNoConn) {
+		t.Errorf("Run() = %v, want ErrNoConn", err)
+	}
+}
+
+// database/sql cannot send statements together: its batch fails before
+// sending anything, unless SequentialBatches asked for one at a time.
+func TestSQLBatchNeedsSequential(t *testing.T) {
+	t.Parallel()
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
+	b := db.Batch()
+	users := b.Slice(db.Select[User]())
+	err := b.Run(t.Context())
+	if !errors.Is(err, barm.ErrNoBatcher) || !errors.Is(users.Err(), barm.ErrNoBatcher) {
+		t.Errorf("Run() = %v, result = %v, want ErrNoBatcher", err, users.Err())
+	}
+
+	seq := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.SequentialBatches()), barm.Postgres)
+	b = seq.Batch()
+	users = b.Slice(seq.Select[User]())
+	one := b.One(seq.Select[User]())
+	err = b.Run(t.Context())
+	if err != nil || len(users.Value()) != 1 || one.Value().Name != "name" {
+		t.Errorf("sequential: %v, %v, %+v", err, users.Value(), one.Value())
 	}
 }
 
@@ -117,7 +162,7 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var got []barm.QueryEvent
-	db := barm.NewBuilder(barm.Postgres, barm.WithHook(barm.QueryHook{
+	db := stubbed(&stubBatcher{}, barm.WithHook(barm.QueryHook{
 		BeforeQuery: func(ctx context.Context, ev *barm.QueryEvent) context.Context {
 			return context.WithValue(ctx, ctxKey{}, ev.StartedAt)
 		},
@@ -131,7 +176,7 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 		},
 	}))
 
-	b := db.Batch(&stubBatcher{})
+	b := db.Batch()
 	b.Count(db.Select[batchUser]())
 	b.Exec(db.Insert[batchUser]().Values(&batchUser{Name: "a"}))
 

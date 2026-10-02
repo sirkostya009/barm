@@ -1,7 +1,7 @@
-// DB is the entry point: it wraps a *sql.DB with a dialect and starts queries.
+// DB is the entry point: it runs on a Pool, in a dialect, and starts queries.
 // It also declares what the other handles share: the IDB interface Tx and Conn
-// satisfy, the session holding statements and hooks, and Handle, which gives an
-// IDB the generic methods an interface cannot declare.
+// satisfy, the session holding statement names and hooks, and Handle, which
+// gives an IDB the generic methods an interface cannot declare.
 
 package barm
 
@@ -10,18 +10,7 @@ import (
 	"database/sql"
 	"iter"
 	"slices"
-	"time"
 )
-
-// Querier is database/sql's query surface, satisfied by *sql.DB, *sql.Tx and
-// *sql.Conn — and by barm's own DB, Tx and Conn, which embed them. It is the
-// least a caller has to accept to stay agnostic about which one it got. barm
-// itself reads through QueryContext alone.
-type Querier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
 
 // session is what a DB, a transaction and a held connection all carry: where
 // named statements live, and who is watching. A query reads it off the handle
@@ -36,7 +25,7 @@ type Querier interface {
 // Everywhere else that sharing is the thing to prevent, so every handle that can
 // diverge is built with a list of its own. See own.
 type session struct {
-	stmts   *stmtCache
+	names   *names
 	hooks   []QueryHook
 	txHooks *[]txHook
 	dedup   bool
@@ -55,12 +44,22 @@ func (s *session) own() session {
 // handle it runs on. A Tx's own shadows that of the Conn inside it.
 func (s *session) sess() *session { return s }
 
-// DB wraps a *sql.DB with a dialect. The embedded *sql.DB stays reachable, so
-// barm plugs into existing database/sql code instead of replacing it.
+// DB runs queries on a Pool: SQL's, over database/sql, or pgxdriver's, over
+// pgx. A DB from NewBuilder has none, and renders SQL only.
 type DB struct {
-	*sql.DB
+	pool Pool
 	session
 	dialect Dialect
+}
+
+// Pool returns the pool the DB runs on, nil for a DB from NewBuilder.
+func (db *DB) Pool() Pool { return db.pool }
+
+func (db *DB) executor() Executor {
+	if db.pool == nil {
+		return nil // an interface holding a nil Pool would not read as nil
+	}
+	return db.pool
 }
 
 // Dialect returns the dialect this builds queries for. A Conn and a Tx ask
@@ -108,14 +107,18 @@ type TypedQuery[T any] interface {
 // which is how one function serves a DB, a transaction and a held connection
 // alike. The method set is closed to barm's own types.
 type IDB interface {
-	Querier
 	Dialect() Dialect
+	// Exec and Query run SQL as written, in the driver's own placeholders,
+	// with the hooks watching. Builders and NewRaw are the way to bind with ?.
+	Exec(ctx context.Context, query string, args ...any) (sql.Result, error)
+	Query(ctx context.Context, query string, args ...any) (Rows, error)
 	// BeginTx starts a transaction on whatever the handle is: a DB takes a
 	// connection for it, a Conn lends its own, and a Tx opens a savepoint.
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error)
 	Begin() (*Tx, error)
 	runner() runner
 	sess() *session
+	executor() Executor
 }
 
 // todo: just add Select/Insert/Update/Delete once generic methods are allowed on interfaces
@@ -181,28 +184,33 @@ func WithTxHook(hooks ...TxHook) Option {
 	}
 }
 
-// New wraps an existing *sql.DB.
-func New(db *sql.DB, d Dialect, opts ...Option) *DB {
-	out := &DB{DB: db,
-		dialect: d, stmts: &stmtCache{p: db}, txHooks: new([]txHook)}
+// New runs barm on a pool, building queries in dialect d:
+//
+//	db := barm.New(barm.SQL(sqldb), barm.SQLite)
+//	db := barm.New(pgxdriver.Pool(pgxpool), barm.Postgres)
+func New(pool Pool, d Dialect, opts ...Option) *DB {
+	out := &DB{pool: pool, dialect: d, names: &names{}, txHooks: new([]txHook)}
 	for _, opt := range opts {
 		opt(out)
 	}
 	return out
 }
 
-// NewBuilder returns a DB that renders SQL but executes nothing. Use it with a
-// driver outside database/sql — the queries carry their own text and arguments,
-// which is all such a driver needs.
+// NewBuilder returns a DB that renders SQL but executes nothing — the queries
+// carry their own text and arguments, which is all a caller running them
+// elsewhere needs.
 func NewBuilder(d Dialect, opts ...Option) *DB { return New(nil, d, opts...) }
 
-// Open opens a database via database/sql and wraps it.
-func Open(driver, dsn string, d Dialect, opts ...Option) (*DB, error) {
-	sqldb, err := sql.Open(driver, dsn)
-	if err != nil {
-		return nil, err
-	}
-	return New(sqldb, d, opts...), nil
+// Exec runs SQL as written, in the driver's own placeholders.
+func (db *DB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	r := db.runner()
+	return r.exec(ctx, query, args)
+}
+
+// Query runs SQL as written and returns its rows, which the caller closes.
+func (db *DB) Query(ctx context.Context, query string, args ...any) (Rows, error) {
+	r := db.runner()
+	return r.query(ctx, query, args)
 }
 
 func (db *DB) runner() runner { return runner{h: db} }
@@ -226,78 +234,34 @@ func (db *DB) Delete[T any]() *DeleteQuery[T] { return newDelete[T](db.runner())
 //	b := db.Batch()
 //	b.Exec(db.NewRaw("REFRESH MATERIALIZED VIEW daily"))
 //
-// Plain Raw is taken: Conn would shadow the *sql.Conn method of that name,
-// which is the way down to the driver and means something else entirely.
-//
 // Reading rows is Select's job — Table and ColumnExpr take SQL barm does not
 // parse, and they come back typed.
 func (db *DB) NewRaw(query string, args ...any) *RawQuery { return newRaw(db.runner(), query, args) }
 
-// Batch starts a batch on this DB. Which driver runs it is settled when it is
-// sent, by probing the connection then — so there is nothing to configure and
-// nothing here to go stale. Pass a Batcher to send it somewhere else entirely.
-func (db *DB) Batch(on ...Batcher) *Batch {
-	if len(on) > 0 {
-		return newBatch(on[0], db.hooks)
-	}
-	if db.DB == nil {
-		return newBatch(nil, db.hooks) // builder-only: no connection to batch on
-	}
-	return newBatch(&sqlDBBatcher{db.DB}, db.hooks)
-}
+// Batch starts a batch on this DB, sent on whichever connection the pool hands
+// out for it.
+func (db *DB) Batch() *Batch { return newBatch(db.executor(), &db.session, false, false) }
 
-// Close closes every cached prepared statement, then the underlying *sql.DB.
+// Close closes the pool.
 func (db *DB) Close() error {
-	err := db.stmts.close()
-	if db.DB == nil {
-		return err // builder-only
+	if db.pool == nil {
+		return nil // builder-only
 	}
-	cerr := db.DB.Close()
-	if cerr != nil {
-		return cerr
-	}
-	return err
+	return db.pool.Close()
 }
 
 // BeginTx starts a transaction. Pair it with `defer tx.Rollback()`: rolling back
-// a committed transaction is a no-op returning sql.ErrTxDone.
-//
-// It shadows the embedded *sql.DB's, which would hand back a *sql.Tx — one that
-// carries no dialect, no hooks and no builders, with nothing in the call to say
-// so.
+// a committed transaction is a no-op returning sql.ErrTxDone. The transaction
+// holds its connection until it ends, so one nobody finishes holds it for good.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	// Taken out of the pool rather than left to database/sql, so the transaction
-	// runs somewhere barm can reach: a *sql.Tx offers no way down to the driver,
-	// which is what batching needs. Commit and Rollback give it back.
-	c, err := db.Conn(ctx)
+	if db.pool == nil {
+		return nil, ErrNoConn
+	}
+	tx, err := db.pool.Begin(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	tx, err := c.Conn.BeginTx(ctx, opts)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-	// The DB's session, not the connection's: named statements stay in the
-	// DB-wide cache, so one prepared in a transaction outlives it.
-	t := &Tx{
-		Tx: tx, Conn: c, session: db.own(), owns: true,
-		ctx: ctx, startedAt: time.Now(), ended: make(chan struct{}),
-	}
-	t.seq, t.done = &t._seq, &t._done
-	// database/sql rolls the transaction back when the context ends, but the
-	// connection is barm's to return, so a transaction nobody finishes does not
-	// hold one for the life of the DB.
-	if ended := t.ended; ctx.Done() != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				c.Close()
-			case <-ended:
-			}
-		}()
-	}
-	return t, nil
+	return newTx(tx, db, db.own(), ctx), nil
 }
 
 func (db *DB) Begin() (*Tx, error) { return db.BeginTx(context.Background(), nil) }
@@ -306,16 +270,12 @@ func (db *DB) Begin() (*Tx, error) { return db.BeginTx(context.Background(), nil
 // only thing that gives it back — an unreleased connection is gone until the DB
 // closes.
 func (db *DB) Conn(ctx context.Context) (*Conn, error) {
-	if db.DB == nil {
+	if db.pool == nil {
 		return nil, ErrNoConn
 	}
-	c, err := db.DB.Conn(ctx)
+	c, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s := db.own()
-	// Its own cache too: a statement prepared on the pool would run wherever the
-	// pool put it, which is the one thing holding a connection rules out.
-	s.stmts = &stmtCache{p: c}
-	return &Conn{Conn: c, session: s, db: db}, nil
+	return &Conn{c: c, session: db.own(), db: db}, nil
 }

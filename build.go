@@ -381,13 +381,16 @@ func (b *builder) conds(kw string, conds []frag) *builder { //nolint:unparam // 
 	}
 	b.str(kw)
 	for i, c := range conds {
-		b.cond(i, c)
+		b.cond(i, c, len(conds) > 1)
 	}
 	return b
 }
 
-// cond writes one condition, joined to the one before it.
-func (b *builder) cond(i int, c frag) {
+// cond writes one condition, joined to the one before it. Among several, each
+// is wrapped in parentheses: barm does not parse the SQL, and an OR left bare —
+// in any of its spellings, MySQL's || among them — would bind across the ANDs
+// around it, out of a tenant filter, say.
+func (b *builder) cond(i int, c frag, wrap bool) {
 	if i > 0 {
 		if c.or {
 			b.str(" OR ")
@@ -395,7 +398,7 @@ func (b *builder) cond(i int, c frag) {
 			b.str(" AND ")
 		}
 	}
-	if needsParens(c.sql) {
+	if wrap {
 		b.byte('(').frag(c).byte(')')
 	} else {
 		b.frag(c)
@@ -413,7 +416,7 @@ func (b *builder) where(conds []frag, m *model, v reflect.Value) error {
 	b.str(" WHERE ")
 	for i, c := range conds {
 		if !c.pk {
-			b.cond(i, c)
+			b.cond(i, c, len(conds) > 1)
 			continue
 		}
 		if !v.IsValid() {
@@ -448,42 +451,6 @@ func (b *builder) where(conds []frag, m *model, v reflect.Value) error {
 		}
 	}
 	return nil
-}
-
-// needsParens wraps composite conditions so AND/OR precedence stays intact. The
-// keywords are matched in place rather than on an upper-cased copy, which cost
-// an allocation per condition.
-func needsParens(sql string) bool {
-	for i := 1; i < len(sql); i++ {
-		if bounds(sql[i-1]) && (keywordAt(sql[i:], "or") || keywordAt(sql[i:], "and")) {
-			return true
-		}
-	}
-	return false
-}
-
-// keywordAt reports whether s starts with the lower-case keyword kw, in any
-// case, as a whole word.
-func keywordAt(s, kw string) bool {
-	if len(s) <= len(kw) || !bounds(s[len(kw)]) {
-		return false
-	}
-	for i := range len(kw) {
-		if s[i]|0x20 != kw[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// bounds reports whether c can end a word next to a keyword: SQL takes any
-// whitespace there, and a parenthesis or a quote needs none.
-func bounds(c byte) bool {
-	switch c {
-	case ' ', '\t', '\n', '\r', '\f', '\v', '(', ')', '\'', '"', '`':
-		return true
-	}
-	return false
 }
 
 // returning writes a RETURNING clause, if there is one.

@@ -1,10 +1,10 @@
 # barm
 
-A fast, typed query builder for `database/sql`, built on Go 1.27 generic methods and
-iterators.
+A fast, typed query builder and ORM for Go, built on Go 1.27 generic methods and
+iterators. It runs natively on pgx's pool, or on any `database/sql` driver.
 
 ```go
-db := barm.New(sqldb, barm.Postgres)
+db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
 
 users, err := db.Select[User]().Where("age >= ?", 18).OrderBy("id DESC").Limit(20).Slice(ctx)
 user, err  := db.Select[User]().Where("email = ?", email).One(ctx)
@@ -18,14 +18,17 @@ for u, err := range db.Select[User]().Seq(ctx) { // streams, closes the rows on 
 You name the row type once, on the builder, and every terminal returns it. No type
 arguments at the call site, and no `interface{}` in sight.
 
-- **No dependencies.** The main module imports only the standard library.
-- **Plain `database/sql` underneath.** `*barm.DB` embeds `*sql.DB`, so everything you already
-  have keeps working.
+- **No dependencies.** The main module imports only the standard library. The pgx driver
+  lives in a module of its own.
+- **Native on Postgres.** On pgx's pool, every type pgx knows reads and writes as it is:
+  arrays, JSON, UUIDs. `database/sql` stays available for SQLite, MySQL and anything else.
 - **Values never enter the SQL text.** Every value is a bind argument, so there is nothing to
   escape.
 - **Nothing is guessed.** Tables and columns come from struct tags, not from Go names.
-- **Fewer round trips.** Relations load one query per level, batches pipeline, and a
-  prepared statement is parsed in the same round trip as its first run (with pgx).
+- **Fewer round trips.** Relations load one query per level, and a batch is one round trip
+  with pgx, prepared statements and transaction included.
+- **pgx decides how a query runs.** barm hands it the SQL and the arguments, so its
+  statement cache and exec mode work as you configured them.
 - **Faster than bun**, 1.5–3× when building and less memory when reading. See
   [Against bun](#against-bun).
 
@@ -47,6 +50,7 @@ arguments at the call site, and no `interface{}` in sight.
 - [Prepared statements](#prepared-statements)
 - [Batching](#batching)
 - [Hooks](#hooks)
+- [Drivers](#drivers)
 - [Interfaces](#interfaces)
 - [Dialects](#dialects)
 - [Not yet](#not-yet)
@@ -61,19 +65,26 @@ barm needs Go 1.27, which is the first release with generic methods.
 go get github.com/sirkostya009/barm
 ```
 
-For Postgres through pgx, add the driver module. Importing it for its side effect is all
-the setup batching and one-round-trip prepared statements need:
+barm runs on a pool, which you pick when creating the `DB`. For Postgres, use pgx's pool
+through the driver module:
 
 ```sh
 go get github.com/sirkostya009/barm/pgxdriver
 ```
 
 ```go
-import (
-	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/sirkostya009/barm/pgxdriver"
-)
+pool, err := pgxpool.New(ctx, dsn)
+db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
 ```
+
+For SQLite, MySQL or any other `database/sql` driver, wrap the `*sql.DB`:
+
+```go
+sqldb, err := sql.Open("sqlite", dsn)
+db := barm.New(barm.SQL(sqldb), barm.SQLite)
+```
+
+See [Drivers](#drivers) for what each one does differently.
 
 ## Example
 
@@ -88,11 +99,12 @@ type User struct {
 	CreatedAt time.Time `barm:"created_at,default:current_timestamp"`
 }
 
-db, err := barm.Open("pgx", dsn, barm.Postgres) // or barm.New(existingSQLDB, barm.Postgres)
+pool, err := pgxpool.New(ctx, dsn)
 if err != nil {
 	return err
 }
-defer db.Close()
+db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
+defer db.Close() // closes the pool
 
 u := &User{Name: "Ada", Email: "ada@example.com", Age: 36}
 _, err = db.Insert[User]().Values(u).Returning("id").Exec(ctx) // u.ID is filled in
@@ -212,6 +224,10 @@ type Account struct {
 - **Any column that holds JSON text works:** `json` or `jsonb` in Postgres, `JSON` in
   MySQL, `TEXT` in SQLite. The value is bound as a string, and Postgres stores it as a
   proper JSON value, not a JSON string.
+- **On pgx, the tag is optional:** pgx encodes and decodes `json`/`jsonb` itself, from the
+  column types the server reports. It is needed for writes only where a query runs
+  unprepared, under `QueryExecModeExec` or `QueryExecModeSimpleProtocol`, since pgx then
+  does not know the parameter is JSON. A query named with `Prepare` is never one of those.
 - **Nil is `NULL`.** A nil pointer, map or slice is written as SQL `NULL`, not as the JSON
   literal `null`. With `nullzero` as well, a zero struct is `NULL` too.
 - **`NULL` reads back as the zero value.**
@@ -304,7 +320,8 @@ db.Select[User]().
 	For("UPDATE") // FOR UPDATE
 ```
 
-`Offset` without `Limit` works on every dialect. SQLite and MySQL only take `OFFSET` as
+A negative `Limit` or `Offset` is an error rather than no limit, so a page size taken from
+input cannot ask for the whole table. `Offset` without `Limit` works on every dialect. SQLite and MySQL only take `OFFSET` as
 part of a `LIMIT`, so barm writes the "no limit" value there (`LIMIT -1` on SQLite).
 
 ### Tables a model does not name
@@ -388,11 +405,12 @@ Where("data ?? 'key'")                 // ?? is a literal question mark
   time too.
 
 **Combining conditions.** Each `Where` joins with `AND`, each `WhereOr` with `OR`, at the
-same level. A condition that contains `AND` or `OR` itself is wrapped in parentheses:
+same level. When there is more than one, each condition is wrapped in parentheses, so an
+`OR` inside one, in whatever spelling, cannot bind across the others:
 
 ```go
 Where("a = 1 OR b = 2").Where("c = ?", 3).WhereOr("d = ?", 4)
-// WHERE (a = 1 OR b = 2) AND c = $1 OR d = $2
+// WHERE (a = 1 OR b = 2) AND (c = $1) OR (d = $2)
 ```
 
 SQL binds `AND` tighter than `OR`, so that last line reads as `(... AND c) OR d`. To group an
@@ -456,6 +474,9 @@ db.Update[Doc]().Value(&d).WherePK().Where("version = ?", seen).Exec(ctx)
 ```go
 _, err := db.Insert[User]().Values(&a, &b).Returning("id", "created_at").Exec(ctx)
 ```
+
+If fewer rows come back than values went in — a trigger dropped one, say — the rows after it
+have landed on the wrong values, and `Exec` returns an error saying so.
 
 ### Upserts
 
@@ -716,10 +737,14 @@ It goes wherever a `Query` goes: into a batch, or in as a CTE body or a union br
 exists on `DB`, `Tx`, `Conn` and `Handle`. For reading rows, use `Select` with `Table` and
 `ColumnExpr`, which take raw SQL too and give you typed rows.
 
+`Exec(ctx, sql, args...)` and `Query(ctx, sql, args...)` on any handle run SQL exactly as
+written, in the driver's own placeholders (`$1` on Postgres), for statements like DDL or
+`SET`. `Query` returns `barm.Rows`, which the caller closes. Hooks see both.
+
 ## Transactions
 
-`Begin()` and `BeginTx(ctx, opts)` work as in `database/sql`, but return a `*barm.Tx` that
-builds queries:
+`Begin()` and `BeginTx(ctx, opts)` take `database/sql`'s `*sql.TxOptions` on every driver and
+return a `*barm.Tx` that builds queries:
 
 ```go
 tx, err := db.BeginTx(ctx, nil)
@@ -750,14 +775,13 @@ return tx.Commit()       // ends the transaction for real
 
 Under the hood a nested transaction is a savepoint, with no names for you to manage, and it
 nests as deep as you like. A savepoint cannot have its own isolation level, so a nested
-`BeginTx` needs nil options.
+`BeginTx` needs nil options. A nested `Rollback` rewinds to the savepoint and releases it, so
+failed nested transactions in a loop do not pile up open savepoints, and a second `Rollback`
+returns `sql.ErrTxDone`.
 
-**Connections.** `db.BeginTx` takes a connection out of the pool for the transaction and
-returns it at commit or rollback. Holding the connection is what lets a transaction batch,
-since a `*sql.Tx` gives no access to the driver. When the context you began with is
-cancelled, the connection is returned too, so an abandoned transaction does not hold it
-forever. With `context.Background()` there is nothing to watch, and your deferred
-`Rollback` is what returns it.
+**Connections.** A transaction holds its connection from begin until commit or rollback,
+so one nobody finishes holds it for good: always `defer tx.Rollback()`. On `database/sql`,
+the driver also rolls back when the context you began with ends; pgx does not.
 
 ## Held connections
 
@@ -779,7 +803,7 @@ if err != nil {
 }
 defer tx.Rollback()
 
-if _, err := tx.ExecContext(ctx, "SET LOCAL search_path = tenant_7"); err != nil {
+if _, err := tx.Exec(ctx, "SET LOCAL search_path = tenant_7"); err != nil {
 	return err
 }
 users, err := tx.Select[User]().Slice(ctx)
@@ -792,10 +816,8 @@ return tx.Commit()
   `Close` and passes to the next user of the connection, so reset it yourself if you use it.
 - **A transaction begun on a `Conn` borrows it.** The connection stays held after commit or
   rollback.
-- **Always `Close` a `Conn`.** One you forget is gone for the life of the DB, because
-  `database/sql` sets no finalizer on it.
-- **`db.Conn` returns `*barm.Conn`.** It shadows the embedded `sql.DB.Conn`. The embedded
-  `*sql.Conn` is still there for `Raw` and `PingContext`.
+- **Always `Close` a `Conn`.** One you forget is never given back to the pool.
+- **`Driver()`** on a `Conn` or a `Tx` returns the driver's own connection or transaction.
 
 ## Schemas
 
@@ -842,31 +864,53 @@ _, err = db.Insert[User]().Values(&u).Prepare("insert_user").Exec(ctx)
 - **Argument dedup is never applied**, since it would make the text depend on memory
   layout.
 
-**With pgx** (`pgxdriver` imported), a named statement is prepared on the connection that
-runs it, **in the same round trip** as its first run: Parse, Bind and Execute go out
-together. After that it runs by name, one round trip each time, with no Parse. Inside a
-transaction it uses the transaction's own connection, so a first use never needs a second
-connection from the pool, which could wait forever if the pool is full. If the server has
-forgotten the statement (`DEALLOCATE`, a pooler resetting the session), it is prepared again
-on the spot.
+**A query without `Prepare` runs however the driver runs queries.** barm hands pgx the SQL
+and its arguments, so the pool's `DefaultQueryExecMode` decides. By default that is pgx's
+statement cache, which prepares each query text once per connection and runs it by name
+after. In a batch, barm's driver keeps the same statements the same way itself, up to the
+same `StatementCacheCapacity`. Set the mode to `QueryExecModeExec` to prepare nothing, at
+the price of Postgres parsing and planning every query, about 12 µs each on a local server:
 
-The first run sends arguments as text of no declared type, like pgx's own exec mode, and the
-server works out each parameter's type from the SQL. Where it cannot tell, add a cast such as
-`$1::uuid`. Later runs encode arguments for the types the server chose.
+```go
+cfg, _ := pgxpool.ParseConfig(dsn)
+cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+pool, _ := pgxpool.NewWithConfig(ctx, cfg)
+```
 
-**With other drivers**, statements go through `database/sql`'s `Prepare`. That is a separate
-round trip, and on a pool it takes its own connection. Inside a transaction the statement is
-then rebound to it. `Seq` always takes this path, on every driver: the pgx path holds the
-connection until the rows are read, so a loop that queried the same transaction would wait
-on itself.
+**On pgx**, a named query is prepared whatever the pool's mode, and runs by name after, one
+round trip each time with no Parse. Its arguments are encoded for the types the server gives
+its parameters, as pgx's statement cache encodes them: encoded without knowing them, a
+`time.Time` bound for a `timestamp` column would store a different value, and a map bound for
+`jsonb` would not encode at all. The pool keeps those types for all its connections:
 
-A `Conn` keeps its own statement cache, prepared on its connection. `db.Close()` closes the
-cached statements, then the database.
+- **New to the pool**, a statement with arguments is described first, a round trip of its
+  own, once.
+- **New to a connection** but known to the pool, it is parsed in the same flush that runs it,
+  so it is still one round trip.
+- **A statement with no arguments** never needs describing.
+
+The name you give `Prepare` is barm's key, bound to one SQL text; the statement on the server
+is named from a hash of the name and the SQL. If the statement fails — the server forgot it
+(`DEALLOCATE`, a pooler resetting the session), or a schema change altered it — it is
+forgotten, by the connection and the pool, that call returns the error, and the next one
+describes and prepares it again.
+
+**On `database/sql`**, statements go through `database/sql`'s `Prepare`. That is a separate
+round trip, and on the pool it takes its own connection. Inside a transaction the statement
+is then rebound to it. A held `Conn` keeps its own statements, prepared on its connection,
+and a sequential batch on the pool prepares its named queries on the connection it borrows,
+for that batch. `db.Close()` closes the cached statements, then the database.
+
+**`Seq` holds its connection** until the loop ends, so a loop that queries the same
+transaction it is reading from waits on itself on pgx, which runs one statement at a time
+per connection.
 
 ## Batching
 
-A batch sends many queries in **one round trip**. It needs a driver that pipelines, so
-import `pgxdriver`, and batching is detected with nothing to configure:
+A batch sends many queries in **one round trip**, on pgx's pool. A statement it keeps is
+parsed in that same round trip the first time a connection runs it; only one with arguments
+that the pool has never seen costs a round trip before, to learn its types (see
+[Prepared statements](#prepared-statements)):
 
 ```go
 b := db.Batch()
@@ -891,23 +935,21 @@ of row types, and a loop can queue as many as it likes.
   early is obvious. Queries behind a failure never run, and keep `ErrNotRun`.
 - **When a query fails,** `Run` returns the first failure, naming the query. It then empties
   the batch, so it cannot run twice.
-- **Implicit transaction:** pgx runs a batch in one unless it is already inside a
-  transaction, so a failure rolls the whole batch back.
+- **Implicit transaction:** a batch runs in one unless it is already inside a transaction,
+  so a failure rolls the whole batch back.
 - **Inserts queued with `Exec`** scan their `RETURNING` columns back into their values, the
   same as their own `Exec`.
 - **`b.One` adds `LIMIT 1`**, like `One`.
 - **Relations** on queued selects load after the batch, breadth-first across all its
   queries.
-- **Queries render when queued,** so later changes to a struct do not affect the batch. A
-  batch only needs a Postgres-dialect builder, so `barm.NewBuilder(barm.Postgres)` works if
-  you execute through pgx directly.
+- **Queries render when queued,** so later changes to a struct do not affect the batch.
 
-On a connection with no registered driver, a batch fails rather than quietly running one
-query at a time:
+`database/sql` cannot send statements together, so a batch on `barm.SQL` fails with
+`ErrNoBatcher` rather than quietly running one query at a time. To run it one statement at a
+time anyway, on one connection, say so when creating the pool:
 
-```
-barm: batching needs a driver that pipelines: nothing registered for *sqlite.conn —
-import a barm driver package, e.g. _ "github.com/sirkostya009/barm/pgxdriver"
+```go
+db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
 ```
 
 20 lookups on a local Postgres, batched versus one at a time. Over a real network the gap
@@ -933,7 +975,11 @@ err := b.Run(ctx) // both statements are inside the transaction
 ```
 
 A batch can also carry its own transaction. `Begin` and `Commit` are queued like any other
-statement, so the transaction costs no extra round trip:
+statement, so the transaction costs no extra round trip. Postgres runs the batch in order, so
+`Begin` is done before anything after it can fail, and `Rollback` always has something to
+return to. When the batch first describes a statement inside a transaction, it does so under
+a savepoint of its own, so a statement that cannot be described fails in its place in the
+batch rather than taking the transaction with it:
 
 ```go
 b := db.Batch()
@@ -984,50 +1030,17 @@ statements Postgres accepts in that state, so `Rollback` sends it as a second ro
 - **`Rollback` needs a held connection.** It goes to the connection the batch ran on, so the
   batch must be on a transaction or a held connection. A batch on the pool has already
   returned its connection, and the pool discards a connection left in a failed transaction.
-- **Recovering matters for speed too.** pgx reports a connection with an unfinished
-  transaction as unusable, so `database/sql` replaces it: a new socket, auth, and an empty
-  statement cache. That costs about 3.7 ms on a local Postgres, against about 180 µs for
-  ending the transaction properly.
 - **To throw a batch away on purpose** (a dry run against real data), queue a rollback with
   `NewRaw` as the last statement of a batch you expect to succeed.
 - **The savepoint name is fixed**, `barm.BatchSavepoint`. Nesting still behaves, because
   `ROLLBACK TO` and `RELEASE` act on the most recent savepoint of that name.
-
-### Custom batch drivers
-
-A driver registers a probe that recognizes its connections and returns a `Batcher`:
-
-```go
-func init() {
-	barm.RegisterDriver(func(driverConn any) (barm.Batcher, bool) {
-		c, ok := driverConn.(*stdlib.Conn)
-		if !ok {
-			return nil, false
-		}
-		return sender{c.Conn()}, true
-	})
-}
-
-type Batcher interface {
-	SendBatch(ctx context.Context, qs []BatchQuery, read func(BatchReader) error) error
-}
-```
-
-The driver owns the connection for the length of `read`, which is what lets a batch run on a
-borrowed connection, even one with a transaction open. The driver is chosen when the batch
-is sent, by probing the connection, so nothing goes stale. `Batch(b)` also takes a `Batcher`
-directly, to send somewhere else entirely. barm treats a batch on your own `Batcher` as
-outside any transaction.
-
-A driver can also implement `StmtDriver` to run named statements itself. That is how
-`pgxdriver` prepares and runs in one round trip.
 
 ## Hooks
 
 ### Query hooks
 
 ```go
-db := barm.New(sqldb, barm.Postgres, barm.WithHook(barm.QueryHook{
+db := barm.New(pgxdriver.Pool(pool), barm.Postgres, barm.WithHook(barm.QueryHook{
 	AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
 		if ev.Duration > time.Second {
 			log.Printf("slow %s (%s): %s", ev.Op, ev.Duration, ev.Query)
@@ -1044,7 +1057,8 @@ unwinding like defers. The context `BeforeQuery` returns goes to the database ca
 `QueryEvent` has:
 
 - **Before the query:** `Op` (`SELECT`, `INSERT`, …), `Query`, `Args`, `Prepared` (the
-  `Prepare` name) and `StartedAt`.
+  `Prepare` name) and `StartedAt`. `Args` is a copy, so a hook that masks a value in place
+  changes what it reports, not what is written.
 - **After it:** `Err`, `Duration` and, for execs, `Result`.
 
 When events finish:
@@ -1065,7 +1079,7 @@ handle.
 ### Transaction hooks
 
 ```go
-db := barm.New(sqldb, barm.Postgres, barm.WithTxHook(barm.TxHook{
+db := barm.New(pgxdriver.Pool(pool), barm.Postgres, barm.WithTxHook(barm.TxHook{
 	AfterCommit: func(_ context.Context, ev *barm.TxEvent) {
 		log.Printf("commit after %s: %v", ev.Duration, ev.Err)
 	},
@@ -1105,6 +1119,28 @@ commits. If that nested transaction rolls back, its hooks are dropped with its w
 never invalidate for rows that were never written. `WithTxHook` on a `Conn` applies to the
 transactions it begins.
 
+## Drivers
+
+barm talks to the database through a small interface of its own, `barm.Pool`, and ships
+two:
+
+|                | `pgxdriver.Pool(pool)`                                     | `barm.SQL(sqldb)`                                      |
+| -------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
+| databases      | Postgres                                                   | anything with a `database/sql` driver                  |
+| column types   | everything pgx encodes and decodes: arrays, JSON, UUIDs, … | what `database/sql` converts; `json` tag for JSON      |
+| batches        | pipelined, one round trip                                  | `ErrNoBatcher`, or one by one with `SequentialBatches` |
+| plain queries  | as the pool's `DefaultQueryExecMode` says                  | as the driver runs them                                |
+| last insert id | none; use `RETURNING`                                      | where the driver reports one                           |
+
+- **JSON on pgx** needs no tag under pgx's default mode, reading or writing. See
+  [JSON columns](#json-columns) for the modes where writing does.
+- **Reaching the driver:** `db.Pool()` returns the pool, `*barm.SQLPool` has `DB()` for the
+  `*sql.DB`, and `Driver()` on a `Conn` or `Tx` returns the driver's own connection or
+  transaction.
+- **Writing your own:** implement `barm.Pool`. It is an `Executor` (query, exec, the prepared
+  forms, and batches) that can also hand out a held connection and begin a transaction,
+  each of which is an `Executor` too.
+
 ## Interfaces
 
 **`IDB`** is anything barm builds on: `*DB`, `*Tx` or `*Conn`. Go does not allow generic
@@ -1117,7 +1153,7 @@ func adults(ctx context.Context, h barm.IDB) ([]User, error) {
 ```
 
 One function then serves a pool, a transaction and a held connection alike. `IDB` also
-has `Begin` and `BeginTx`, which do the right thing for whatever it holds: a `DB` starts a
+has `Exec` and `Query` for raw SQL, and `Begin` and `BeginTx`, which do the right thing for whatever it holds: a `DB` starts a
 transaction on a connection of its own, a `Conn` lends its connection, and a `Tx` opens a
 savepoint. So a transaction helper written once over `IDB` nests correctly:
 
@@ -1135,12 +1171,9 @@ func inTx(ctx context.Context, h barm.IDB, fn func(*barm.Tx) error) error {
 }
 ```
 
-`Handle` is a
-stopgap, and `IDB` takes over its methods once Go allows generic methods in interfaces. A
-query that is already built runs on any handle through [`Via`](#reusing-and-composing-queries).
-
-**`Querier`** is the `database/sql` common ground: `QueryContext`, `QueryRowContext` and
-`ExecContext`. `*sql.DB`, `*sql.Tx`, `*sql.Conn` and barm's own types all satisfy it.
+`Handle` is a stopgap, and `IDB` takes over its methods once Go allows generic methods in
+interfaces. A query that is already built runs on any handle through
+[`Via`](#reusing-and-composing-queries).
 
 **`Query`** is any built query: every builder, and `NewRaw`. Only barm's own types can
 implement it, because a nested query renders into the enclosing query to share its argument
@@ -1177,11 +1210,9 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 
 What barm does not do yet, for anyone coming from bun:
 
-- **Postgres array columns through `database/sql`.** Writing a slice works on every path,
-  and pgx's own rows read arrays natively (prepared statements, batches). A plain
-  `Slice`/`One` reads through `database/sql`, which hands the column over as text, so a
-  `[]int64` field cannot take it there. A native `pgxpool` backend that would close this is
-  being designed.
+- **Postgres array columns on `database/sql`.** On pgx's pool they read and write natively.
+  Through `database/sql`, the driver hands an array over as text, which a `[]int64` field
+  cannot take.
 - **Statement shapes:** `UPDATE … FROM`, `DELETE … USING`, `INSERT … SELECT`, a `VALUES` list
   built from structs, multi-row update and delete by key, `DISTINCT ON`.
 - **Grouped conditions.** `WhereOr` joins at the top level, so a parenthesized `OR` group
@@ -1192,23 +1223,23 @@ What barm does not do yet, for anyone coming from bun:
 
 ## Against bun
 
-`bench/` runs barm and bun over the same table, the same SQL and the same SQLite database.
-It is its own module, so bun stays out of barm's `go.mod`. Medians of 6 runs, measured
-2026-09-28:
+`bench/` runs barm and bun over the same table, the same SQL and the same SQLite database,
+barm through `barm.SQL`. It is its own module, so bun stays out of barm's `go.mod`. Medians
+of 6 runs, measured 2026-10-01:
 
 |                                         |    barm |     bun |           |  barm B/op | bun B/op | barm allocs | bun allocs |
 | --------------------------------------- | ------: | ------: | --------: | ---------: | -------: | ----------: | ---------: |
-| build select                            |   406ns |   621ns | **1.53×** |        577 |     1024 |           5 |         10 |
-| build select, 3 wheres + order + paging |   765ns |   1.5µs | **1.90×** |       1042 |     1728 |          10 |         17 |
-| build insert, 1 row                     |   426ns |   1.3µs | **3.05×** |        520 |     1400 |           6 |         14 |
-| build insert, 100 rows                  |  14.3µs |  39.1µs | **2.72×** |      25581 |    30472 |         112 |        220 |
-| build update by pk                      |   379ns |   971ns | **2.56×** |        561 |     1224 |           5 |         10 |
-| build delete by pk                      |   264ns |   408ns | **1.55×** |        328 |      680 |           5 |          6 |
-| select 1 row                            |  15.0µs |  16.5µs |     1.10× |       1990 |     6329 |          40 |         44 |
-| select 100 rows                         | 166.3µs | 184.6µs |     1.11× |      36952 |    43581 |         642 |        745 |
-| select 1000 rows                        |  1.52ms |  1.69ms |     1.11× |     318856 |   346381 |        6790 |       7794 |
-| `One`                                   |  15.4µs |  16.2µs |     1.05× |       2063 |     6265 |          46 |         44 |
-| stream 1000 rows (`Seq` vs a slice)     |  1.48ms |  1.71ms |     1.15× | **144355** |   346382 |        6782 |       7794 |
+| build select                            |   363ns |   556ns | **1.53×** |        577 |     1024 |           5 |         10 |
+| build select, 3 wheres + order + paging |   670ns |   1.4µs | **2.06×** |       1042 |     1728 |          10 |         17 |
+| build insert, 1 row                     |   444ns |   1.2µs | **2.79×** |        520 |     1400 |           6 |         14 |
+| build insert, 100 rows                  |  14.3µs |  38.3µs | **2.69×** |      25581 |    30472 |         112 |        220 |
+| build update by pk                      |   418ns |   930ns | **2.23×** |        561 |     1224 |           5 |         10 |
+| build delete by pk                      |   261ns |   357ns |     1.36× |        328 |      680 |           5 |          6 |
+| select 1 row                            |  14.4µs |  15.4µs |     1.07× |       2006 |     6329 |          40 |         44 |
+| select 100 rows                         | 165.0µs | 184.5µs |     1.12× |      36970 |    43580 |         642 |        745 |
+| select 1000 rows                        |  1.51ms |  1.69ms |     1.12× |     318892 |   346381 |        6790 |       7794 |
+| `One`                                   |  15.1µs |  16.0µs |     1.06× |       2022 |     6265 |          44 |         44 |
+| stream 1000 rows (`Seq` vs a slice)     |  1.47ms |  1.69ms |     1.15× | **144402** |   346382 |        6784 |       7794 |
 
 - **Building is where the difference is.** Running a query is mostly SQLite and
   `database/sql`, so 1.05–1.15× is the honest number there.
@@ -1218,6 +1249,16 @@ It is its own module, so bun stays out of barm's `go.mod`. Medians of 6 runs, me
   text and runs the query with no arguments. barm sends placeholders and an argument list.
   That is part of why barm builds faster, and it is why bun cannot give the driver a
   reusable statement.
+
+On Postgres, barm runs on pgx's pool and bun on `database/sql` over pgx, each as it is
+meant to be used. Loading 100 authors with their relations, each relation 10 rows per
+author:
+
+|             |    barm |     bun |           |
+| ----------- | ------: | ------: | --------: |
+| 1 relation  | 498.1µs | 711.0µs | **1.43×** |
+| 2 relations | 795.9µs |  1.34ms | **1.68×** |
+| 3 relations |  1.11ms |  1.95ms | **1.76×** |
 
 **Why a row costs one allocation, not one per column.** `reflect` copies an addressable
 value on its way into an `any`, so binding N columns straight off your struct would cost N
@@ -1236,9 +1277,9 @@ none of it reaches anyone importing barm:
 
 ```
 barm/             the library, standard library only
-barm/pgxdriver    pgx batching and prepared-statement driver
-barm/integration  round trips against SQLite, through database/sql
-barm/bench        the bun comparison
+barm/pgxdriver    the pgx pool driver
+barm/integration  round trips against SQLite, through barm.SQL
+barm/bench        the bun comparison, and prepared and batched reads on Postgres
 ```
 
 ```sh

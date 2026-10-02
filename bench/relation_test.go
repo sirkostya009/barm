@@ -116,7 +116,7 @@ func openRel(b *testing.B, authors, perAuthor int) (*barm.DB, *bun.DB) {
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
-	return barm.New(sqldb, barm.SQLite), bun.NewDB(sqldb, sqlitedialect.New())
+	return barm.New(barm.SQL(sqldb), barm.SQLite), bun.NewDB(sqldb, sqlitedialect.New())
 }
 
 var (

@@ -97,7 +97,7 @@ func BenchmarkBuildInsertDedup(b *testing.B) {
 }
 
 func BenchmarkOne(b *testing.B) {
-	db := barm.New(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
 	ctx := b.Context()
 	b.ReportAllocs()
 	for b.Loop() {
@@ -109,7 +109,7 @@ func BenchmarkOne(b *testing.B) {
 }
 
 func BenchmarkSlice(b *testing.B) {
-	db := barm.New(sql.OpenDB(fakeConnector{rows: 10}), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 10})), barm.Postgres)
 	ctx := b.Context()
 	b.ReportAllocs()
 	for b.Loop() {
@@ -122,7 +122,7 @@ func BenchmarkSlice(b *testing.B) {
 
 // Via on a query built once should cost what building on the handle does.
 func BenchmarkVia(b *testing.B) {
-	db := barm.New(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
 	c, err := db.Conn(b.Context())
 	if err != nil {
 		b.Fatal(err)

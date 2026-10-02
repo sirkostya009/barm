@@ -479,6 +479,10 @@ func hashable(k any) any {
 	if b, ok := k.([]byte); ok {
 		return unsafe.String(unsafe.SliceData(b), len(b))
 	}
+	if t := reflect.TypeOf(k); t != nil && t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+		b := reflect.ValueOf(k).Bytes() // a named byte slice, json.RawMessage say, is no map key either
+		return unsafe.String(unsafe.SliceData(b), len(b))
+	}
 	return k
 }
 
@@ -516,14 +520,12 @@ func (r *runner) sendRelations(ctx context.Context, level []*pending) error {
 			n++
 		}
 	}
-	if n > 1 {
-		if b, ok := r.batcher(); ok {
-			// ErrNoBatcher comes from probing the connection, before anything is
-			// sent, so falling back cannot run a query twice.
-			err := batchRelations(ctx, newBatch(b, r.h.sess().hooks), level)
-			if !errors.Is(err, ErrNoBatcher) {
-				return err
-			}
+	if e := r.h.executor(); n > 1 && e != nil {
+		// A driver that cannot batch says so before sending anything, so falling
+		// back cannot run a query twice.
+		err := batchRelations(ctx, newBatch(e, r.h.sess(), false, false), level)
+		if !errors.Is(err, ErrNoBatcher) {
+			return err
 		}
 	}
 	c := *r
@@ -532,12 +534,12 @@ func (r *runner) sendRelations(ctx context.Context, level []*pending) error {
 		if w.read == nil {
 			continue
 		}
-		rows, err := c.query(ctx, w.query, w.args) //nolint:rowserrcheck // w.read checks rows.Err() itself before returning
+		rows, err := c.query(ctx, w.query, w.args)
 		if err != nil {
 			return err
 		}
 		w.set, w.next, err = w.read(ctx, rows)
-		rows.Close() //nolint:sqlclosecheck // deferring would keep rows open across the loop's remaining iterations
+		rows.Close()
 		if err != nil {
 			return err
 		}
@@ -551,7 +553,7 @@ func batchRelations(ctx context.Context, batch *Batch, level []*pending) error {
 		if w.read == nil {
 			continue
 		}
-		batch.queue(w.query, w.args, nil, item{
+		batch.queue("", w.query, w.args, nil, item{
 			fail: func(error) {},
 			read: func(br BatchReader) (sql.Result, error) {
 				rows, err := br.Rows()
@@ -565,21 +567,4 @@ func batchRelations(ctx context.Context, batch *Batch, level []*pending) error {
 		})
 	}
 	return batch.Run(ctx)
-}
-
-// batcher reports what could pipeline this query's relations.
-func (r *runner) batcher() (Batcher, bool) {
-	// A held connection batches on itself, inside the transaction when there is
-	// one: a *sql.Tx offers no way down to the driver, but the Conn it runs on
-	// does.
-	switch h := r.h.(type) {
-	case *Tx:
-		return sqlConnBatcher{h.Conn.Conn}, true
-	case *Conn:
-		return sqlConnBatcher{h.Conn}, true
-	}
-	if db, ok := r.h.(*DB); ok && db.DB != nil {
-		return &sqlDBBatcher{db.DB}, true
-	}
-	return nil, false
 }

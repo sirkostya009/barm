@@ -39,7 +39,7 @@ func TestBuildSelect(t *testing.T) {
 	}
 
 	want := `SELECT "u"."id", "u"."name", "u"."email", "u"."age", "u"."created_at" ` +
-		`FROM "users" AS "u" WHERE u.age >= $1 OR u.name = $2 ORDER BY u.id DESC LIMIT 10`
+		`FROM "users" AS "u" WHERE (u.age >= $1) OR (u.name = $2) ORDER BY u.id DESC LIMIT 10`
 	if q != want {
 		t.Errorf("got  %s\nwant %s", q, want)
 	}
@@ -48,8 +48,8 @@ func TestBuildSelect(t *testing.T) {
 	}
 }
 
-// A condition written across lines is still one condition: it is wrapped, so
-// the AND joining it to the next cannot bind tighter than its own OR.
+// Among several conditions each is wrapped, a multi-line one included, so the
+// AND joining them cannot bind tighter than an OR inside one.
 func TestMultilineConditionIsWrapped(t *testing.T) {
 	t.Parallel()
 	db := barm.New(nil, barm.Postgres)
@@ -59,7 +59,7 @@ func TestMultilineConditionIsWrapped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "DELETE FROM \"users\" WHERE name = $1 AND (email = $2\n\t\tOR email = $3)"
+	want := "DELETE FROM \"users\" WHERE (name = $1) AND (email = $2\n\t\tOR email = $3)"
 	if q != want {
 		t.Errorf("got  %q\nwant %q", q, want)
 	}
@@ -144,7 +144,7 @@ func TestWherePK(t *testing.T) {
 	u := &User{ID: 7, Name: "x", Age: 3}
 
 	q, args, err := db.Delete[User]().Value(u).WherePK().Where("age = ?", 3).Build()
-	if err != nil || q != `DELETE FROM "users" WHERE "id" = $1 AND age = $2` || !slices.Equal(args, []any{int64(7), 3}) {
+	if err != nil || q != `DELETE FROM "users" WHERE "id" = $1 AND (age = $2)` || !slices.Equal(args, []any{int64(7), 3}) {
 		t.Errorf("delete: %s %v, %v", q, args, err)
 	}
 	// asked for before the value is bound: the key is read when the query is built
@@ -160,7 +160,7 @@ func TestWherePK(t *testing.T) {
 		User int64 `barm:"user,pk"`
 	}
 	q, _, err = db.Delete[member]().Value(&member{Org: 1, User: 2}).WherePK().WhereOr("expired").Build()
-	if err != nil || q != `DELETE FROM "members" WHERE ("org" = $1 AND "user" = $2) OR expired` {
+	if err != nil || q != `DELETE FROM "members" WHERE ("org" = $1 AND "user" = $2) OR (expired)` {
 		t.Errorf("composite: %s, %v", q, err)
 	}
 
@@ -266,9 +266,9 @@ func TestCloneBranches(t *testing.T) {
 
 	sel := db.Select[User]().Where("a").Where("b").Where("c")
 	sx, sy := sel.Clone().Where("x"), sel.Clone().Where("y")
-	check("select x", sx, "WHERE a AND b AND c AND x")
-	check("select y", sy, "WHERE a AND b AND c AND y")
-	check("select base", sel, "WHERE a AND b AND c")
+	check("select x", sx, "WHERE (a) AND (b) AND (c) AND (x)")
+	check("select y", sy, "WHERE (a) AND (b) AND (c) AND (y)")
+	check("select base", sel, "WHERE (a) AND (b) AND (c)")
 
 	upd := db.Update[User]().Set("a = 1").Set("b = 2").Set("c = 3").Where("id = 1")
 	ux, uy := upd.Clone().Set("x = 1"), upd.Clone().Set("y = 1")
@@ -277,8 +277,8 @@ func TestCloneBranches(t *testing.T) {
 
 	del := db.Delete[User]().Where("a").Where("b").Where("c")
 	dx, dy := del.Clone().Where("x"), del.Clone().Where("y")
-	check("delete x", dx, "WHERE a AND b AND c AND x")
-	check("delete y", dy, "WHERE a AND b AND c AND y")
+	check("delete x", dx, "WHERE (a) AND (b) AND (c) AND (x)")
+	check("delete y", dy, "WHERE (a) AND (b) AND (c) AND (y)")
 
 	ins := db.Insert[User]().Values(&User{Name: "a"}, &User{Name: "b"}, &User{Name: "c"})
 	ix, iy := ins.Clone().Values(&User{Name: "x"}), ins.Clone().Values(&User{Name: "y"})
@@ -642,7 +642,7 @@ func TestCTESQL(t *testing.T) {
 		}
 		want := `WITH "young" AS (SELECT "id" FROM "users" AS "u" WHERE age < $1), ` +
 			`"old" AS (SELECT "id" FROM "users" AS "u" WHERE age > $2) ` +
-			`SELECT "id" FROM young WHERE (id NOT IN (SELECT id FROM old) AND id < $3)`
+			`SELECT "id" FROM young WHERE id NOT IN (SELECT id FROM old) AND id < $3`
 		if q != want {
 			t.Errorf("got  %s\nwant %s", q, want)
 		}
@@ -819,7 +819,7 @@ func TestSubqueryArgument(t *testing.T) {
 	ids := func() *barm.SelectQuery[User] {
 		return pg.Select[User]().Column("id").Where("age > ? AND age < ? AND name <> ?", 1, 2, "z")
 	}
-	sub := `SELECT "id" FROM "users" AS "u" WHERE (age > $2 AND age < $3 AND name <> $4)`
+	sub := `SELECT "id" FROM "users" AS "u" WHERE age > $2 AND age < $3 AND name <> $4`
 	for _, tc := range []struct {
 		what string
 		q    barm.Query
@@ -830,12 +830,12 @@ func TestSubqueryArgument(t *testing.T) {
 			// the enclosing query counts the subquery as one argument, and has bound
 			// one already when the subquery's three arrive
 			"after an argument", pg.Delete[User]().Where("a = ? AND id IN (?)", 7, ids()),
-			`DELETE FROM "users" WHERE (a = $1 AND id IN (` + sub + `))`, []any{7, 1, 2, "z"},
+			`DELETE FROM "users" WHERE a = $1 AND id IN (` + sub + `)`, []any{7, 1, 2, "z"},
 		},
 		{
 			// ?1 after the subquery still points at the first bind
 			"?N across it", pg.Delete[User]().Where("a = ?1 AND id IN (?2) AND b = ?1", 7, ids()),
-			`DELETE FROM "users" WHERE (a = $1 AND id IN (` + sub + `) AND b = $1)`, []any{7, 1, 2, "z"},
+			`DELETE FROM "users" WHERE a = $1 AND id IN (` + sub + `) AND b = $1`, []any{7, 1, 2, "z"},
 		},
 		{
 			"column", pg.Select[User]().Column("id").ColumnExpr("(?) AS n", pg.Select[User]().ColumnExpr("count(*)").Where("age > ?", 5)).Where("name = ?", "x"),
@@ -989,7 +989,7 @@ func TestIn(t *testing.T) {
 		{pg, "id IN (?)", barm.In([]int64{1, 2, 3}), "id IN ($1, $2, $3)", []any{int64(1), int64(2), int64(3)}},
 		{pg, "id IN (?)", barm.In([]any{1, "x"}), "id IN ($1, $2)", []any{1, "x"}},
 		{my, "id IN (?)", barm.In([]string{"a", "b"}), "id IN (?, ?)", []any{"a", "b"}},
-		{pg, "a IN (?1) OR b IN (?1)", barm.In([]int{5, 6}), "(a IN ($1, $2) OR b IN ($3, $4))", []any{5, 6, 5, 6}},
+		{pg, "a IN (?1) OR b IN (?1)", barm.In([]int{5, 6}), "a IN ($1, $2) OR b IN ($3, $4)", []any{5, 6, 5, 6}},
 	} {
 		q, args, err := tc.db.Select[User]().Where(tc.expr, tc.arg).Build()
 		if err != nil || !strings.HasSuffix(q, "WHERE "+tc.want) || !slices.Equal(args, tc.args) {
@@ -1104,7 +1104,7 @@ func TestIndexedPlaceholders(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `SELECT "u"."id", "u"."name", "u"."email", "u"."age", "u"."created_at" ` +
-		`FROM "users" AS "u" WHERE (name = $1 OR email = $1) AND age > $2`
+		`FROM "users" AS "u" WHERE (name = $1 OR email = $1) AND (age > $2)`
 	if q != want {
 		t.Errorf("got  %s\nwant %s", q, want)
 	}
@@ -1118,7 +1118,7 @@ func TestIndexedPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, `WHERE (a = $1 AND b = $2 AND c = $2)`) {
+	if !strings.HasSuffix(q, `WHERE a = $1 AND b = $2 AND c = $2`) {
 		t.Errorf("got %s", q)
 	}
 	if len(args) != 2 || args[0] != 2 || args[1] != 1 {
@@ -1131,7 +1131,7 @@ func TestIndexedPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE (name = ? OR email = ?)") {
+	if !strings.HasSuffix(q, "WHERE name = ? OR email = ?") {
 		t.Errorf("got %s", q)
 	}
 	if len(args) != 2 || args[0] != "root" || args[1] != "root" {
@@ -1152,7 +1152,7 @@ func TestIndexedPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE (a = ANY($1) OR b = ANY($1))") || len(args) != 1 {
+	if !strings.HasSuffix(q, "WHERE a = ANY($1) OR b = ANY($1)") || len(args) != 1 {
 		t.Errorf("got %s %v", q, args)
 	}
 }
@@ -1169,7 +1169,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $1") {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $1)") {
 		t.Errorf("got %s", q)
 	}
 	if len(args) != 1 {
@@ -1182,7 +1182,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $2") || len(args) != 2 {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $2)") || len(args) != 2 {
 		t.Errorf("got %s / %d args", q, len(args))
 	}
 
@@ -1191,7 +1191,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $1") || len(args) != 1 {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $1)") || len(args) != 1 {
 		t.Errorf("got %s / %d args", q, len(args))
 	}
 
@@ -1203,7 +1203,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $2") || len(args) != 2 {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $2)") || len(args) != 2 {
 		t.Errorf("got %s / %d args", q, len(args))
 	}
 
@@ -1213,7 +1213,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $1") || len(args) != 1 {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $1)") || len(args) != 1 {
 		t.Errorf("got %s / %d args", q, len(args))
 	}
 
@@ -1222,7 +1222,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $2") || len(args) != 2 {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $2)") || len(args) != 2 {
 		t.Errorf("prepared query deduped: %s / %d args", q, len(args))
 	}
 
@@ -1232,7 +1232,7 @@ func TestArgDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(q, "WHERE a = $1 AND b = $2") {
+	if !strings.HasSuffix(q, "WHERE (a = $1) AND (b = $2)") {
 		t.Errorf("got %s", q)
 	}
 }
@@ -1253,7 +1253,7 @@ func TestArgDedupIndexed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(query, "email = $1 AND email = $40") {
+	if !strings.HasSuffix(query, "(email = $1) AND (email = $40)") {
 		t.Errorf("got %s", query[max(0, len(query)-60):])
 	}
 	if len(args) != len(vals) {
@@ -1279,7 +1279,7 @@ func TestPooledBuilderIsolation(t *testing.T) {
 					return
 				}
 				want := `SELECT "u"."id", "u"."name", "u"."email", "u"."age", "u"."created_at" ` +
-					`FROM "users" AS "u" WHERE age = $1 AND name = $2`
+					`FROM "users" AS "u" WHERE (age = $1) AND (name = $2)`
 				if q != want {
 					t.Errorf("got %s", q)
 					return
@@ -1531,14 +1531,9 @@ func TestHandleAcceptsEveryKind(t *testing.T) {
 		var plain barm.Query = q
 		_, _ = q, plain
 	}
-	// And barm's own types are Queriers, like the database/sql ones they wrap.
+	// And the database/sql adapter is a Pool.
 	_ = func() {
-		var _ barm.Querier = db
-		var _ barm.Querier = tx
-		var _ barm.Querier = c
-		var _ barm.Querier = (*sql.DB)(nil)
-		var _ barm.Querier = (*sql.Tx)(nil)
-		var _ barm.Querier = (*sql.Conn)(nil)
+		var _ = barm.SQL((*sql.DB)(nil))
 	}
 	_, _, _ = db, tx, c
 }
@@ -1613,4 +1608,36 @@ func TestRawQuery(t *testing.T) {
 
 	// it is a Query, so it queues in a batch like any other
 	var _ barm.Query = db.NewRaw("SELECT 1")
+}
+
+// Among several conditions each is wrapped, whatever spells its OR: barm does
+// not parse the SQL, so a MySQL || or an XOR could not otherwise be told apart
+// from an AND, and would bind across a tenant filter.
+func TestConditionsAreWrapped(t *testing.T) {
+	t.Parallel()
+	my := barm.NewBuilder(barm.MySQL)
+	q, _, err := my.Select[User]().Where("tenant_id = ?", 1).Where("a = ? || b = ?", 2, 3).Build()
+	if err != nil || !strings.HasSuffix(q, "WHERE (tenant_id = ?) AND (a = ? || b = ?)") {
+		t.Errorf("got %s, %v", q, err)
+	}
+	q, _, err = my.Select[User]().Where("a = ? || b = ?", 2, 3).Build()
+	if err != nil || !strings.HasSuffix(q, "WHERE a = ? || b = ?") {
+		t.Errorf("a lone condition has nothing to bind across: %s, %v", q, err)
+	}
+}
+
+// A negative Limit or Offset is an error rather than no limit, so a page size
+// taken from input cannot ask for the whole table.
+func TestNegativeLimit(t *testing.T) {
+	t.Parallel()
+	pg := barm.NewBuilder(barm.Postgres)
+	for what, q := range map[string]barm.Query{
+		"limit":  pg.Select[User]().Limit(-1),
+		"offset": pg.Select[User]().Offset(-5),
+	} {
+		_, _, err := q.Build()
+		if err == nil {
+			t.Errorf("%s: negative value built", what)
+		}
+	}
 }

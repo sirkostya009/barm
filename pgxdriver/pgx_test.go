@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -17,9 +18,10 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sirkostya009/barm"
-	_ "github.com/sirkostya009/barm/pgxdriver"
+	"github.com/sirkostya009/barm/pgxdriver"
 )
 
 type User struct {
@@ -32,22 +34,51 @@ type User struct {
 	CreatedAt time.Time `barm:"created_at"`
 }
 
-// open gives a DB on database/sql. The pgx driver underneath is found by the
-// registration in pgxdriver's init — nothing here wires it up.
+// open gives a DB on a pgx pool.
 func open(t *testing.T, opts ...barm.Option) *barm.DB {
 	t.Helper()
-	dsn := os.Getenv("PGDSN")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost/postgres"
+	return openPool(t, 0, opts...)
+}
+
+func dsn() string {
+	if d := os.Getenv("PGDSN"); d != "" {
+		return d
 	}
-	sqldb, err := sql.Open("pgx", dsn)
+	return "postgres://postgres@localhost/postgres"
+}
+
+// openPool gives a DB on a pgx pool of at most size connections, or pgx's
+// default for 0, over dsn.
+func openPool(t *testing.T, size int32, opts ...barm.Option) *barm.DB {
+	t.Helper()
+	return openDSN(t, dsn(), size, nil, opts...)
+}
+
+// execMode configures a pool to run plain queries unprepared, as unnamed
+// statements.
+func execMode(c *pgxpool.Config) { c.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec }
+
+func openDSN(t *testing.T, dsn string, size int32, configure func(*pgxpool.Config), opts ...barm.Option) *barm.DB {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Skipf("no postgres: %v", err)
 	}
-	if err := sqldb.Ping(); err != nil {
+	if size > 0 {
+		cfg.MaxConns = size
+	}
+	if configure != nil {
+		configure(cfg)
+	}
+	p, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Skipf("no postgres: %v", err)
+	}
+	if err := p.Ping(context.Background()); err != nil {
+		p.Close()
 		t.Skipf("no postgres at %s: %v", dsn, err)
 	}
-	t.Cleanup(func() { sqldb.Close() })
+	t.Cleanup(p.Close)
 
 	for _, q := range []string{
 		`DROP TABLE IF EXISTS batch_users`,
@@ -55,11 +86,36 @@ func open(t *testing.T, opts ...barm.Option) *barm.DB {
 			id bigserial PRIMARY KEY, name text NOT NULL, email text NOT NULL,
 			age int NOT NULL, created_at timestamptz NOT NULL)`,
 	} {
-		if _, err := sqldb.Exec(q); err != nil {
+		if _, err := p.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return barm.New(sqldb, barm.Postgres, opts...)
+	return barm.New(pgxdriver.Pool(p), barm.Postgres, opts...)
+}
+
+// row is the first row of a raw query, scanned positionally.
+type row struct {
+	rows barm.Rows
+	err  error
+}
+
+func queryRow(ctx context.Context, h barm.IDB, query string, args ...any) row {
+	rows, err := h.Query(ctx, query, args...)
+	return row{rows, err}
+}
+
+func (r row) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	defer r.rows.Close()
+	if !r.rows.Next() {
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	return r.rows.Scan(dest...)
 }
 
 func seed(t *testing.T, db *barm.DB) {
@@ -284,7 +340,7 @@ func TestInsertReturningAs(t *testing.T) {
 	}
 
 	// created_at and age have defaults in this table, and id is generated
-	if _, err := db.Exec(`ALTER TABLE batch_users
+	if _, err := db.Exec(context.Background(), `ALTER TABLE batch_users
 		ALTER COLUMN age SET DEFAULT 42,
 		ALTER COLUMN created_at SET DEFAULT now()`); err != nil {
 		t.Fatal(err)
@@ -702,11 +758,11 @@ func TestRelationsFallBackInsideTx(t *testing.T) {
 		`INSERT INTO rel_books (author_id, title) VALUES (1, 'Solaris')`,
 		`INSERT INTO rel_tags (author_id, label) VALUES (1, 'sf')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS rel_authors, rel_books, rel_tags`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS rel_authors, rel_books, rel_tags`) })
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -829,11 +885,11 @@ func seedRel(t *testing.T, db *barm.DB) {
 		`INSERT INTO rel_books (author_id, title) VALUES (1, 'Solaris'), (1, 'Cyberiad'), (2, 'Ficciones')`,
 		`INSERT INTO rel_tags (author_id, label) VALUES (1, 'sf')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS rel_authors, rel_books, rel_tags`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS rel_authors, rel_books, rel_tags`) })
 }
 
 // A statement that fails inside a savepoint aborts the whole transaction until
@@ -854,7 +910,7 @@ func TestNestedCommitFailureLeavesRollback(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer in.Rollback()
-		if _, err := in.ExecContext(ctx, "SELECT 1/0"); err == nil {
+		if _, err := in.Exec(ctx, "SELECT 1/0"); err == nil {
 			t.Fatal("expected division by zero")
 		}
 		if err := in.Commit(); err == nil {
@@ -863,7 +919,7 @@ func TestNestedCommitFailureLeavesRollback(t *testing.T) {
 	}()
 
 	var n int
-	if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&n); err != nil {
+	if err := queryRow(ctx, tx, "SELECT 1").Scan(&n); err != nil {
 		t.Fatalf("outer transaction after the nested one failed: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -978,11 +1034,11 @@ func TestRelationByteaKey(t *testing.T) {
 		`INSERT INTO bp VALUES ('\x01'), ('\x02')`,
 		`INSERT INTO bc VALUES ('\x01', 'a'), ('\x01', 'b'), ('\x02', 'c')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS bp, bc`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS bp, bc`) })
 	got, err := db.Select[byteaParent]().OrderBy("k").Relation[byteaChild]("Kids").Slice(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1009,11 +1065,11 @@ func TestReadmeRecursiveExample(t *testing.T) {
 		`CREATE TABLE nodes (id bigint PRIMARY KEY, parent_id bigint)`,
 		`INSERT INTO nodes VALUES (1, NULL), (2, 1), (3, 2), (4, NULL)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS nodes`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS nodes`) })
 	type node = treeNode
 
 	got, err := db.Select[node]().Table("tree").
@@ -1117,11 +1173,11 @@ func seedDeepRel(t *testing.T, db *barm.DB) {
 		`INSERT INTO rel_reviews VALUES (1, 'great'), (1, 'dense'), (3, 'short')`,
 		`INSERT INTO rel_tag_notes VALUES (1, 'classic')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS rel_reviews, rel_tag_notes`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS rel_reviews, rel_tag_notes`) })
 }
 
 // Relations load a depth at a time: everything at one depth goes out together,
@@ -1177,9 +1233,9 @@ func TestBatchRelationsLoadTogether(t *testing.T) {
 	}
 }
 
-// syncCounter proxies a Postgres connection and counts the Sync messages the
-// client sends, one per extended-protocol round trip, and the Parse messages,
-// one per statement prepared.
+// syncCounter proxies a Postgres connection and counts the round trips the
+// client starts — a Sync ends one in the extended protocol, a Query is one in
+// the simple protocol — and the Parse messages, one per statement prepared.
 type syncCounter struct {
 	n      atomic.Int64
 	parses atomic.Int64
@@ -1236,7 +1292,7 @@ func (sc *syncCounter) pump(dst io.Writer, src io.Reader) {
 			return
 		}
 		switch hdr[0] {
-		case 'S':
+		case 'S', 'Q': // a Sync ends an extended-protocol round trip; a simple query is one on its own
 			sc.n.Add(1)
 		case 'P':
 			sc.parses.Add(1)
@@ -1246,10 +1302,9 @@ func (sc *syncCounter) pump(dst io.Writer, src io.Reader) {
 	}
 }
 
-// openCounted opens a DB whose connections go through a Sync counter.
-func openCounted(t *testing.T) (*barm.DB, *syncCounter) {
+// openCounted opens a DB of one connection that goes through a Sync counter.
+func openCounted(t *testing.T, configure ...func(*pgxpool.Config)) (*barm.DB, *syncCounter) {
 	t.Helper()
-	db := open(t) // creates the table
 	u, err := url.Parse(os.Getenv("PGDSN"))
 	if err != nil || u.Host == "" {
 		t.Skip("needs a PGDSN URL to proxy")
@@ -1263,31 +1318,30 @@ func openCounted(t *testing.T) (*barm.DB, *syncCounter) {
 	q := u.Query()
 	q.Set("sslmode", "disable")
 	u.RawQuery = q.Encode()
-	sqldb, err := sql.Open("pgx", u.String())
-	if err != nil {
-		t.Fatal(err)
+	var c func(*pgxpool.Config)
+	if len(configure) > 0 {
+		c = configure[0]
 	}
-	t.Cleanup(func() { sqldb.Close() })
-	_ = db
-	return barm.New(sqldb, barm.Postgres), sc
+	return openDSN(t, u.String(), 1, c), sc
 }
 
-// A named statement is prepared on the connection that runs it, in the same
-// round trip as its first execution; every later one is a round trip too.
-func TestPreparedIsOneRoundTrip(t *testing.T) {
+// A named statement new to the pool is described first, a round trip of its
+// own, so its arguments are encoded for their types from the first run. After
+// that each run is one round trip, by name, with no Parse.
+func TestPreparedRoundTrips(t *testing.T) {
 	ctx := t.Context()
 	db, sc := openCounted(t)
 	seed(t, db)
-	db.SetMaxOpenConns(1)
 
-	for i, parses := range []int64{1, 0} { // prepared once, run by name after
+	for i, want := range []struct{ trips, parses int64 }{{2, 1}, {1, 0}} { // prepared once, run by name after
+		parses := want.parses
 		before, parsedBefore := sc.n.Load(), sc.parses.Load()
 		u, err := db.Select[User]().Where("age = ?", 20).Prepare("by_age").One(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := sc.n.Load() - before; got != 1 || u.Name != "ann" {
-			t.Errorf("call %d: %d round trips, name %q", i, got, u.Name)
+		if got := sc.n.Load() - before; got != want.trips || u.Name != "ann" {
+			t.Errorf("call %d: %d round trips, want %d, name %q", i, got, want.trips, u.Name)
 		}
 		if got := sc.parses.Load() - parsedBefore; got != parses {
 			t.Errorf("call %d: %d parses, want %d", i, got, parses)
@@ -1305,17 +1359,16 @@ func TestPreparedIsOneRoundTrip(t *testing.T) {
 	if n, _ := res.RowsAffected(); n != 1 {
 		t.Errorf("rows affected = %d", n)
 	}
-	if got := sc.n.Load() - before; got != 2 {
-		t.Errorf("slice and exec took %d round trips, want 2", got)
+	if got := sc.n.Load() - before; got != 4 {
+		t.Errorf("slice and exec, each new to the pool, took %d round trips, want 4", got)
 	}
 }
 
 // Inside a transaction the statement is prepared on the transaction's own
 // connection, so a pool with nothing else free is no obstacle.
 func TestPreparedInTxOnFullPool(t *testing.T) {
-	db := open(t)
+	db := openPool(t, 1)
 	seed(t, db)
-	db.SetMaxOpenConns(1)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
@@ -1338,7 +1391,8 @@ func TestPreparedInTxOnFullPool(t *testing.T) {
 }
 
 // A statement the server has forgotten — DEALLOCATE, or a pooler resetting the
-// session — is prepared again rather than failing every call after.
+// session — fails the call that finds out, and pgx drops it, so the next call
+// prepares it again rather than every call after failing.
 func TestPreparedSurvivesDeallocate(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -1348,13 +1402,100 @@ func TestPreparedSurvivesDeallocate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	for range 2 {
-		u, err := c.Select[User]().Where("age = ?", 40).Prepare("forgotten").One(ctx)
-		if err != nil || u.Name != "cy" {
-			t.Fatalf("one = %+v, %v", u, err)
+	q := func() (User, error) { return c.Select[User]().Where("age = ?", 40).Prepare("forgotten").One(ctx) }
+	u, err := q()
+	if err != nil || u.Name != "cy" {
+		t.Fatalf("one = %+v, %v", u, err)
+	}
+	if _, err := c.Exec(ctx, "DEALLOCATE ALL"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = q() // finds the statement gone
+	u, err = q()
+	if err != nil || u.Name != "cy" {
+		t.Fatalf("after DEALLOCATE: %+v, %v", u, err)
+	}
+}
+
+// A batch forgets a named statement it could not run, as a single query does:
+// one the server has dropped, and one whose Parse never ran because an earlier
+// query in the batch failed first. Either way the next batch parses it again.
+func TestBatchForgetsWhatFailed(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	run := func(fail bool) error {
+		b := c.Batch()
+		if fail {
+			b.Exec(c.NewRaw("SELECT 1/0"))
 		}
-		if _, err := c.ExecContext(ctx, "DEALLOCATE ALL"); err != nil {
-			t.Fatal(err)
+		r := b.One(c.Select[User]().Where("age = ?", 40).Prepare("bf_cy"))
+		if err := b.Run(ctx); err != nil {
+			return err
+		}
+		if r.Value().Name != "cy" {
+			return errors.New("wrong row: " + r.Value().Name)
+		}
+		return nil
+	}
+
+	if err := run(true); err == nil {
+		t.Fatal("the batch should fail")
+	}
+	if err := run(false); err != nil {
+		t.Fatalf("after a batch that never parsed it: %v", err)
+	}
+	if _, err := c.Exec(ctx, "DEALLOCATE ALL"); err != nil {
+		t.Fatal(err)
+	}
+	_ = run(false) // finds the statement gone
+	if err := run(false); err != nil {
+		t.Fatalf("after DEALLOCATE: %v", err)
+	}
+}
+
+// A schema change that alters a named statement's result fails the call that
+// finds out, and the next one runs against the new schema rather than every
+// call after failing with "cached plan must not change result type".
+func TestPreparedSurvivesSchemaChange(t *testing.T) {
+	ctx := t.Context()
+	db := openPool(t, 1)
+	seed(t, db)
+	q := func() ([]User, error) { return db.Select[User]().Where("age > ?", 0).Prepare("sk_stale").Slice(ctx) }
+	if _, err := q(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "ALTER TABLE batch_users ALTER COLUMN age TYPE bigint"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = q()
+	us, err := q()
+	if err != nil || len(us) != 3 {
+		t.Fatalf("after ALTER: %d rows, %v", len(us), err)
+	}
+}
+
+// A named query that runs on its first run, arguments as untyped text, runs on
+// every run after: an argument pgx cannot encode for its parameter's type goes
+// as text again.
+func TestPreparedEncodesTheSameEveryRun(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	var first error
+	for i := range 3 {
+		_, err := db.Select[User]().Where("name = ?", 5).Prepare("sk_textint").Slice(ctx)
+		if i == 0 {
+			first = err
+			continue
+		}
+		if (err == nil) != (first == nil) {
+			t.Errorf("run %d: %v, but run 0: %v", i, err, first)
 		}
 	}
 }
@@ -1403,14 +1544,14 @@ func TestOnSetReturning(t *testing.T) {
 		`CREATE TABLE pg_accts (id bigserial PRIMARY KEY, email text UNIQUE, name text)`,
 		`INSERT INTO pg_accts (email, name) VALUES ('b@x', 'b')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS pg_accts`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS pg_accts`) })
 	idOf := func(email string) int64 {
 		var id int64
-		if err := db.QueryRowContext(ctx, `SELECT id FROM pg_accts WHERE email = $1`, email).Scan(&id); err != nil {
+		if err := queryRow(ctx, db, `SELECT id FROM pg_accts WHERE email = $1`, email).Scan(&id); err != nil {
 			t.Fatal(err)
 		}
 		return id
@@ -1469,11 +1610,11 @@ func TestNestedRelationBesideSibling(t *testing.T) {
 		`CREATE TABLE rel_reviews (book_id bigint, body text)`,
 		`INSERT INTO rel_reviews (book_id, body) VALUES (1, 'great'), (1, 'dense'), (3, 'short')`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS rel_reviews`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS rel_reviews`) })
 
 	load := func(t *testing.T, h barm.IDB) {
 		t.Helper()
@@ -1535,9 +1676,7 @@ func TestNestedRelationBesideSibling(t *testing.T) {
 		load(t, tx)
 	})
 	t.Run("pool of one", func(t *testing.T) {
-		db.SetMaxOpenConns(1)
-		defer db.SetMaxOpenConns(0)
-		load(t, db)
+		load(t, openPool(t, 1))
 	})
 }
 
@@ -1635,20 +1774,19 @@ func TestRawInBatch(t *testing.T) {
 // remembers which — it is read from the batcher each time.
 func TestBatchBeginProbes(t *testing.T) {
 	ctx := t.Context()
-	db := open(t)
-	db.SetMaxOpenConns(1)
+	db := openPool(t, 1)
 	for _, q := range []string{
 		`DROP TABLE IF EXISTS probe_t`,
 		`CREATE TABLE probe_t (id int PRIMARY KEY)`,
 		`INSERT INTO probe_t VALUES (1)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	count := func(q barm.Querier) int64 {
+	count := func(q barm.IDB) int64 {
 		var n int64
-		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM probe_t`).Scan(&n); err != nil {
+		if err := queryRow(ctx, q, `SELECT count(*) FROM probe_t`).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -1732,18 +1870,18 @@ func TestNullZeroPgx(t *testing.T) {
 		`DROP TABLE IF EXISTS pg_nz`,
 		`CREATE TABLE pg_nz (id bigserial PRIMARY KEY, name text, seen timestamptz, n int)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS pg_nz`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS pg_nz`) })
 
 	empty := &pgNZ{}
 	if _, err := db.Insert[pgNZ]().Values(empty).Returning("id").Prepare("nz_ins").Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var nulls int
-	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_nz WHERE name IS NULL AND seen IS NULL AND n IS NULL`).Scan(&nulls)
+	err := queryRow(ctx, db, `SELECT count(*) FROM pg_nz WHERE name IS NULL AND seen IS NULL AND n IS NULL`).Scan(&nulls)
 	if err != nil || nulls != 1 {
 		t.Fatalf("rows written all NULL = %d, %v, want 1", nulls, err)
 	}
@@ -1780,11 +1918,11 @@ func TestJSONPgx(t *testing.T) {
 		`DROP TABLE IF EXISTS pg_js`,
 		`CREATE TABLE pg_js (id bigserial PRIMARY KEY, meta jsonb, plain json)`,
 	} {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS pg_js`) })
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS pg_js`) })
 
 	for i, prepare := range []string{"", "js_ins"} {
 		v := &pgJSON{Meta: map[string]any{"k": "v", "n": float64(i)}, Plain: []int{i}}
@@ -1793,7 +1931,7 @@ func TestJSONPgx(t *testing.T) {
 		}
 	}
 	var kinds string
-	if err := db.QueryRowContext(ctx, `SELECT string_agg(jsonb_typeof(meta), ',') FROM pg_js`).Scan(&kinds); err != nil || kinds != "object,object" {
+	if err := queryRow(ctx, db, `SELECT string_agg(jsonb_typeof(meta), ',') FROM pg_js`).Scan(&kinds); err != nil || kinds != "object,object" {
 		t.Fatalf("stored as %q, %v, want objects rather than strings", kinds, err)
 	}
 
@@ -1813,4 +1951,505 @@ func TestJSONPgx(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("batch", res.Value(), res.Err())
+}
+
+type nativeRow struct {
+	barm.BaseModel `barm:"table:native_t"`
+
+	ID    int64          `barm:"id,pk,autoincrement"`
+	Ints  []int64        `barm:"ints"`
+	Texts []string       `barm:"texts"`
+	Meta  map[string]any `barm:"meta"`
+}
+
+// On pgx's own pool every column type pgx knows reads straight into its field,
+// with no tag: arrays and JSON through a plain Slice and One, which went
+// through database/sql's conversions before and could not take them.
+func TestNativeTypes(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS native_t`,
+		`CREATE TABLE native_t (id bigserial PRIMARY KEY, ints bigint[], texts text[], meta jsonb)`,
+		`INSERT INTO native_t (ints, texts, meta) VALUES ('{1,2}', '{a,"b c"}', '{"k": "v"}')`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS native_t`) })
+
+	check := func(what string, r nativeRow, err error) {
+		t.Helper()
+		if err != nil || !slices.Equal(r.Ints, []int64{1, 2}) || !slices.Equal(r.Texts, []string{"a", "b c"}) || r.Meta["k"] != "v" {
+			t.Errorf("%s: %+v, %v", what, r, err)
+		}
+	}
+	rows, err := db.Select[nativeRow]().Slice(ctx)
+	if len(rows) != 1 {
+		t.Fatalf("slice: %+v, %v", rows, err)
+	}
+	check("slice", rows[0], err)
+	one, err := db.Select[nativeRow]().One(ctx)
+	check("one", one, err)
+
+	// writing needs no tag either: pgx has the column types from its cache
+	if _, err := db.Insert[nativeRow]().Values(&nativeRow{Ints: []int64{3}, Texts: []string{"z"}, Meta: map[string]any{"w": 1.0}}).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, err := db.Select[nativeRow]().Where("3 = ANY(ints) AND meta->>'w' = '1'").Count(ctx)
+	if err != nil || n != 1 {
+		t.Errorf("array and JSON written: count = %d, %v", n, err)
+	}
+}
+
+// barm hands pgx a plain query and nothing else, so what gets prepared is pgx's
+// configuration: nothing under exec mode, pgx's own cache under its default.
+// A name from Prepare is prepared either way, and a batch's plain queries never
+// are.
+func TestFollowsPgxMode(t *testing.T) {
+	ctx := t.Context()
+	run := func(t *testing.T, db *barm.DB) []string {
+		t.Helper()
+		seed(t, db)
+		c, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		for range 3 {
+			if _, err := c.Select[User]().Where("age > ?", 1).Slice(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Update[User]().Set("age = age").Where("age > ?", 1).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b := c.Batch()
+		b.Count(c.Select[User]())
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Select[User]().Where("age > ?", 1).Prepare("opted_in").Slice(ctx); err != nil {
+			t.Fatal(err)
+		}
+		names, err := c.Select[string]().Table("pg_prepared_statements").Column("name").OrderBy("name").Slice(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
+	t.Run("exec mode", func(t *testing.T) {
+		if got := run(t, openDSN(t, dsn(), 0, execMode)); len(got) != 1 {
+			t.Errorf("prepared = %v, want only the named one", got)
+		}
+	})
+	t.Run("pgx default", func(t *testing.T) {
+		if got := run(t, open(t)); len(got) < 3 {
+			t.Errorf("prepared = %v, want pgx's cached statements as well as the named one", got)
+		}
+	})
+}
+
+// A plain query in exec mode is one round trip: the unnamed statement goes out
+// with its arguments in a single flush.
+func TestPlainQueryIsOneRoundTrip(t *testing.T) {
+	ctx := t.Context()
+	db, sc := openCounted(t, execMode)
+	seed(t, db)
+	for i := range 3 {
+		before := sc.n.Load()
+		if _, err := db.Select[User]().Where("age = ?", 20).One(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := sc.n.Load() - before; got != 1 {
+			t.Errorf("query %d: %d round trips, want 1", i, got)
+		}
+	}
+}
+
+// Under pgx's default mode a plain query is prepared once per connection by
+// pgx's own cache and run by name after, so a repeat skips the server's parse.
+func TestPgxStatementCache(t *testing.T) {
+	ctx := t.Context()
+	db, sc := openCounted(t)
+	seed(t, db)
+	for i, parses := range []int64{1, 0} {
+		before, parsedBefore := sc.n.Load(), sc.parses.Load()
+		u, err := db.Select[User]().Where("age = ?", 20).One(ctx)
+		if err != nil || u.Name != "ann" {
+			t.Fatalf("one = %+v, %v", u, err)
+		}
+		if got := sc.parses.Load() - parsedBefore; got != parses {
+			t.Errorf("run %d: %d parses, want %d", i, got, parses)
+		}
+		if got := sc.n.Load() - before; i == 1 && got != 1 {
+			t.Errorf("run %d: %d round trips, want 1", i, got)
+		}
+	}
+	b := db.Batch()
+	n := b.Count(db.Select[User]())
+	us := b.Slice(db.Select[User]().Where("age > ?", 25))
+	if err := b.Run(ctx); err != nil || n.Value() != 3 || len(us.Value()) != 2 {
+		t.Errorf("batch: %v, %d, %v", err, n.Value(), us.Value())
+	}
+	names, err := db.Select[string]().Table("pg_prepared_statements").Column("name").Slice(ctx)
+	if err != nil || len(names) == 0 {
+		t.Errorf("prepared statements = %v, %v, want some", names, err)
+	}
+}
+
+// A batch goes out in one round trip whatever pgx's mode. A statement it keeps
+// is parsed the first time — five sharing one text are one Parse and five runs
+// of it — and run by name after; one with arguments new to the pool is
+// described first, in a round trip of its own. Named ones are kept in any
+// mode, plain ones under pgx's default, and in exec mode plain ones are parsed
+// on every run.
+func TestBatchRoundTrips(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure []func(*pgxpool.Config)
+		prepare   string
+		trips     [3]int64
+		parses    [3]int64
+	}{
+		{"pgx default", nil, "", [3]int64{2, 1, 1}, [3]int64{2, 0, 0}},
+		{"exec mode", []func(*pgxpool.Config){execMode}, "", [3]int64{1, 1, 1}, [3]int64{6, 6, 6}},
+		{"named", nil, "rt_one", [3]int64{2, 1, 1}, [3]int64{2, 0, 0}},
+		{"named in exec mode", []func(*pgxpool.Config){execMode}, "rt_one", [3]int64{2, 1, 1}, [3]int64{2, 1, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			db, sc := openCounted(t, tc.configure...)
+			seed(t, db)
+			for run := range 3 {
+				before, parsed := sc.n.Load(), sc.parses.Load()
+				b := db.Batch()
+				ones := make([]*barm.BatchResult[User], 5)
+				for i := range ones {
+					q := db.Select[User]().Where("age >= ?", 20+i)
+					if tc.prepare != "" {
+						q.Prepare(tc.prepare)
+					}
+					ones[i] = b.One(q)
+				}
+				n := b.Count(db.Select[User]())
+				if err := b.Run(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if ones[0].Value().Name != "ann" || ones[4].Value().Name != "bo" || n.Value() != 3 {
+					t.Fatalf("run %d: wrong rows: %+v %+v %d", run, ones[0].Value(), ones[4].Value(), n.Value())
+				}
+				if got := sc.n.Load() - before; got != tc.trips[run] {
+					t.Errorf("run %d: %d round trips, want %d", run, got, tc.trips[run])
+				}
+				if got := sc.parses.Load() - parsed; got != tc.parses[run] {
+					t.Errorf("run %d: %d parses, want %d", run, got, tc.parses[run])
+				}
+			}
+		})
+	}
+}
+
+// A transaction's batch of named statements between Begin and Commit is one
+// round trip — the SAVEPOINT, each statement's Parse, every run of them and the
+// RELEASE in one flush — on every connection but the first to meet them, which
+// describes them first. Their types are the pool's, so a second connection
+// parses them with no describe of its own.
+func TestTxBatchOfNamed(t *testing.T) {
+	ctx := t.Context()
+	db, sc := openCounted(t, func(c *pgxpool.Config) { c.MaxConns = 2 })
+	seed(t, db)
+	bump := func(t *testing.T, c *barm.Conn, run int, trips, parses int64) {
+		t.Helper()
+		tx, err := c.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		before, parsed := sc.n.Load(), sc.parses.Load()
+		b := tx.Batch()
+		b.Begin()
+		for i := range 4 {
+			b.Exec(tx.Update[User]().Set("age = age + ?", 1).Where("name = ?", "ann").Prepare("tx_bump"))
+			b.One(tx.Select[User]().Where("age > ?", i).Prepare("tx_first"))
+		}
+		b.Commit()
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := sc.n.Load() - before; got != trips {
+			t.Errorf("run %d: %d round trips, want %d", run, got, trips)
+		}
+		if got := sc.parses.Load() - parsed; got != parses {
+			t.Errorf("run %d: %d parses, want %d", run, got, parses)
+		}
+		u, err := tx.Select[User]().Where("name = ?", "ann").One(ctx)
+		if err != nil || u.Age != 24 {
+			t.Errorf("run %d: ann = %+v, %v, want age 24 after four bumps", run, u, err)
+		}
+	}
+	first, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	// The describe is a round trip of its own, under a savepoint of its own:
+	// SAVEPOINT, two Parses and RELEASE. The batch then parses its SAVEPOINT
+	// and RELEASE, as it keeps them too.
+	bump(t, first, 0, 2, 6)
+	bump(t, first, 1, 1, 0)
+
+	second, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	bump(t, second, 2, 1, 4) // the two statements, the SAVEPOINT and the RELEASE
+}
+
+type encRow struct {
+	barm.BaseModel `barm:"table:enc"`
+
+	K string `barm:"k"`
+	V any    `barm:"v"`
+}
+
+type typeChange struct {
+	barm.BaseModel `barm:"table:type_change"`
+
+	V any `barm:"v"`
+}
+
+// A schema change that leaves a statement's parameter types invalid fails the
+// call that finds out, and the next one learns the new types, rather than every
+// call after parsing with the old ones, on any connection.
+func TestTypesFollowSchemaChange(t *testing.T) {
+	ctx := t.Context()
+	db := openPool(t, 1)
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS type_change`,
+		`CREATE TABLE type_change (v int)`,
+		`INSERT INTO type_change VALUES (1)`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE type_change`) })
+	named := func() error {
+		_, err := db.Select[typeChange]().Where("v = ?", 1).Prepare("tc_named").One(ctx)
+		return err
+	}
+	batched := func() error {
+		b := db.Batch()
+		r := b.One(db.Select[typeChange]().Where("v = ? AND TRUE", 1))
+		if err := b.Run(ctx); err != nil {
+			return err
+		}
+		return r.Err()
+	}
+	for _, run := range []func() error{named, batched} {
+		if err := run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(ctx, `ALTER TABLE type_change ALTER COLUMN v TYPE jsonb USING to_jsonb(v)`); err != nil {
+		t.Fatal(err)
+	}
+	for i, run := range []func() error{named, batched} {
+		_ = run() // finds the types stale
+		if err := run(); err != nil {
+			t.Errorf("query %d after ALTER: %v", i, err)
+		}
+	}
+}
+
+// A batch and a named query store what a plain query stores, from their first
+// run on: their arguments are encoded for the types the server gives them,
+// not blind.
+func TestBatchEncodesAsPlain(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	type obj struct{ A string }
+	zone := time.FixedZone("x", 3600)
+	for i, c := range []struct {
+		typ string
+		v   any
+	}{
+		{"jsonb", map[string]any{"k": 1}},
+		{"jsonb", obj{"x"}},
+		{"jsonb", []obj{{"x"}}},
+		{"jsonb", []byte(`{"a": 1}`)},
+		{"uuid", [16]byte{1}},
+		{"timestamp", time.Date(2026, 1, 2, 3, 4, 5, 0, zone)},
+		{"date", time.Date(2026, 1, 2, 23, 4, 5, 0, time.FixedZone("y", -5*3600))},
+		{"text", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
+		{"numeric", 0.1},
+		{"int[]", []int64{1, 2}},
+		{"text", 5}, // pgx cannot encode an int for text, whichever way it runs
+	} {
+		tbl := fmt.Sprintf("enc_%d", i)
+		if _, err := db.Exec(ctx, `DROP TABLE IF EXISTS `+tbl); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(ctx, `CREATE TABLE `+tbl+` (k text, v `+c.typ+`)`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE `+tbl) })
+		insert := func(k string) *barm.InsertQuery[encRow] {
+			return db.Insert[encRow]().Table(tbl).Values(&encRow{K: k, V: c.v})
+		}
+		errs := map[string]error{}
+		_, errs["plain"] = insert("plain").Exec(ctx)
+		for _, k := range []string{"batch 1", "batch 2"} {
+			b := db.Batch()
+			b.Exec(insert(k))
+			errs[k] = b.Run(ctx)
+		}
+		for _, k := range []string{"named 1", "named 2"} {
+			_, errs[k] = insert(k).Prepare(tbl).Exec(ctx)
+		}
+		for k, err := range errs {
+			if (err == nil) != (errs["plain"] == nil) {
+				t.Errorf("%s %T: %s: %v, plain: %v", c.typ, c.v, k, err, errs["plain"])
+			}
+		}
+		vals, err := db.Select[struct {
+			K string  `barm:"k"`
+			V *string `barm:"v"`
+		}]().Table(tbl).ColumnExpr("k, v::text AS v").Slice(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vals {
+			if *v.V != *vals[0].V {
+				t.Errorf("%s %T: %s stored %s, %s stored %s", c.typ, c.v, v.K, *v.V, vals[0].K, *vals[0].V)
+			}
+		}
+	}
+}
+
+// The plain statements a batch keeps are bounded by pgx's statement cache
+// capacity: past it the least recently run is closed on the server.
+func TestBatchStatementsAreBounded(t *testing.T) {
+	ctx := t.Context()
+	db := openDSN(t, dsn(), 1, func(c *pgxpool.Config) { c.ConnConfig.StatementCacheCapacity = 2 })
+	seed(t, db)
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for range 2 {
+		b := c.Batch()
+		ns := make([]*barm.BatchResult[int64], 3)
+		for i := range ns {
+			q := c.Select[User]().Where("age > ?", 0)
+			for range i {
+				q.Where("TRUE") // three texts, one more than fits
+			}
+			ns[i] = b.Count(q)
+		}
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for i, n := range ns {
+			if n.Value() != 3 {
+				t.Errorf("count %d = %d", i, n.Value())
+			}
+		}
+	}
+	kept, err := c.Select[int64]().Table("pg_prepared_statements").ColumnExpr("count(*)").Where(`name LIKE 'barm\_%'`).One(ctx)
+	if err != nil || kept != 2 {
+		t.Errorf("%d statements kept, %v, want 2", kept, err)
+	}
+}
+
+// Inside a transaction a batch's SAVEPOINT is the first thing in its pipeline,
+// so a statement that fails to parse — after the SAVEPOINT, before anything
+// else runs — still leaves the savepoint for Rollback to return to, and the
+// transaction usable. One with arguments fails its describe first, under a
+// savepoint of its own that the batch then rolls back to. The failed statement
+// is not kept: a later batch parses it again rather than running a name the
+// server never had.
+func TestBatchRollbackAfterPlanError(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for i := range 4 {
+		bad := tx.Select[User]().Table("no_such_table").Prepare("no_table")
+		if i >= 2 {
+			bad.Where("age > ?", 1).Prepare("no_table_args")
+		}
+		b := tx.Batch()
+		b.Begin()
+		b.Exec(tx.Update[User]().Set("age = age + 1").Where("name = ?", "ann"))
+		b.Slice(bad)
+		b.Commit()
+		err := b.Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), "no_such_table") {
+			t.Fatalf("the batch should fail on the missing table, got %v", err)
+		}
+		if err := b.Rollback(ctx); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+	}
+	n, err := tx.Select[User]().Count(ctx)
+	if err != nil || n != 3 {
+		t.Errorf("after rollback: %d, %v, want the transaction usable", n, err)
+	}
+}
+
+// Rows runs a named query like any other.
+func TestRowsPrepared(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	rows, err := db.Select[User]().Column("name").Where("age > ?", 25).OrderBy("age").Prepare("rows_named").Rows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil || !slices.Equal(names, []string{"bo", "cy"}) {
+		t.Errorf("names = %v, %v", names, err)
+	}
+}
+
+// A trigger that drops a row shifts the RETURNING rows after it onto the wrong
+// values, so a count that does not match is reported rather than written back
+// quietly.
+func TestReturningCountMismatch(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	for _, q := range []string{
+		`CREATE OR REPLACE FUNCTION skip_bo() RETURNS trigger AS $$ BEGIN IF NEW.name = 'bo' THEN RETURN NULL; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER skip_bo BEFORE INSERT ON batch_users FOR EACH ROW EXECUTE FUNCTION skip_bo()`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := []*User{
+		{Name: "ann", Email: "a", Age: 1, CreatedAt: time.Now()},
+		{Name: "bo", Email: "b", Age: 2, CreatedAt: time.Now()},
+		{Name: "cy", Email: "c", Age: 3, CreatedAt: time.Now()},
+	}
+	_, err := db.Insert[User]().Values(rows...).Returning("id").Exec(ctx)
+	if err == nil {
+		t.Error("a RETURNING count short of the values should be reported")
+	}
 }

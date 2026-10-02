@@ -1,7 +1,8 @@
 # barm
 
-A query builder and ORM for `database/sql`, built on Go 1.27 generic methods and
-iterators. It is meant to replace bun in our own services.
+A query builder and ORM built on Go 1.27 generic methods and iterators, running
+on pgx's pool or on `database/sql`. It is meant to replace bun in our own
+services.
 
 ## Ground rules
 
@@ -23,29 +24,30 @@ allocations are — that reasoning has been wrong here before.
 
 ## Layout
 
-| file                                            | what it holds                                                   |
-| ----------------------------------------------- | --------------------------------------------------------------- |
-| `db.go`                                         | `DB`, `Handle`, the shared `session`, the exported interfaces   |
-| `conn.go`                                       | `Conn` — one connection held out of the pool                    |
-| `tx.go`                                         | `Tx`, nested transactions as savepoints                         |
-| `select.go` `insert.go` `update.go` `delete.go` | the builders, one per file with its private constructor         |
-| `raw.go`                                        | `RawQuery` — hand-written SQL as a `Query`                      |
-| `runner.go`                                     | `runner` — what every builder ends in, with `one`/`slice`/`seq` |
-| `build.go`                                      | SQL text assembly, the `WITH` clause                            |
-| `scan.go`                                       | reflect-based row scanning                                      |
-| `schema.go`                                     | model cache, struct tag parsing                                 |
-| `relation.go`                                   | `Relation[U]`, key predicates, grouping                         |
-| `batch.go`                                      | `Batch`, `Batcher`, transaction statements, driver registration |
-| `hook.go`                                       | `QueryHook`, `TxHook`                                           |
-| `dialect.go`                                    | `Dialect` and the three built-ins                               |
-| `stmt.go`                                       | prepared statement cache                                        |
+| file                                            | what it holds                                                     |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| `db.go`                                         | `DB`, `Handle`, the shared `session`, the exported interfaces     |
+| `driver.go`                                     | `Executor`, `Pool`, `DriverConn`, `DriverTx`                      |
+| `sqldriver.go`                                  | `SQL` — the `Pool` over `database/sql`                            |
+| `conn.go`                                       | `Conn` — one connection held out of the pool                      |
+| `tx.go`                                         | `Tx`, nested transactions as savepoints                           |
+| `select.go` `insert.go` `update.go` `delete.go` | the builders, one per file with its private constructor           |
+| `raw.go`                                        | `RawQuery` — hand-written SQL as a `Query`                        |
+| `runner.go`                                     | `runner` — what every builder ends in, with `one`/`slice`/`seq`   |
+| `build.go`                                      | SQL text assembly, the `WITH` clause                              |
+| `scan.go`                                       | reflect-based row scanning                                        |
+| `schema.go`                                     | model cache, struct tag parsing                                   |
+| `relation.go`                                   | `Relation[U]`, key predicates, grouping                           |
+| `batch.go`                                      | `Batch`, its results, and the statements a batch transaction uses |
+| `hook.go`                                       | `QueryHook`, `TxHook`                                             |
+| `dialect.go`                                    | `Dialect` and the three built-ins                                 |
+| `stmt.go`                                       | statement names, and `database/sql`'s prepared statement cache    |
 
 A method starting a query on a handle (`Select`, `NewRaw`, `Batch`, …) lives in
 that handle's file.
 
-`pgxdriver/` registers pgx via a side-effect import, as a `Batcher` and as a
-`StmtDriver` that prepares a named statement in the same round trip as its first
-run.
+`pgxdriver/` is the `Pool` over pgx's own pool: pgx's codecs, and batches and
+named statements sent through pgconn pipelines of its own, one round trip each.
 
 ## Conventions
 
@@ -58,10 +60,31 @@ Terminals come in pairs: the plain one returns the builder's own type, the `As`
 one takes a type parameter for a different result shape. Both go through
 `Build`/`BuildAs`.
 
-A `Tx` holds its own `*sql.Conn` from begin until commit or rollback. This is
-not incidental — a `*sql.Tx` has no `Raw`, so without the connection a
-transaction cannot reach the driver and cannot batch. Nested transactions are
-savepoints on that same connection.
+barm reaches the database only through the `driver.go` interfaces: a `DB` runs
+on a `Pool`, a `Conn` on a `DriverConn`, a `Tx` on a `DriverTx`. Nothing in the
+core calls `database/sql` except `sqldriver.go`, so batching, prepared statements
+and column types are each driver's to get right. Nested transactions are
+savepoints, sent on the driver transaction.
+
+barm hands a driver the SQL and its arguments, and for a `Prepare`d query the
+name too, and lets the driver decide the rest. On pgx that means the pool's
+`DefaultQueryExecMode` — pgx's statement cache unless configured otherwise — is
+how a plain query runs; barm never overrides it.
+
+Batches and named queries on pgx are the driver's own pipelines, because pgx's
+batch spends a round trip describing statements and another on a savepoint that
+must exist before anything can fail. Every batch is one round trip: Postgres runs
+the messages in order, so a statement's Parse goes right before its first run,
+after the batch's SAVEPOINT. Arguments are always encoded for the parameter types
+the server reports, never blind: a blind first run stores a different
+`time.Time` in a `timestamp` or `date` column than every later run, and cannot
+encode a map for `jsonb` at all. So a statement with arguments needs its types
+before its first Bind, and the only source is a describe. The pool shares the
+types across connections by SQL, so that describe happens once per statement per
+pool, inside a transaction under a savepoint of its own; a connection meeting a
+known statement parses it with those types in the same flush that runs it. A
+statement that fails is forgotten by the connection and the pool, so stale types
+cost one failed call.
 
 Transaction hooks fire once per transaction and never on a savepoint, because
 their reason for existing is cache invalidation and a cache invalidates when the
@@ -83,7 +106,9 @@ through a `holder` from the scan plan, and a plan without one pays nothing.
 
 Struct size is part of performance: a builder that grows past an allocator size
 class costs B/op on every query, and a B/op regression is a reason to rework or
-revert a change. Check `unsafe.Sizeof` before adding a field to a builder.
+revert a change. Check `unsafe.Sizeof` before adding a field to a builder. A
+closure that captures a query's runner puts the whole query on the heap, so
+helpers that need one take the runner by value.
 
 Comments explain why, not what. Do not leave a comment describing something that
 is no longer in the code.
@@ -120,13 +145,3 @@ their runs, then reading the result with `benchstat`; separate runs have shown
 
 Run `gofmt -l`, `go vet`, `go fix` and `golangci-lint run ./...` before calling a
 change done.
-
-## Direction
-
-The open design question is a backend abstraction: a `database/sql`
-implementation in the core and a native `pgxpool` one in `pgxdriver`, with
-`Rows`, `ExecResult`, `Batcher` and `StmtDriver` promoted from what the `Raw`
-tunnel reaches to the front door. It would make arrays and JSON work natively
-on Postgres, but `DB`, `Tx` and `Conn` stop embedding `*sql.DB`/`*sql.Tx`/
-`*sql.Conn`, so it needs a written design before code. Until then, Postgres
-array columns cannot be read through the `database/sql` path.

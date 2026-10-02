@@ -203,7 +203,7 @@ func startQuery(ctx context.Context, hooks []QueryHook, name, query string, args
 	ev := &QueryEvent{
 		Op:        operation(query),
 		Query:     query,
-		Args:      args,
+		Args:      slices.Clone(args), // a hook that masks a value in place must not change what is bound
 		Prepared:  name,
 		StartedAt: time.Now(),
 	}
