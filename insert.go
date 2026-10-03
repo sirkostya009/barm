@@ -25,7 +25,7 @@ type InsertQuery[T any] struct {
 	rows      []reflect.Value // the values to write, addressable for RETURNING
 	fields    []*field
 	returning []frag
-	conflict  *upsert
+	extra     *insertExtra
 	err       error
 	runner
 	withClause
@@ -112,11 +112,57 @@ func (q *InsertQuery[T]) Column(names ...string) *InsertQuery[T] {
 	return q
 }
 
-// upsert is an insert's ON clause and the assignments Set adds to it. It is
-// replaced rather than changed, so a Clone setting its own leaves the other be.
-type upsert struct {
-	on  frag
-	set []frag
+// insertExtra is what few inserts have — an ON clause and the assignments Set
+// adds to it, a query whose rows are inserted — behind one pointer, so the
+// builder stays in its size class. It is replaced rather than changed, so a
+// Clone setting its own leaves the other be.
+//
+// It fits the allocator's 80-byte class, as the ON clause alone did, so an
+// upsert pays nothing for the source: an empty ON is none, and the source is
+// held by pointer, which only a Select allocates.
+type insertExtra struct {
+	on     frag
+	set    []frag
+	source *Query
+}
+
+func (q *InsertQuery[T]) extraCopy() insertExtra {
+	if q.extra == nil {
+		return insertExtra{}
+	}
+	return *q.extra
+}
+
+// conflict is the ON clause, nil when there is none.
+func (q *InsertQuery[T]) conflict() *insertExtra {
+	if q.extra != nil && q.extra.on.sql != "" {
+		return q.extra
+	}
+	return nil
+}
+
+func (q *InsertQuery[T]) source() Query {
+	if q.extra == nil || q.extra.source == nil {
+		return nil
+	}
+	return *q.extra.source
+}
+
+// Select inserts the rows sub produces rather than values, as
+// `INSERT INTO t (cols) <sub>`. The columns are Column's, or else every one
+// the model has but those the database fills in — autoincrement and default:
+// ones — and sub has to produce them in that order:
+//
+//	db.Insert[Audit]().Column("user_id", "action").
+//		Select(db.NewRaw("SELECT id, 'expired' FROM users WHERE seen < ?", cutoff))
+//
+// Exec writes nothing back with a RETURNING clause, having no values to write
+// into; read the rows with Slice or SliceAs.
+func (q *InsertQuery[T]) Select(sub Query) *InsertQuery[T] {
+	x := q.extraCopy()
+	x.source = &sub
+	q.extra = &x
+	return q
 }
 
 // On appends a conflict clause, e.g. On("CONFLICT (email) DO NOTHING"), or one
@@ -124,7 +170,9 @@ type upsert struct {
 // barm does not read it, so rows RETURNING hands back go to the values in
 // order, and only when every value came back — see Exec.
 func (q *InsertQuery[T]) On(expr string, args ...any) *InsertQuery[T] {
-	q.conflict = &upsert{on: frag{sql: expr, args: args}}
+	x := q.extraCopy()
+	x.on, x.set = frag{sql: expr, args: args}, nil
+	q.extra = &x
 	return q
 }
 
@@ -133,15 +181,15 @@ func (q *InsertQuery[T]) On(expr string, args ...any) *InsertQuery[T] {
 // UPDATE, as Postgres and sqlite write it, and the clause itself on MySQL's ON
 // DUPLICATE KEY UPDATE.
 func (q *InsertQuery[T]) Set(expr string, args ...any) *InsertQuery[T] {
-	if q.conflict == nil {
+	if q.conflict() == nil {
 		if q.err == nil {
 			q.err = errors.New("barm: Set follows On")
 		}
 		return q
 	}
-	c := *q.conflict
-	c.set = append(slices.Clip(c.set), frag{sql: expr, args: args})
-	q.conflict = &c
+	x := *q.extra
+	x.set = append(slices.Clip(x.set), frag{sql: expr, args: args})
+	q.extra = &x
 	return q
 }
 
@@ -259,7 +307,10 @@ func (q *InsertQuery[T]) Build() (string, []any, error) {
 // whatever the CTEs and the conflict clause bind.
 func (q *InsertQuery[T]) argCount() int {
 	n := len(q.rows)*len(q.model.fields) + q.withClause.argCount()
-	if c := q.conflict; c != nil {
+	if src := q.source(); src != nil {
+		n += src.argCount()
+	}
+	if c := q.conflict(); c != nil {
 		n += len(c.on.args)
 		for _, s := range c.set {
 			n += len(s.args)
@@ -277,7 +328,11 @@ func (q *InsertQuery[T]) render(b *builder) error {
 	if q.tableName() == "" {
 		return errNoTable
 	}
-	if len(q.rows) == 0 {
+	src := q.source()
+	switch {
+	case src != nil && len(q.rows) > 0:
+		return errors.New("barm: Insert has both values and a Select")
+	case src == nil && len(q.rows) == 0:
 		return errors.New("barm: Insert has no values")
 	}
 	fields := q.insertFields()
@@ -298,6 +353,15 @@ func (q *InsertQuery[T]) render(b *builder) error {
 			b.str(", ")
 		}
 		b.ident(f.name)
+	}
+	if src != nil {
+		b.str(") ")
+		err = src.render(b)
+		if err != nil {
+			return err
+		}
+		q.renderConflict(b)
+		return nil
 	}
 	b.str(") VALUES ")
 	for i, row := range q.rows {
@@ -342,7 +406,7 @@ func (q *InsertQuery[T]) Exec(ctx context.Context) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(q.returning) > 0 {
+	if q.hasReturning() {
 		n, err := q.execReturning(ctx, query, args)
 		return rowsAffected(n), err
 	}
@@ -363,7 +427,7 @@ func (q *InsertQuery[T]) setLastInsertID(res sql.Result) {
 	// the previous insert's. A dialect with RETURNING reads the key back through
 	// that; one without — MySQL — reports it per statement, and 0 when nothing
 	// was inserted.
-	if q.conflict != nil && q.Dialect().HasReturning() {
+	if q.conflict() != nil && q.Dialect().HasReturning() {
 		return
 	}
 	id, err := res.LastInsertId()
@@ -404,7 +468,7 @@ func (q *InsertQuery[T]) execReturning(ctx context.Context, query string, args [
 
 // hasReturning reports whether Exec reads rows back, which a batch needs to
 // know to read them too.
-func (q *InsertQuery[T]) hasReturning() bool { return len(q.returning) > 0 }
+func (q *InsertQuery[T]) hasReturning() bool { return len(q.returning) > 0 && q.source() == nil }
 
 // scanReturning scans the returned rows back into the values, in order, and
 // reports how many came back. The caller closes rows.
@@ -417,7 +481,7 @@ func (q *InsertQuery[T]) scanReturning(rows Rows) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if q.conflict != nil {
+	if q.conflict() != nil {
 		return q.scanMatched(rows, p, len(cols))
 	}
 	dest := make([]any, len(cols))
@@ -457,7 +521,7 @@ func (q *InsertQuery[T]) scanReturning(rows Rows) (int64, error) {
 
 // renderConflict writes the ON clause and what Set added to it, then RETURNING.
 func (q *InsertQuery[T]) renderConflict(b *builder) {
-	if c := q.conflict; c != nil {
+	if c := q.conflict(); c != nil {
 		b.str(" ON ").frag(c.on)
 		if len(c.set) > 0 {
 			if endsFold(strings.TrimRight(c.on.sql, " \t\n"), "do update") {

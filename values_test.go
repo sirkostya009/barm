@@ -198,3 +198,71 @@ func TestValuesCasts(t *testing.T) {
 		}
 	}
 }
+
+// An insert takes its rows from a query: the WITH clause first, then the
+// query, then the conflict clause, numbered in that order.
+func TestInsertSelect(t *testing.T) {
+	t.Parallel()
+	db := barm.New(nil, barm.Postgres)
+	q, args, err := db.Insert[User]().
+		With("recent", db.Select[User]().Where("u.age > ?", 30)).
+		Column("name", "age").
+		Select(db.NewRaw("SELECT name, age + ? FROM recent WHERE name <> ?", 1, "root")).
+		On("CONFLICT (name) DO UPDATE").Set("age = ?", 5).
+		Returning("id").
+		Build()
+	check(t, q, args, err,
+		`WITH "recent" AS (SELECT "u"."id", "u"."name", "u"."email", "u"."age", "u"."created_at" FROM "users" AS "u" WHERE u.age > $1) `+
+			`INSERT INTO "users" ("name", "age") SELECT name, age + $2 FROM recent WHERE name <> $3 `+
+			`ON CONFLICT (name) DO UPDATE SET age = $4 RETURNING id`,
+		30, 1, "root", 5)
+}
+
+// Without Column the insert names every column the database does not fill in
+// itself, which here leaves out the autoincrement key.
+func TestInsertSelectDefaultColumns(t *testing.T) {
+	t.Parallel()
+	db := barm.New(nil, barm.Postgres)
+	q, _, err := db.Insert[User]().Table("archive").Select(db.Select[User]().Column("name", "email", "age", "created_at")).Build()
+	check(t, q, nil, err,
+		`INSERT INTO "archive" ("name", "email", "age", "created_at") SELECT "name", "email", "age", "created_at" FROM "users" AS "u"`)
+}
+
+func TestInsertSelectErrors(t *testing.T) {
+	t.Parallel()
+	db := barm.New(nil, barm.Postgres)
+	_, _, err := db.Insert[User]().Values(&User{}).Select(db.NewRaw("SELECT 1")).Build()
+	if err == nil || !strings.Contains(err.Error(), "both") {
+		t.Errorf("values and a Select: %v", err)
+	}
+	_, _, err = db.Insert[User]().Select(db.NewRaw("SELECT ?", 1)).Set("x = 1").Build()
+	if err == nil || !strings.Contains(err.Error(), "Set follows On") {
+		t.Errorf("Set without On: %v", err)
+	}
+	_, _, err = db.Insert[User]().Select(db.Select[User]().Limit(-1)).Build()
+	if err == nil {
+		t.Error("the source query's own error should be reported")
+	}
+}
+
+// The source and the conflict clause share one pointer, which a Clone shares
+// too until either changes it: neither may see the other's.
+func TestInsertSelectClone(t *testing.T) {
+	t.Parallel()
+	db := barm.New(nil, barm.Postgres)
+	base := db.Insert[User]().Column("name").Select(db.NewRaw("SELECT 'a'"))
+	withOn := base.Clone().On("CONFLICT DO NOTHING")
+	other := base.Clone().Select(db.NewRaw("SELECT 'b'"))
+
+	for _, tc := range []struct {
+		q    *barm.InsertQuery[User]
+		want string
+	}{
+		{base, `INSERT INTO "users" ("name") SELECT 'a'`},
+		{withOn, `INSERT INTO "users" ("name") SELECT 'a' ON CONFLICT DO NOTHING`},
+		{other, `INSERT INTO "users" ("name") SELECT 'b'`},
+	} {
+		q, _, err := tc.q.Build()
+		check(t, q, nil, err, tc.want)
+	}
+}

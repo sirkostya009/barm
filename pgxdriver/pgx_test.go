@@ -2708,3 +2708,70 @@ func TestDeleteUsingValuesOnPgx(t *testing.T) {
 		t.Errorf("left %+v, %v", left, err)
 	}
 }
+
+type userArchive struct {
+	barm.BaseModel `barm:"table:user_archive"`
+
+	ID   int64  `barm:"id,pk,autoincrement"`
+	Name string `barm:"name"`
+	Age  int    `barm:"age"`
+}
+
+// An insert takes its rows from a query — a CTE over a VALUES list here, as tms
+// fills a table from its own ids — and RETURNING reads what it wrote, through
+// Slice; Exec writes nothing back, having no values, and a batch runs it too.
+func TestInsertSelectOnPgx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS user_archive`,
+		`CREATE TABLE user_archive (id bigserial PRIMARY KEY, name text UNIQUE, age int)`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS user_archive`) })
+	type pick struct {
+		Name string `barm:"name"`
+	}
+	archive := func(names ...string) *barm.InsertQuery[userArchive] {
+		picks := make([]pick, len(names))
+		for i, n := range names {
+			picks[i].Name = n
+		}
+		return db.Insert[userArchive]().
+			With("picked", db.Values(picks)).
+			Select(db.NewRaw("SELECT u.name, u.age + ? FROM batch_users AS u JOIN picked ON picked.name = u.name", 100)).
+			On("CONFLICT (name) DO NOTHING")
+	}
+
+	got, err := archive("ann", "bo").Returning("name, age").Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.SortFunc(got, func(a, b userArchive) int { return strings.Compare(a.Name, b.Name) })
+	if len(got) != 2 || got[0].Name != "ann" || got[0].Age != 120 || got[1].Age != 130 {
+		t.Errorf("returned %+v", got)
+	}
+	res, err := archive("bo", "cy").Returning("id").Exec(ctx)
+	if err != nil {
+		t.Fatalf("exec with returning: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Errorf("exec inserted %d rows, want cy alone", n)
+	}
+	b := db.Batch()
+	r := b.Exec(archive("ann", "nobody").Returning("id"))
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if r.Value().RowsAffected != 0 {
+		t.Errorf("batch inserted %d rows over a conflict", r.Value().RowsAffected)
+	}
+	n, err := db.Select[userArchive]().Count(ctx)
+	if err != nil || n != 3 {
+		t.Errorf("archive holds %d rows, %v", n, err)
+	}
+}

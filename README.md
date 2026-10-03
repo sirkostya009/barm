@@ -492,6 +492,27 @@ db.Update[Doc]().Value(&d).WherePK().Where("version = ?", seen).Exec(ctx)
 // UPDATE "docs" SET "title" = $1, "version" = $2 WHERE "id" = $3 AND version = $4
 ```
 
+### Inserting from a query
+
+`Select` inserts the rows a query produces instead of values. The query can be a select, a
+`NewRaw`, a `Values` list or a union:
+
+```go
+db.Insert[EditHistory]().
+	With("data", db.Select[TCase]().ColumnExpr("id, version + 1").Where("project_id = ?", p)).
+	Column("tcase_id", "tcase_version").
+	Select(db.NewRaw("SELECT * FROM data")).
+	Exec(ctx)
+// WITH "data" AS (SELECT id, version + 1 FROM "tcases" ... WHERE project_id = $1)
+// INSERT INTO "edit_history" ("tcase_id", "tcase_version") SELECT * FROM data
+```
+
+- **The columns** are `Column`'s, or every column of the model except autoincrement and
+  `default:` ones. The query has to produce them in that order.
+- **`On` and `Returning` work as usual.** `Exec` writes nothing back, having no values to
+  write into. Read the returned rows with `Slice` or `SliceAs`.
+- **Values and a `Select` together** are an error.
+
 ### Getting generated keys back
 
 | dialect  | how the new key reaches your struct                                                               |
@@ -1294,7 +1315,7 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 
 What barm does not do yet, for anyone coming from bun:
 
-- **Statement shapes:** `INSERT … SELECT`, multi-row update and delete by key, `DISTINCT ON`.
+- **Statement shapes:** multi-row update and delete by key, `DISTINCT ON`.
 - **Grouped conditions.** `WhereOr` joins at the top level, so a parenthesized `OR` group
   goes in a single `Where` string.
 - **Identifier and raw-SQL arguments**, bun's `Ident` and `Safe`.

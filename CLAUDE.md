@@ -124,6 +124,9 @@ no join to a non-text column survives, and which pgx refuses to encode an
 flagged in `frag.kind`, rather than in slices of their own that would push the
 builders past their size class.
 
+An insert's ON clause and its `Select` source share `insertExtra`, behind the
+one pointer the ON clause had, sized to stay in the 80-byte class it was in.
+
 Struct size is part of performance: a builder that grows past an allocator size
 class costs B/op on every query, and a B/op regression is a reason to rework or
 revert a change. Check `unsafe.Sizeof` before adding a field to a builder. A
