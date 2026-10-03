@@ -27,7 +27,10 @@ type SelectQuery[T any] struct {
 	table  *frag
 	schema string
 	withClause
-	dist    bool
+	// dist is nil for no DISTINCT, plainDistinct for one, and the ON list
+	// otherwise: a pointer takes the slot a bool did, so DistinctOn costs the
+	// builder nothing, and plain Distinct allocates nothing.
+	dist    *frag
 	unions  []union
 	cols    []frag
 	colName []string // per-cols column name, empty when the expression is opaque
@@ -177,7 +180,23 @@ func (q *SelectQuery[T]) ColumnExpr(expr string, args ...any) *SelectQuery[T] {
 	return q
 }
 
-func (q *SelectQuery[T]) Distinct() *SelectQuery[T] { q.dist = true; return q }
+var plainDistinct = &frag{}
+
+// Distinct selects distinct rows, as SELECT DISTINCT.
+func (q *SelectQuery[T]) Distinct() *SelectQuery[T] { q.dist = plainDistinct; return q }
+
+// DistinctOn keeps the first row of each group the expressions pick, as
+// Postgres's SELECT DISTINCT ON (expr). Which row is first is ORDER BY's to
+// say, and the expressions have to lead it. A second call adds to the list.
+func (q *SelectQuery[T]) DistinctOn(expr string, args ...any) *SelectQuery[T] {
+	if q.dist == nil || q.dist.sql == "" {
+		q.dist = &frag{sql: expr, args: args}
+		return q
+	}
+	// Replaced rather than changed, so a Clone sharing it keeps its own.
+	q.dist = &frag{sql: q.dist.sql + ", " + expr, args: append(slices.Clip(q.dist.args), args...)}
+	return q
+}
 
 func (q *SelectQuery[T]) Where(expr string, args ...any) *SelectQuery[T] {
 	q.wheres = append(q.wheres, frag{sql: expr, args: args})
@@ -314,8 +333,11 @@ func (q *SelectQuery[T]) render(b *builder) error {
 		return err
 	}
 	b.str("SELECT ")
-	if q.dist {
+	if q.dist != nil {
 		b.str("DISTINCT ")
+		if q.dist.sql != "" {
+			b.str("ON (").frag(*q.dist).str(") ")
+		}
 	}
 	switch {
 	case len(q.cols) > 0:
@@ -418,6 +440,9 @@ func (q *SelectQuery[T]) argCount() int {
 	n := q.withClause.argCount()
 	if q.table != nil {
 		n += len(q.table.args)
+	}
+	if q.dist != nil {
+		n += len(q.dist.args)
 	}
 	for _, u := range q.unions {
 		n += u.sub.argCount()
@@ -576,11 +601,11 @@ func (q *SelectQuery[T]) CountQuery() (string, []any, error) {
 	c := *q
 	c.orders, c.limit, c.offset = nil, 0, 0
 	c.name = "" // different SQL text than the query this was derived from
-	if !c.dist && len(c.groups) == 0 && len(c.unions) == 0 && c.lock == "" {
+	if c.dist == nil && len(c.groups) == 0 && len(c.unions) == 0 && c.lock == "" {
 		c.cols, c.colName = countCols, opaqueName
 		return c.build()
 	}
-	if !c.dist && len(c.unions) == 0 {
+	if c.dist == nil && len(c.unions) == 0 {
 		c.cols, c.colName = existsCols, opaqueName // a group or a locked row counts whatever it selects
 	}
 	b := c.builder().str("SELECT count(*) FROM (")

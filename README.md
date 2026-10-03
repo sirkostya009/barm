@@ -356,6 +356,19 @@ A negative `Limit` or `Offset` is an error rather than no limit, so a page size 
 input cannot ask for the whole table. `Offset` without `Limit` works on every dialect. SQLite and MySQL only take `OFFSET` as
 part of a `LIMIT`, so barm writes the "no limit" value there (`LIMIT -1` on SQLite).
 
+`DistinctOn` is Postgres's `DISTINCT ON`: it keeps the first row of each group, by
+`ORDER BY`. A second call adds to the list:
+
+```go
+db.Select[Result]().DistinctOn("r.run_id, r.tcase_id").OrderBy("r.run_id, r.tcase_id, r.created_at DESC")
+// SELECT DISTINCT ON (r.run_id, r.tcase_id) ... ORDER BY r.run_id, r.tcase_id, r.created_at DESC
+```
+
+Postgres requires the `DISTINCT ON` expressions to lead the `ORDER BY` exactly as written.
+An argument inside one, `DistinctOn("age > ?", 30)`, becomes a placeholder that no
+`ORDER BY` text matches, so put such a value in the SQL or in a column. `Count` on a
+`DISTINCT ON` query counts the rows it keeps.
+
 ### Tables a model does not name
 
 `Table` sets what a query reads from or writes to, so the model need not be the table, or
@@ -1315,7 +1328,7 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 
 What barm does not do yet, for anyone coming from bun:
 
-- **Statement shapes:** multi-row update and delete by key, `DISTINCT ON`.
+- **Statement shapes:** multi-row update and delete by key.
 - **Grouped conditions.** `WhereOr` joins at the top level, so a parenthesized `OR` group
   goes in a single `Where` string.
 - **Identifier and raw-SQL arguments**, bun's `Ident` and `Safe`.

@@ -2775,3 +2775,25 @@ func TestInsertSelectOnPgx(t *testing.T) {
 		t.Errorf("archive holds %d rows, %v", n, err)
 	}
 }
+
+// DISTINCT ON keeps the row ORDER BY puts first in each group: the oldest user
+// of each age bracket here, as tms keeps a run's latest result.
+func TestDistinctOnPgx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	q := db.Select[User]().
+		DistinctOn("age >= 30").
+		OrderBy("age >= 30, age DESC")
+	us, err := q.Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(us) != 2 || us[0].Name != "ann" || us[1].Name != "cy" {
+		t.Errorf("got %+v, want ann (under 30) and cy (oldest at 30 or over)", us)
+	}
+	n, err := q.Count(ctx)
+	if err != nil || n != 2 {
+		t.Errorf("count = %d, %v", n, err)
+	}
+}
