@@ -208,6 +208,40 @@ func (q *SelectQuery[T]) WhereOr(expr string, args ...any) *SelectQuery[T] {
 	return q
 }
 
+// WhereGroup adds the conditions fn adds as one, in parentheses, so an OR
+// among them stays inside the group:
+//
+//	q.Where("project_id = ?", p).WhereGroup(func(q *SelectQuery[Run]) *SelectQuery[Run] {
+//		q.Where("status = ?", pending)
+//		if stale {
+//			q.WhereOr("locked_at < ?", cutoff)
+//		}
+//		return q
+//	})
+//	// WHERE (project_id = $1) AND ((status = $2) OR (locked_at < $3))
+//
+// A group fn adds nothing to is left out, and groups nest.
+func (q *SelectQuery[T]) WhereGroup(fn func(*SelectQuery[T]) *SelectQuery[T]) *SelectQuery[T] {
+	return q.whereGroup(fn, 0)
+}
+
+// WhereOrGroup is WhereGroup joined to the conditions before it with OR.
+func (q *SelectQuery[T]) WhereOrGroup(fn func(*SelectQuery[T]) *SelectQuery[T]) *SelectQuery[T] {
+	return q.whereGroup(fn, fragOr)
+}
+
+func (q *SelectQuery[T]) whereGroup(fn func(*SelectQuery[T]) *SelectQuery[T], kind fragKind) *SelectQuery[T] {
+	start := len(q.wheres)
+	if r := fn(q); r != q {
+		if q.err == nil {
+			q.err = errGroupReturn
+		}
+		return q
+	}
+	q.wheres = group(q.wheres, start, kind)
+	return q
+}
+
 func (q *SelectQuery[T]) Join(expr string, args ...any) *SelectQuery[T] {
 	q.joins = append(q.joins, frag{sql: expr, args: args})
 	return q

@@ -404,6 +404,30 @@ columns are written unqualified, since the expression owns its naming.
 
 ## Conditions and arguments
 
+Conditions are joined with `AND`, or with `OR` for `WhereOr`, and each is wrapped in
+parentheses when there are several, so an `OR` written inside one cannot bind across the
+others. `WhereGroup` makes the conditions a function adds into one, so an `OR` among them
+stays inside the group. A branch you add only sometimes needs no string building:
+
+```go
+db.Select[Job]().
+	Where("queue = ?", q).
+	WhereGroup(func(q *barm.SelectQuery[Job]) *barm.SelectQuery[Job] {
+		q.Where("status = ? AND next_attempt_at <= ?", pending, now)
+		if reclaim {
+			q.WhereOr("status = ? AND locked_at < ?", processing, stale)
+		}
+		return q
+	})
+// WHERE (queue = $1) AND ((status = $2 AND next_attempt_at <= $3) OR (status = $4 AND locked_at < $5))
+```
+
+- **`WhereOrGroup`** joins the group with `OR` instead.
+- **Groups nest,** and a group the function adds nothing to is left out.
+- **On update and delete too,** but `WherePK` goes beside a group, not inside one.
+- **The function returns the query it was given,** as with `Apply`. Returning another one,
+  a `Clone` say, is an error rather than conditions silently lost.
+
 Fragments such as `Where`, `Join` and `OrderBy` are SQL that barm does not parse. Every `?`
 in them becomes the dialect's placeholder, and its value goes into the arguments:
 
@@ -1329,8 +1353,6 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 What barm does not do yet, for anyone coming from bun:
 
 - **Statement shapes:** multi-row update and delete by key.
-- **Grouped conditions.** `WhereOr` joins at the top level, so a parenthesized `OR` group
-  goes in a single `Where` string.
 - **Identifier and raw-SQL arguments**, bun's `Ident` and `Safe`.
 - **Relations:** composite join keys, many-to-many, and belongs-to loaded by a `JOIN` in
   the same query rather than a query of its own.

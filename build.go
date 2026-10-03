@@ -441,6 +441,49 @@ func (b *builder) cond(i int, c frag, wrap bool) {
 	}
 }
 
+// condGroup is the conditions a WhereGroup function added, standing as one
+// condition: a `?` whose argument renders them in place, the way a query passed
+// as an argument does, so the group is joined and parenthesized like any other
+// condition and the builders need nothing of their own to hold it.
+type condGroup []frag
+
+func (g condGroup) Build() (string, []any, error) {
+	return "", nil, errors.New("barm: a condition group renders inside the query it belongs to")
+}
+
+func (g condGroup) render(b *builder) error {
+	for i, c := range g {
+		switch {
+		case c.pk():
+			return errors.New("barm: WherePK cannot go inside a WhereGroup")
+		case c.from():
+			return errors.New("barm: Using cannot go inside a WhereGroup")
+		}
+		b.cond(i, c, len(g) > 1)
+	}
+	return nil
+}
+
+func (g condGroup) argCount() int {
+	n := 0
+	for _, c := range g {
+		n += len(c.args)
+	}
+	return n
+}
+
+// group folds the conditions added past start into one, joined to those before
+// it as kind says. Nothing added leaves nothing behind.
+func group(wheres []frag, start int, kind fragKind) []frag {
+	if len(wheres) == start {
+		return wheres
+	}
+	g := condGroup(slices.Clone(wheres[start:]))
+	return append(wheres[:start], frag{sql: "?", args: []any{g}, kind: kind})
+}
+
+var errGroupReturn = errors.New("barm: a WhereGroup function must return the query it was given")
+
 // where writes the WHERE clause of an UPDATE or DELETE, which must have one:
 // the conditions as given, with v's primary key where WherePK put it. The key
 // is written straight into the builder rather than as fragments, which would

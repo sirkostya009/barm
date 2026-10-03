@@ -125,6 +125,29 @@ func (q *DeleteQuery[T]) WhereOr(expr string, args ...any) *DeleteQuery[T] {
 	return q
 }
 
+// WhereGroup adds the conditions fn adds as one, in parentheses. See
+// [SelectQuery.WhereGroup].
+func (q *DeleteQuery[T]) WhereGroup(fn func(*DeleteQuery[T]) *DeleteQuery[T]) *DeleteQuery[T] {
+	return q.whereGroup(fn, 0)
+}
+
+// WhereOrGroup is WhereGroup joined to the conditions before it with OR.
+func (q *DeleteQuery[T]) WhereOrGroup(fn func(*DeleteQuery[T]) *DeleteQuery[T]) *DeleteQuery[T] {
+	return q.whereGroup(fn, fragOr)
+}
+
+func (q *DeleteQuery[T]) whereGroup(fn func(*DeleteQuery[T]) *DeleteQuery[T], kind fragKind) *DeleteQuery[T] {
+	start := len(q.wheres)
+	if r := fn(q); r != q {
+		if q.err == nil {
+			q.err = errGroupReturn
+		}
+		return q
+	}
+	q.wheres = group(q.wheres, start, kind)
+	return q
+}
+
 // WherePK adds the primary key of the value given to Value as a condition, in
 // its place among the others: `.WherePK().Where("version = ?", v)` deletes that
 // row only if its version still matches. The key is read when the query is

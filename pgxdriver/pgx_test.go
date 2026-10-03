@@ -2797,3 +2797,35 @@ func TestDistinctOnPgx(t *testing.T) {
 		t.Errorf("count = %d, %v", n, err)
 	}
 }
+
+// A group keeps its OR from binding across the AND before it: without the
+// parentheses cy, aged 40, would match too.
+func TestWhereGroupPgx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	us, err := db.Select[User]().
+		Where("name <> ?", "cy").
+		WhereGroup(func(q *barm.SelectQuery[User]) *barm.SelectQuery[User] {
+			return q.Where("age = ?", 20).WhereOr("age = ?", 40)
+		}).
+		Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(us) != 1 || us[0].Name != "ann" {
+		t.Errorf("got %+v, want ann alone", us)
+	}
+	res, err := db.Delete[User]().
+		WhereGroup(func(q *barm.DeleteQuery[User]) *barm.DeleteQuery[User] {
+			return q.Where("age = ?", 30).WhereOr("age = ?", 40)
+		}).
+		Where("name = ?", "bo").
+		Exec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Errorf("deleted %d rows, want bo alone", n)
+	}
+}
