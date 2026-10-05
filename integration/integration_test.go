@@ -3240,21 +3240,21 @@ func TestJSONColumns(t *testing.T) {
 	}
 }
 
-type soFolder struct {
-	barm.BaseModel `barm:"table:so_folders,alias:f"`
+type soAuthor struct {
+	barm.BaseModel `barm:"table:so_authors,alias:a"`
 
-	ID     int64     `barm:"id,pk"`
-	Name   string    `barm:"name"`
-	Count  int       `barm:"tcase_count,scanonly"`
-	Titles []string  `barm:"titles,json,scanonly"`
-	Cases  []soTcase `barm:"rel:id=folder_id"`
+	ID     int64    `barm:"id,pk"`
+	Name   string   `barm:"name"`
+	Count  int      `barm:"book_count,scanonly"`
+	Titles []string `barm:"titles,json,scanonly"`
+	Books  []soBook `barm:"rel:id=author_id"`
 }
 
-type soTcase struct {
-	barm.BaseModel `barm:"table:so_tcases,alias:t"`
+type soBook struct {
+	barm.BaseModel `barm:"table:so_books,alias:b"`
 
 	ID       int64  `barm:"id,pk"`
-	FolderID int64  `barm:"folder_id"`
+	AuthorID int64  `barm:"author_id"`
 	Title    string `barm:"title"`
 	Upper    string `barm:"upper,scanonly"`
 }
@@ -3269,25 +3269,25 @@ func TestScanOnlyRuns(t *testing.T) {
 	}
 	defer db.Close()
 	for _, q := range []string{
-		`CREATE TABLE so_folders (id INTEGER PRIMARY KEY, name TEXT)`,
-		`CREATE TABLE so_tcases (id INTEGER PRIMARY KEY, folder_id INTEGER, title TEXT)`,
-		`INSERT INTO so_tcases (id, folder_id, title) VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')`,
+		`CREATE TABLE so_authors (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE so_books (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)`,
+		`INSERT INTO so_books (id, author_id, title) VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')`,
 	} {
 		if _, err := db.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// inserted through barm, so the scanonly fields must stay out of it
-	for _, f := range []*soFolder{{ID: 1, Name: "one", Count: 99}, {ID: 2, Name: "two"}} {
-		if _, err := db.Insert[soFolder]().Values(f).Exec(ctx); err != nil {
+	for _, f := range []*soAuthor{{ID: 1, Name: "one", Count: 99}, {ID: 2, Name: "two"}} {
+		if _, err := db.Insert[soAuthor]().Values(f).Exec(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	q := db.Select[soFolder]().
-		ColumnExpr("f.*").
-		ColumnExpr("(?) AS tcase_count", db.NewRaw("SELECT count(*) FROM so_tcases WHERE folder_id = f.id")).
-		ColumnExpr("(?) AS titles", db.NewRaw("SELECT json_group_array(title) FROM so_tcases WHERE folder_id = f.id AND title <> ?", "")).
+	q := db.Select[soAuthor]().
+		ColumnExpr("a.*").
+		ColumnExpr("(?) AS book_count", db.NewRaw("SELECT count(*) FROM so_books WHERE author_id = a.id")).
+		ColumnExpr("(?) AS titles", db.NewRaw("SELECT json_group_array(title) FROM so_books WHERE author_id = a.id AND title <> ?", "")).
 		OrderBy("id")
 	rows, err := q.Slice(ctx)
 	if err != nil || len(rows) != 2 || rows[0].Count != 2 || rows[1].Count != 1 || !slices.Equal(rows[0].Titles, []string{"a", "b"}) {
@@ -3297,17 +3297,17 @@ func TestScanOnlyRuns(t *testing.T) {
 	if err != nil || one.Count != 1 || !slices.Equal(one.Titles, []string{"c"}) {
 		t.Errorf("one: %+v, %v", one, err)
 	}
-	plain, err := db.Select[soFolder]().Where("id = ?", 1).One(ctx)
+	plain, err := db.Select[soAuthor]().Where("id = ?", 1).One(ctx)
 	if err != nil || plain.Count != 0 || plain.Titles != nil {
 		t.Errorf("without the column: %+v, %v", plain, err)
 	}
 
-	withCases, err := db.Select[soFolder]().OrderBy("id").
-		Relation("Cases", func(q *barm.SelectQuery[soTcase]) *barm.SelectQuery[soTcase] {
-			return q.ColumnExpr("t.*").ColumnExpr("upper(title) AS upper").OrderBy("id")
+	withBooks, err := db.Select[soAuthor]().OrderBy("id").
+		Relation("Books", func(q *barm.SelectQuery[soBook]) *barm.SelectQuery[soBook] {
+			return q.ColumnExpr("b.*").ColumnExpr("upper(title) AS upper").OrderBy("id")
 		}).Slice(ctx)
-	if err != nil || len(withCases) != 2 || len(withCases[0].Cases) != 2 || withCases[0].Cases[1].Upper != "B" {
-		t.Errorf("relation: %+v, %v", withCases, err)
+	if err != nil || len(withBooks) != 2 || len(withBooks[0].Books) != 2 || withBooks[0].Books[1].Upper != "B" {
+		t.Errorf("relation: %+v, %v", withBooks, err)
 	}
 }
 

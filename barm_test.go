@@ -862,11 +862,11 @@ func TestSubqueryArgument(t *testing.T) {
 }
 
 type counted struct {
-	barm.BaseModel `barm:"table:folders,alias:f"`
+	barm.BaseModel `barm:"table:authors,alias:a"`
 
-	ID     int64  `barm:"id,pk"`
-	Name   string `barm:"name"`
-	Tcases int    `barm:"tcase_count,scanonly"`
+	ID    int64  `barm:"id,pk"`
+	Name  string `barm:"name"`
+	Books int    `barm:"book_count,scanonly"`
 }
 
 // A scanonly field is in no statement barm writes, selects by default or
@@ -874,22 +874,22 @@ type counted struct {
 func TestScanOnly(t *testing.T) {
 	t.Parallel()
 	pg := barm.NewBuilder(barm.Postgres)
-	v := &counted{ID: 1, Name: "a", Tcases: 5}
-	sub := pg.NewRaw("SELECT count(*) FROM tcases WHERE folder_id = f.id AND age > ?", 3)
+	v := &counted{ID: 1, Name: "a", Books: 5}
+	sub := pg.NewRaw("SELECT count(*) FROM books WHERE author_id = a.id AND pages > ?", 3)
 	for _, tc := range []struct {
 		what string
 		q    barm.Query
 		want string
 		args []any
 	}{
-		{"select", pg.Select[counted](), `SELECT "f"."id", "f"."name" FROM "folders" AS "f"`, nil},
+		{"select", pg.Select[counted](), `SELECT "a"."id", "a"."name" FROM "authors" AS "a"`, nil},
 		{
-			"computed", pg.Select[counted]().ColumnExpr("f.*").ColumnExpr("(?) AS tcase_count", sub).Where("name = ?", "x"),
-			`SELECT f.*, (SELECT count(*) FROM tcases WHERE folder_id = f.id AND age > $1) AS tcase_count FROM "folders" AS "f" WHERE name = $2`,
+			"computed", pg.Select[counted]().ColumnExpr("a.*").ColumnExpr("(?) AS book_count", sub).Where("name = ?", "x"),
+			`SELECT a.*, (SELECT count(*) FROM books WHERE author_id = a.id AND pages > $1) AS book_count FROM "authors" AS "a" WHERE name = $2`,
 			[]any{3, "x"},
 		},
-		{"insert", pg.Insert[counted]().Values(v), `INSERT INTO "folders" ("id", "name") VALUES ($1, $2)`, []any{int64(1), "a"}},
-		{"update", pg.Update[counted]().Value(v).WherePK(), `UPDATE "folders" SET "name" = $1 WHERE "id" = $2`, []any{"a", int64(1)}},
+		{"insert", pg.Insert[counted]().Values(v), `INSERT INTO "authors" ("id", "name") VALUES ($1, $2)`, []any{int64(1), "a"}},
+		{"update", pg.Update[counted]().Value(v).WherePK(), `UPDATE "authors" SET "name" = $1 WHERE "id" = $2`, []any{"a", int64(1)}},
 	} {
 		q, args, err := tc.q.Build()
 		if err != nil || q != tc.want || !slices.Equal(args, tc.args) {
@@ -898,21 +898,21 @@ func TestScanOnly(t *testing.T) {
 	}
 
 	q, _, _ := pg.Insert[counted]().Values(v).BuildAs[counted]()
-	if strings.Contains(q, "tcase_count") {
+	if strings.Contains(q, "book_count") {
 		t.Errorf("default RETURNING names the scanonly column: %s", q)
 	}
-	withCount := pg.Select[counted]().ColumnExpr("f.*").ColumnExpr("(?) AS tcase_count", sub).Where("name = ?", "x")
+	withCount := pg.Select[counted]().ColumnExpr("a.*").ColumnExpr("(?) AS book_count", sub).Where("name = ?", "x")
 	for what, build := range map[string]func() (string, []any, error){
 		"count": withCount.CountQuery, "exists": withCount.ExistsQuery,
 	} {
 		q, args, err := build()
-		if err != nil || strings.Contains(q, "tcase_count") || !slices.Equal(args, []any{"x"}) {
+		if err != nil || strings.Contains(q, "book_count") || !slices.Equal(args, []any{"x"}) {
 			t.Errorf("%s keeps the added column: %s %v, %v", what, q, args, err)
 		}
 	}
 	for what, q := range map[string]barm.Query{
-		"insert": pg.Insert[counted]().Values(v).Column("tcase_count"),
-		"update": pg.Update[counted]().Value(v).Column("tcase_count").WherePK(),
+		"insert": pg.Insert[counted]().Values(v).Column("book_count"),
+		"update": pg.Update[counted]().Value(v).Column("book_count").WherePK(),
 	} {
 		_, _, err := q.Build()
 		if err == nil {

@@ -680,6 +680,10 @@ db.Update[User]().
 - **`Values` goes wherever a query does**, a subquery included:
   `Where("(id, name) IN (?)", db.Values(pairs))`.
 - **An empty slice is an error**: `VALUES` with no rows does not parse.
+- **Many rows by their keys** is this same shape, one statement however many rows: the
+  example above updates each user to its own name. bun calls it `Bulk`. barm has no
+  shortcut for it, so the columns written and the key matched on stay in the SQL you
+  write. A delete matches a `Values` list through `Using` the same way.
 
 ## Reusing and composing queries
 
@@ -1376,7 +1380,6 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 
 What barm does not do yet, for anyone coming from bun:
 
-- **Statement shapes:** multi-row update and delete by key.
 - **Relations:** many-to-many, and belongs-to loaded by a `JOIN` in the same query rather
   than a query of its own.
 
