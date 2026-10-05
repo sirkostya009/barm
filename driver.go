@@ -49,6 +49,11 @@ type Pool interface {
 	// Acquire takes one connection out of the pool, until its Release.
 	Acquire(ctx context.Context) (DriverConn, error)
 	Begin(ctx context.Context, opts *sql.TxOptions) (DriverTx, error)
+	// Ping checks the database is reachable, connecting if it has to.
+	Ping(ctx context.Context) error
+	// Underlying returns the driver's own pool, for a type assertion to reach
+	// what barm does not wrap: a *sql.DB for SQL, a *pgxpool.Pool for pgxdriver.
+	Underlying() any
 	Close() error
 }
 

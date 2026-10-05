@@ -44,6 +44,10 @@ type SQLPool struct {
 // DB returns the *sql.DB the pool runs on.
 func (p *SQLPool) DB() *sql.DB { return p.db }
 
+func (p *SQLPool) Underlying() any { return p.db }
+
+func (p *SQLPool) Ping(ctx context.Context) error { return p.db.PingContext(ctx) }
+
 func (p *SQLPool) Query(ctx context.Context, query string, args []any) (Rows, error) {
 	return p.db.QueryContext(ctx, query, args...) //nolint:rowserrcheck // the caller reads them and checks rows.Err()
 }

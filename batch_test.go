@@ -51,7 +51,9 @@ func (stubPool) Acquire(context.Context) (barm.DriverConn, error) { panic("unuse
 func (stubPool) Begin(context.Context, *sql.TxOptions) (barm.DriverTx, error) {
 	panic("unused")
 }
-func (stubPool) Close() error { return nil }
+func (stubPool) Ping(context.Context) error { return nil }
+func (stubPool) Underlying() any            { return nil }
+func (stubPool) Close() error               { return nil }
 
 func stubbed(stub *stubBatcher, opts ...barm.Option) *barm.DB {
 	return barm.New(stubPool{stub}, barm.Postgres, opts...)

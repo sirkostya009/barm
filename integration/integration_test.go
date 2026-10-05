@@ -52,6 +52,24 @@ func open(t *testing.T) *barm.DB {
 	return db
 }
 
+func TestPingAndUnderlying(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	err := db.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping = %v", err)
+	}
+	sqlDB, ok := db.Pool().Underlying().(*sql.DB)
+	if !ok || sqlDB != db.Pool().(*barm.SQLPool).DB() {
+		t.Fatalf("Underlying = %T, want the pool's *sql.DB", db.Pool().Underlying())
+	}
+	sqlDB.Close()
+	err = db.Ping(ctx)
+	if err == nil {
+		t.Error("Ping on a closed pool = nil, want an error")
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)

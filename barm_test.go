@@ -1501,6 +1501,10 @@ func TestBuilderOnlyReportsNoConn(t *testing.T) {
 	if !errors.Is(err, barm.ErrNoConn) {
 		t.Errorf("Exec = %v, want ErrNoConn", err)
 	}
+	err = db.Ping(ctx)
+	if !errors.Is(err, barm.ErrNoConn) {
+		t.Errorf("Ping = %v, want ErrNoConn", err)
+	}
 }
 
 // Handle is what lets one function serve a DB, a transaction and a connection.

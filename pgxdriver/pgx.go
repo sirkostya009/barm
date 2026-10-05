@@ -122,6 +122,10 @@ func (p *pool) Begin(ctx context.Context, opts *sql.TxOptions) (barm.DriverTx, e
 	return &tx{t, p.t}, nil
 }
 
+func (p *pool) Ping(ctx context.Context) error { return p.p.Ping(ctx) }
+
+func (p *pool) Underlying() any { return p.p }
+
 func (p *pool) Close() error {
 	p.p.Close()
 	return nil

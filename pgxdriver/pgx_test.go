@@ -132,6 +132,24 @@ func seed(t *testing.T, db *barm.DB) {
 	}
 }
 
+func TestPingAndUnderlying(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	err := db.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping = %v", err)
+	}
+	p, ok := db.Pool().Underlying().(*pgxpool.Pool)
+	if !ok {
+		t.Fatalf("Underlying = %T, want *pgxpool.Pool", db.Pool().Underlying())
+	}
+	p.Close()
+	err = db.Ping(ctx)
+	if err == nil {
+		t.Error("Ping on a closed pool = nil, want an error")
+	}
+}
+
 func TestBatch(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)

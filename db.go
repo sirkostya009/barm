@@ -266,6 +266,14 @@ func (db *DB) Close() error {
 	return db.pool.Close()
 }
 
+// Ping checks the database is reachable.
+func (db *DB) Ping(ctx context.Context) error {
+	if db.pool == nil {
+		return ErrNoConn
+	}
+	return db.pool.Ping(ctx)
+}
+
 // BeginTx starts a transaction. Pair it with `defer tx.Rollback()`: rolling back
 // a committed transaction is a no-op returning sql.ErrTxDone. The transaction
 // holds its connection until it ends, so one nobody finishes holds it for good.
