@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/sirkostya009/barm v0.0.0-20261005115234-aa2bb4440aa8
+	github.com/sirkostya009/barm v0.0.0-20261005142425-b46653c49444
 )
 
 require (
