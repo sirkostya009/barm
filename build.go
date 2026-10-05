@@ -292,8 +292,15 @@ func (b *builder) frag(f frag) *builder {
 			continue
 		}
 		v := f.args[arg]
-		if l, ok := v.(inList); ok {
-			b.list(l.v) // spelled out again at every reference: one placeholder is not a list
+		switch v := v.(type) {
+		case inList:
+			b.list(v.v) // spelled out again at every reference: one placeholder is not a list
+			continue
+		case ident:
+			b.ident(string(v))
+			continue
+		case safe:
+			b.str(string(v))
 			continue
 		}
 		if q, ok := v.(Query); ok {
@@ -322,6 +329,26 @@ func (b *builder) frag(f frag) *builder {
 // `= ANY(?)` is how Postgres matches against one. An empty slice is a build
 // error, since `IN ()` is not SQL.
 func In(slice any) any { return inList{slice} }
+
+// Ident writes name as a quoted identifier where its ? is, for a table or
+// column known only at run time:
+//
+//	Join("JOIN ? AS tv ON tv.id = t.id", barm.Ident(tempTable)) // JOIN "tmp_ids" AS tv ...
+//
+// A dotted name is quoted per part, "schema"."table", and a quote inside one is
+// doubled, so the name cannot end the identifier early. It binds no argument.
+func Ident(name string) any { return ident(name) }
+
+// Safe writes sql as it is where its ? is, binding nothing and rewriting no
+// marker inside it. It is for SQL assembled elsewhere, a column expression
+// picked from a fixed list, say; anything that came from a user belongs in an
+// argument instead, or in Ident.
+func Safe(sql string) any { return safe(sql) }
+
+type (
+	ident string
+	safe  string
+)
 
 type inList struct{ v any }
 

@@ -2829,3 +2829,43 @@ func TestWhereGroupPgx(t *testing.T) {
 		t.Errorf("deleted %d rows, want bo alone", n)
 	}
 }
+
+// A temp table named at run time joins through Ident, as tms joins its
+// per-request version tables, and a raw expression goes in through Safe — in a
+// plain query, a prepared one and a batch alike.
+func TestIdentAndSafePgx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	tmp := `tmp "ids"` // a name that needs its quotes
+	if _, err := c.NewRaw("CREATE TEMP TABLE ? (name text)", barm.Ident(tmp)).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.NewRaw("INSERT INTO ? VALUES ('bo'), ('cy')", barm.Ident(tmp)).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	q := func() *barm.SelectQuery[User] {
+		return c.Select[User]().
+			Join("JOIN ? AS picked ON picked.name = u.name", barm.Ident(tmp)).
+			Where("? > ?", barm.Safe("u.age + 0"), 35)
+	}
+	check := func(what string, us []User, err error) {
+		t.Helper()
+		if err != nil || len(us) != 1 || us[0].Name != "cy" {
+			t.Errorf("%s: %+v, %v", what, us, err)
+		}
+	}
+	us, err := q().Slice(ctx)
+	check("plain", us, err)
+	us, err = q().Prepare("ident_safe").Slice(ctx)
+	check("prepared", us, err)
+	b := c.Batch()
+	r := b.Slice(q())
+	err = b.Run(ctx)
+	check("batch", r.Value(), err)
+}

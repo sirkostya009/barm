@@ -452,6 +452,16 @@ Where("data ?? 'key'")                 // ?? is a literal question mark
   write: `IN (?)`. It is how to filter by a list on MySQL and SQLite, which have no arrays.
   An empty `In` is a build error, since `IN ()` is not SQL, so decide what an empty filter
   means before building. Reused through `?N`, the list is spelled out again.
+- **`barm.Ident` writes an identifier** where its `?` is, quoted for the dialect, for a
+  table or column known only at run time: `Join("JOIN ? AS tv ON tv.id = t.id",
+  barm.Ident(tempTable))`. A dotted name is quoted per part, `"schema"."table"`, and a
+  quote inside a name is doubled, so it cannot end the identifier early.
+- **`barm.Safe` writes SQL as it is**, binding nothing and rewriting no `?` inside it. It is
+  for SQL your code chose, never for anything a user sent.
+- **Neither binds an argument,** so the value after one is still the next placeholder, and
+  both are written again at every `?N` reference. They work in builder fragments and
+  `NewRaw`. `db.Exec` and `db.Query` pass SQL to the driver untouched, so
+  `SET search_path = ?` with an `Ident` goes through `db.NewRaw(...).Exec(ctx)`.
 - **A query is an argument too.** Any barm query, `NewRaw` included, renders in place, inside
   the parentheses you write, and continues the enclosing query's numbering:
 
@@ -1353,7 +1363,6 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 What barm does not do yet, for anyone coming from bun:
 
 - **Statement shapes:** multi-row update and delete by key.
-- **Identifier and raw-SQL arguments**, bun's `Ident` and `Safe`.
 - **Relations:** composite join keys, many-to-many, and belongs-to loaded by a `JOIN` in
   the same query rather than a query of its own.
 
