@@ -3764,3 +3764,66 @@ func TestUpdateFromValuesSQLite(t *testing.T) {
 		t.Errorf("ages = %v, %v", ages, err)
 	}
 }
+
+type ckVersion struct {
+	barm.BaseModel `barm:"table:ck_versions"`
+
+	ID      string `barm:"id"`
+	Version int    `barm:"version"`
+	Text    string `barm:"text"`
+}
+
+type ckDoc struct {
+	barm.BaseModel `barm:"table:ck_docs"`
+
+	ID       string      `barm:"id,pk"`
+	VerID    string      `barm:"ver_id"`
+	VerNum   int         `barm:"ver_num"`
+	Versions []ckVersion `barm:"rel:ver_id=id,rel:ver_num=version"`
+}
+
+// SQLite has no arrays, so a key of two columns goes as row values spelled
+// out, which it takes.
+func TestCompositeRelationSQLite(t *testing.T) {
+	ctx := t.Context()
+	var child string
+	db, err := openSQL("sqlite", "file:"+t.TempDir()+"/ck.db", barm.SQLite, barm.WithHook(barm.QueryHook{
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+			if strings.Contains(ev.Query, `FROM "ck_versions"`) {
+				child = ev.Query
+			}
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		`CREATE TABLE ck_versions (id TEXT, version INTEGER, text TEXT)`,
+		`CREATE TABLE ck_docs (id TEXT, ver_id TEXT, ver_num INTEGER)`,
+		`INSERT INTO ck_versions VALUES ('v', 1, 'one'), ('v', 2, 'two'), ('w', 1, 'w one')`,
+		`INSERT INTO ck_docs VALUES ('a', 'v', 2), ('b', 'w', 1), ('c', 'v', 3)`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	docs, err := db.Select[ckDoc]().Relation[ckVersion]("Versions").OrderBy("id").Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range docs {
+		var texts []string
+		for _, v := range d.Versions {
+			texts = append(texts, v.Text)
+		}
+		got = append(got, d.ID+":"+strings.Join(texts, ","))
+	}
+	if want := []string{"a:two", "b:w one", "c:"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if !strings.Contains(child, `IN ((?, ?), (?, ?), (?, ?))`) {
+		t.Errorf("child query = %s, want row values", child)
+	}
+}

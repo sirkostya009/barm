@@ -55,19 +55,21 @@ type field struct {
 }
 
 // relField is a field holding rows of another table rather than a column, from
-// `rel:parent_col=child_col`. A slice field takes many rows, anything else one —
-// the field's own type decides, when the rows are handed over.
+// `rel:parent_col=child_col`, repeated for a key of several columns. A slice
+// field takes many rows, anything else one — the field's own type decides,
+// when the rows are handed over.
 //
 // typ is the type the field holds — on a model that is the other model, which is
 // where the child table comes from; on a projection it is the projection of it,
 // which is where the child columns come from. The same split the query itself
 // has, one level down.
 type relField struct {
-	name      string // the Go field name, which is what With takes
-	index     []int
-	typ       reflect.Type
-	parentCol string
-	childCol  string
+	name  string // the Go field name, which is what With takes
+	index []int
+	typ   reflect.Type
+	// The columns the relation joins on, pairwise: parentCols[i] = childCols[i].
+	parentCols []string
+	childCols  []string
 }
 
 // model is the cached mapping between a struct type and a table.
@@ -237,9 +239,17 @@ func (m *model) collect(t reflect.Type, index []int) {
 		// A relation holds rows, not a value, so it is not a column — and the
 		// columns it joins on are spelled out, like everything else here.
 		if opts.rel != "" && sf.IsExported() {
-			parent, child, ok := strings.Cut(opts.rel, "=")
-			if !ok || parent == "" || child == "" {
-				continue // `rel:parent_col=child_col`, or nothing
+			var parents, children []string
+			for pair := range strings.SplitSeq(opts.rel, ",") {
+				parent, child, ok := strings.Cut(pair, "=")
+				if !ok || parent == "" || child == "" {
+					parents = nil // `rel:parent_col=child_col`, or nothing
+					break
+				}
+				parents, children = append(parents, parent), append(children, child)
+			}
+			if parents == nil {
+				continue
 			}
 			t := sf.Type
 			if t.Kind() == reflect.Slice {
@@ -247,7 +257,7 @@ func (m *model) collect(t reflect.Type, index []int) {
 			}
 			m.rels = append(m.rels, relField{
 				name: sf.Name, index: idx, typ: deref(t),
-				parentCol: parent, childCol: child,
+				parentCols: parents, childCols: children,
 			})
 			continue
 		}
@@ -336,7 +346,10 @@ func parseTag(tag string) (name string, opts tagOpts) {
 		case "default":
 			opts.def = v
 		case "rel":
-			opts.rel = v
+			if opts.rel != "" {
+				opts.rel += "," // one pair per rel: option, a key column apiece
+			}
+			opts.rel += v
 		case "pk":
 			opts.pk = true
 		case "autoincrement", "identity":

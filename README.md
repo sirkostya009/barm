@@ -147,7 +147,7 @@ type User struct {
 | `type:sqltype`               | field                    | the type a `VALUES` list casts the column to (see [Other tables](#writing-from-other-tables))        |
 | `scanonly`                   | field                    | a column a query computes: never written or selected by default (see below)                          |
 | `skipupdate`                 | field                    | left out of an update built from `Value`, for columns maintained elsewhere; `Column` still writes it |
-| `rel:parent_col=child_col`   | field                    | a relation, not a column (see [Relations](#relations))                                               |
+| `rel:parent_col=child_col`   | field                    | a relation, not a column, repeated for a key of several columns (see [Relations](#relations))        |
 | `-`                          | field or embedded struct | skip it                                                                                              |
 
 **Nothing is inferred from Go names.** The table comes from `BaseModel`'s tag, and a field
@@ -319,19 +319,19 @@ the table has. No insert, update or default select touches it, and a raw column 
 name fills it:
 
 ```go
-type Folder struct {
-	barm.BaseModel `barm:"table:folders,alias:f"`
+type AuthorRow struct {
+	barm.BaseModel `barm:"table:authors,alias:a"`
 
-	ID         int64  `barm:"id,pk"`
-	Name       string `barm:"name"`
-	TcaseCount int    `barm:"tcase_count,scanonly"`
+	ID        int64  `barm:"id,pk"`
+	Name      string `barm:"name"`
+	BookCount int    `barm:"book_count,scanonly"`
 }
 
-db.Select[Folder]().
-	ColumnExpr("f.*").
-	ColumnExpr("(?) AS tcase_count", db.NewRaw("SELECT count(*) FROM tcases WHERE folder_id = f.id")).
+db.Select[AuthorRow]().
+	ColumnExpr("a.*").
+	ColumnExpr("(?) AS book_count", db.NewRaw("SELECT count(*) FROM books WHERE author_id = a.id")).
 	One(ctx)
-// SELECT f.*, (SELECT count(*) ...) AS tcase_count FROM "folders" AS "f"
+// SELECT a.*, (SELECT count(*) ...) AS book_count FROM "authors" AS "a"
 ```
 
 A query that does not select the column leaves the field zero. Naming a `scanonly` column
@@ -360,8 +360,9 @@ part of a `LIMIT`, so barm writes the "no limit" value there (`LIMIT -1` on SQLi
 `ORDER BY`. A second call adds to the list:
 
 ```go
-db.Select[Result]().DistinctOn("r.run_id, r.tcase_id").OrderBy("r.run_id, r.tcase_id, r.created_at DESC")
-// SELECT DISTINCT ON (r.run_id, r.tcase_id) ... ORDER BY r.run_id, r.tcase_id, r.created_at DESC
+db.Select[Order]().DistinctOn("o.customer_id").OrderBy("o.customer_id, o.created_at DESC")
+// SELECT DISTINCT ON (o.customer_id) ... ORDER BY o.customer_id, o.created_at DESC
+// the latest order of each customer
 ```
 
 Postgres requires the `DISTINCT ON` expressions to lead the `ORDER BY` exactly as written.
@@ -545,13 +546,13 @@ db.Update[Doc]().Value(&d).WherePK().Where("version = ?", seen).Exec(ctx)
 `NewRaw`, a `Values` list or a union:
 
 ```go
-db.Insert[EditHistory]().
-	With("data", db.Select[TCase]().ColumnExpr("id, version + 1").Where("project_id = ?", p)).
-	Column("tcase_id", "tcase_version").
-	Select(db.NewRaw("SELECT * FROM data")).
+db.Insert[ArchivedOrder]().
+	With("old", db.Select[Order]().ColumnExpr("id, total").Where("created_at < ?", cutoff)).
+	Column("order_id", "total").
+	Select(db.NewRaw("SELECT * FROM old")).
 	Exec(ctx)
-// WITH "data" AS (SELECT id, version + 1 FROM "tcases" ... WHERE project_id = $1)
-// INSERT INTO "edit_history" ("tcase_id", "tcase_version") SELECT * FROM data
+// WITH "old" AS (SELECT id, total FROM "orders" ... WHERE created_at < $1)
+// INSERT INTO "archived_orders" ("order_id", "total") SELECT * FROM old
 ```
 
 - **The columns** are `Column`'s, or every column of the model except autoincrement and
@@ -823,6 +824,19 @@ Good to know:
   the statement. Elsewhere they are spelled out as `IN (?, ?, ?)`. Keys are deduplicated.
 - **Key types can differ.** Child keys are read as the parent field's type, so a parent
   `ID int` and a driver returning `int64` still match.
+- **A key of several columns** repeats `rel:`, one pair per column, up to four:
+
+    ```go
+    Lines []OrderLine `barm:"rel:region=region,rel:number=order_number"`
+    ```
+
+  On Postgres the keys go as one array per column, zipped back into rows, so the SQL is
+  still the same for any number of parents:
+  `("l"."region", "l"."order_number") IN (SELECT * FROM unnest($1::text[], $2::bigint[]))`. The array
+  types are what a `VALUES` list would cast those columns to, so a `type:` tag on the
+  parent's field applies. A key column with no type to cast to, and the other dialects,
+  spell the keys out as row values, `IN ((?, ?), (?, ?))`. A parent with any part of its
+  key `NULL` matches nothing.
 - **Field shapes:** a slice field takes many rows, `[]U` or `[]*U`, and any other field
   takes one. A parent with no children keeps a nil slice.
 - **Errors instead of guesses:** the field must be a declared relation, the result field
@@ -1363,8 +1377,8 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 What barm does not do yet, for anyone coming from bun:
 
 - **Statement shapes:** multi-row update and delete by key.
-- **Relations:** composite join keys, many-to-many, and belongs-to loaded by a `JOIN` in
-  the same query rather than a query of its own.
+- **Relations:** many-to-many, and belongs-to loaded by a `JOIN` in the same query rather
+  than a query of its own.
 
 ## Against bun
 

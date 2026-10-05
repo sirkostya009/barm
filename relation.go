@@ -33,12 +33,30 @@ type setter func(field, key any)
 // It renders rather than runs, so that the relations of one query can be sent
 // together: they all wait on the same parent keys and on nothing else.
 type relation struct {
-	field     string // the Go field name on the result type
-	childType reflect.Type
-	parentCol string
-	childCol  string
-	prepare   func(r runner, schema string, keys []any, keyType reflect.Type) (string, []any, reader, error)
+	field      string // the Go field name on the result type
+	childType  reflect.Type
+	parentCols []string
+	prepare    func(r runner, schema string, keys relKeys) (string, []any, reader, error)
 }
+
+// maxKeyCols bounds a composite key, which groups as an array of its parts.
+const maxKeyCols = 4
+
+// compositeKey is a key of several columns as a map holds it: each part made
+// hashable, the unused ones nil.
+type compositeKey [maxKeyCols]any
+
+// relKeys is the distinct parent keys a relation fetches by, a column at a
+// time: cols[c][i] is column c of key i, for the first n columns. Arrays rather
+// than slices, so a relation pays no allocation per column for them.
+type relKeys struct {
+	n     int
+	cols  [maxKeyCols][]any
+	types [maxKeyCols]reflect.Type // each column's type on the parent, pointer removed
+	casts [maxKeyCols]string       // each column's SQL type, for the arrays Postgres matches on
+}
+
+func (k *relKeys) len() int { return len(k.cols[0]) }
 
 // Relation loads a relation alongside the query, as a second statement keyed on what
 // the first returned — one query per relation, not one per row.
@@ -92,13 +110,16 @@ func (q *SelectQuery[T]) Relation[U any](field string, fns ...func(*SelectQuery[
 		return q
 	}
 
-	childCol := rel.childCol
+	if len(rel.childCols) > maxKeyCols {
+		q.fail(fmt.Errorf("barm: relation %q joins on %d columns, more than the %d barm takes", field, len(rel.childCols), maxKeyCols))
+		return q
+	}
+	childCols := rel.childCols
 	q.rels = append(q.rels, relation{
-		field:     field,
-		childType: reflect.TypeFor[U](),
-		parentCol: rel.parentCol,
-		childCol:  childCol,
-		prepare: func(r runner, schema string, keys []any, keyType reflect.Type) (string, []any, reader, error) {
+		field:      field,
+		childType:  reflect.TypeFor[U](),
+		parentCols: rel.parentCols,
+		prepare: func(r runner, schema string, keys relKeys) (string, []any, reader, error) {
 			r.name = "" // the key list changes the SQL, so it is not the parent's statement
 			c := newSelect[U](r)
 			c.model = child // table and relations from the model, columns from U
@@ -108,16 +129,14 @@ func (q *SelectQuery[T]) Relation[U any](field string, fns ...func(*SelectQuery[
 					c = fn(c)
 				}
 			}
-			return prepareRelation(c, childCol, keys, keyType)
+			return prepareRelation(c, childCols, keys)
 		},
 	})
 	return q
 }
 
 // prepareRelation renders the child query and hands back the reader for it.
-func prepareRelation[U any](
-	c *SelectQuery[U], childCol string, keys []any, keyType reflect.Type,
-) (string, []any, reader, error) {
+func prepareRelation[U any](c *SelectQuery[U], childCols []string, keys relKeys) (string, []any, reader, error) {
 	// The key has to come back with every row to group by, whether or not the
 	// projection asked for it, so it goes in front of whatever was being
 	// selected — after the caller's fns, which therefore cannot displace it.
@@ -130,121 +149,178 @@ func prepareRelation[U any](
 			c.colName = append(c.colName, name)
 		}
 	}
-	key := c.qualified(childCol)
-	// A projection that selects the key already gets it moved to the front rather
-	// than sent twice, and the row keeps it.
-	selected := slices.Index(c.colName, childCol)
-	if selected >= 0 {
-		c.cols = slices.Delete(c.cols, selected, selected+1)
-		c.colName = slices.Delete(c.colName, selected, selected+1)
+	// A projection that selects a key column already gets it moved to the front
+	// rather than sent twice, and the row keeps it.
+	n := len(childCols)
+	var inRow [maxKeyCols]bool
+	var names [maxKeyCols]string
+	for i, col := range childCols {
+		if at := slices.Index(c.colName, col); at >= 0 {
+			c.cols = slices.Delete(c.cols, at, at+1)
+			c.colName = slices.Delete(c.colName, at, at+1)
+			inRow[i] = true
+		}
 	}
-	c.cols = append([]frag{key}, c.cols...)
-	c.colName = append([]string{childCol}, c.colName...)
-	c.Where(keyPredicate(c.Dialect(), key.sql, keys, keyType))
+	cols := make([]frag, n, n+len(c.cols))
+	colName := make([]string, n, n+len(c.colName))
+	for i, col := range childCols {
+		cols[i], colName[i] = c.qualified(col), col
+		names[i] = cols[i].sql
+	}
+	c.cols, c.colName = append(cols, c.cols...), append(colName, c.colName...)
+	pred, args := keyPredicate(c.Dialect(), names[:n], &keys)
+	c.Where(pred, args...)
 
 	query, args, err := c.build()
 	if err != nil {
 		return "", nil, nil, err
 	}
+	// Only what grouping needs goes in the closure, so the keys themselves stay
+	// off the heap.
+	types, nkeys := keys.types, keys.len()
 	read := func(_ context.Context, rows Rows) (setter, func() ([]*pending, error), error) {
-		return groupRelation(c, rows, keyType, len(keys), selected >= 0)
+		return groupRelation(c, rows, n, nkeys, types, inRow)
 	}
 	return query, args, read, nil
 }
 
 // keyPredicate matches the child rows against the keys. One array parameter
-// keeps the SQL the same for any number of them, so a driver that caches
-// statements keeps hitting the same one; a dialect without arrays spells the
-// values out instead.
-func keyPredicate(d Dialect, name string, keys []any, keyType reflect.Type) (string, any) {
-	if !d.HasAnyArray() {
-		return name + " IN (?)", In(keys)
+// per key column keeps the SQL the same for any number of them, so a driver
+// that caches statements keeps hitting the same one; a dialect without arrays,
+// or a key column with no SQL type to cast its array to, spells the values out
+// instead.
+func keyPredicate(d Dialect, names []string, keys *relKeys) (string, []any) {
+	if len(names) == 1 {
+		if !d.HasAnyArray() {
+			return names[0] + " IN (?)", []any{In(keys.cols[0])}
+		}
+		return names[0] + " = ANY(?)", []any{typedSlice(keys.types[0], keys.cols[0])}
 	}
-	// A typed slice binds as one value: the driver sees an array.
-	arr := reflect.MakeSlice(reflect.SliceOf(keyType), len(keys), len(keys))
-	for i, k := range keys {
-		arr.Index(i).Set(reflect.ValueOf(k))
+	row := "(" + strings.Join(names, ", ") + ")"
+	if d.HasAnyArray() && !slices.Contains(keys.casts[:keys.n], "") {
+		// unnest zips the arrays back into the keys, one row each.
+		var sb strings.Builder
+		sb.WriteString(row)
+		sb.WriteString(" IN (SELECT * FROM unnest(") //nolint:unqueryvet // unnest yields exactly the key columns
+		args := make([]any, len(names))
+		for i := range names {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("?")
+			sb.Write(d.AppendCast(nil, keys.casts[i]+"[]"))
+			args[i] = typedSlice(keys.types[i], keys.cols[i])
+		}
+		sb.WriteString("))")
+		return sb.String(), args
 	}
-	return name + " = ANY(?)", arr.Interface()
+	var sb strings.Builder
+	sb.WriteString(row)
+	sb.WriteString(" IN (")
+	args := make([]any, 0, keys.len()*len(names))
+	for i := range keys.len() {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+		for c := range names {
+			if c > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('?')
+			args = append(args, keys.cols[c][i])
+		}
+		sb.WriteByte(')')
+	}
+	sb.WriteByte(')')
+	return sb.String(), args
+}
+
+// typedSlice binds values as one value of their own type: the driver sees an
+// array.
+func typedSlice(t reflect.Type, values []any) any {
+	arr := reflect.MakeSlice(reflect.SliceOf(t), len(values), len(values))
+	for i, v := range values {
+		arr.Index(i).Set(reflect.ValueOf(v))
+	}
+	return arr.Interface()
 }
 
 // groupRelation scans the child rows and gathers each key's into one contiguous
 // run of a single array, so every parent is handed a window of it rather than a
 // slice of its own. Rows of their own load first, before anyone holds a window.
 func groupRelation[U any](
-	c *SelectQuery[U], rows Rows, keyType reflect.Type, nkeys int, inRow bool,
+	c *SelectQuery[U], rows Rows, n, nkeys int, types [maxKeyCols]reflect.Type, inRow [maxKeyCols]bool,
 ) (setter, func() ([]*pending, error), error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, nil, err
 	}
-	// The key is column 0. When the row selects it too, it scans into the row and
-	// is read back from there; otherwise it scans into a holder of its own.
-	off := 1
-	if inRow {
-		off = 0
-	}
-	p, err := planFor(reflect.TypeFor[U](), cols[off:])
+	p, err := planFor(reflect.TypeFor[U](), cols)
 	if err != nil {
 		return nil, nil, err
 	}
-	if inRow && p.paths[0] == nil {
-		return nil, nil, fmt.Errorf("barm: %s maps no field to %q", reflect.TypeFor[U](), cols[0])
-	}
 
+	// The key columns come first. One the row selects too scans into it and is
+	// read back from there; the others scan into holders of the parent's type,
+	// so the keys compare.
 	var (
 		flat  []U
 		gid   []int32 // the group of each row, in the order the rows came
 		group = make(map[any]int32, nkeys)
 		dest  = make([]any, len(cols))
 		sink  any
-		key   = reflect.New(keyType) // the parent's own type, so the keys compare
 		hs    = p.holders(rows)
+		kr    = keyReader{inRow: inRow, types: types, paths: p.paths}
 	)
-	convert, deref := false, false
-	if inRow {
-		ft := reflect.TypeFor[U]().FieldByIndex(p.paths[0]).Type
+	for i := range n {
+		t := types[i]
+		if !inRow[i] {
+			kr.held[i] = reflect.New(t)
+			dest[i] = kr.held[i].Interface()
+			continue
+		}
+		if p.paths[i] == nil {
+			return nil, nil, fmt.Errorf("barm: %s maps no field to %q", reflect.TypeFor[U](), cols[i])
+		}
+		ft := reflect.TypeFor[U]().FieldByIndex(p.paths[i]).Type
 		if ft.Kind() == reflect.Pointer {
-			ft, deref = ft.Elem(), true // a nullable key; NULL matches no parent, so it never comes back
+			ft, kr.deref[i] = ft.Elem(), true // a nullable key; NULL matches no parent, so it never comes back
 		}
-		if ft != keyType {
-			if !ft.ConvertibleTo(keyType) {
-				return nil, nil, fmt.Errorf("barm: key %q is %s on the row but %s on the parent", cols[0], ft, keyType)
+		if ft != t {
+			if !ft.ConvertibleTo(t) {
+				return nil, nil, fmt.Errorf("barm: key %q is %s on the row but %s on the parent", cols[i], ft, t)
 			}
-			convert = true
+			kr.conv[i] = true
 		}
-	} else {
-		dest[0] = key.Interface()
 	}
 	for rows.Next() {
 		var zero U
 		flat = append(flat, zero)
 		rv := reflect.ValueOf(&flat[len(flat)-1]).Elem()
 		for i, path := range p.paths {
-			if path == nil {
-				dest[i+off] = &sink
-				continue
+			switch {
+			case i < n && !inRow[i]:
+			case path == nil:
+				dest[i] = &sink
+			default:
+				dest[i] = p.at(rv, i, hs)
 			}
-			dest[i+off] = p.at(rv, i, hs)
 		}
 		err = rows.Scan(dest...)
 		if err != nil {
 			return nil, nil, err
 		}
 		var k any
-		if inRow {
-			f := fieldValue(rv, p.paths[0])
-			if deref {
-				f = f.Elem()
-			}
-			if convert {
-				f = f.Convert(keyType) // same value as the parent's key type, so they compare
-			}
-			k = f.Interface()
+		if n == 1 {
+			k = kr.part(rv, 0)
 		} else {
-			k = key.Elem().Interface()
+			var ck compositeKey
+			for i := range n {
+				ck[i] = kr.part(rv, i)
+			}
+			k = ck
 		}
-		k = hashable(k)
 		g, ok := group[k]
 		if !ok {
 			g = int32(len(group)) //nolint:gosec // group would exhaust memory long before hitting 2^31 entries
@@ -320,6 +396,28 @@ func groupRelation[U any](
 		}
 	}
 	return set, next, nil
+}
+
+// keyReader reads a child row's key, a column at a time.
+type keyReader struct {
+	inRow, deref, conv [maxKeyCols]bool
+	held               [maxKeyCols]reflect.Value // where a key the row does not select scans to
+	types              [maxKeyCols]reflect.Type
+	paths              [][]int
+}
+
+func (kr *keyReader) part(rv reflect.Value, i int) any {
+	if !kr.inRow[i] {
+		return hashable(kr.held[i].Elem().Interface())
+	}
+	f := fieldValue(rv, kr.paths[i])
+	if kr.deref[i] {
+		f = f.Elem()
+	}
+	if kr.conv[i] {
+		f = f.Convert(kr.types[i]) // same value as the parent's key type, so they compare
+	}
+	return hashable(f.Interface())
 }
 
 // pending is one relation with its query rendered and its parents lined up.
@@ -399,55 +497,73 @@ func (q *SelectQuery[T]) prepareRelations(rows []T) ([]*pending, error) {
 			return nil, fmt.Errorf("barm: relation %q holds %s, but Relation was given %s",
 				rel.field, target.typ, rel.childType)
 		}
-		key, ok := m.field(rel.parentCol)
-		if !ok {
-			return nil, fmt.Errorf("barm: relation %q joins on %q, which %s does not select",
-				rel.field, rel.parentCol, m.typ)
-		}
-		if !q.selects(rel.parentCol) {
-			return nil, fmt.Errorf("barm: relation %q joins on %q, which the query's columns leave out — add it with Column",
-				rel.field, rel.parentCol)
+		n := len(rel.parentCols)
+		keys := relKeys{n: n}
+		var index [maxKeyCols][]int
+		var nullable [maxKeyCols]bool
+		for c, col := range rel.parentCols {
+			key, ok := m.field(col)
+			if !ok {
+				return nil, fmt.Errorf("barm: relation %q joins on %q, which %s does not select", rel.field, col, m.typ)
+			}
+			if !q.selects(col) {
+				return nil, fmt.Errorf("barm: relation %q joins on %q, which the query's columns leave out — add it with Column",
+					rel.field, col)
+			}
+			// A nullable key is compared by what it points at, and a nil one
+			// belongs to nothing.
+			t := m.typ.FieldByIndex(key.index).Type
+			if nullable[c] = t.Kind() == reflect.Pointer; nullable[c] {
+				t = t.Elem()
+			}
+			index[c], keys.types[c], keys.casts[c] = key.index, t, key.cast
+			keys.cols[c] = make([]any, 0, len(rows))
 		}
 
-		// Each parent's key, and the distinct ones for the IN list. A nullable
-		// key is compared by what it points at, and a nil one belongs to nothing.
-		keyType := m.typ.FieldByIndex(key.index).Type
-		nullable := keyType.Kind() == reflect.Pointer
-		if nullable {
-			keyType = keyType.Elem()
-		}
+		// Each parent's key, and the distinct ones to fetch by.
 		byParent := make([]any, len(rows))
 		seen := make(map[any]struct{}, len(rows))
-		keys := make([]any, 0, len(rows))
+		var parts [maxKeyCols]any
+	parents:
 		for j := range rows {
-			kv := fieldValue(reflect.ValueOf(&rows[j]).Elem(), key.index)
-			if nullable {
-				if kv.IsNil() {
-					continue
+			rv := reflect.ValueOf(&rows[j]).Elem()
+			var ck compositeKey
+			for c := range n {
+				kv := fieldValue(rv, index[c])
+				if nullable[c] {
+					if kv.IsNil() {
+						continue parents
+					}
+					kv = kv.Elem()
 				}
-				kv = kv.Elem()
+				parts[c] = kv.Interface()
+				ck[c] = hashable(parts[c])
 			}
-			k := kv.Interface()
-			h := hashable(k)
+			h := ck[0]
+			if n > 1 {
+				h = ck
+			}
 			byParent[j] = h
 			if _, dup := seen[h]; !dup {
 				seen[h] = struct{}{}
-				keys = append(keys, k) // bound as it is, compared as the database compares it
+				for c := range n {
+					keys.cols[c] = append(keys.cols[c], parts[c]) // bound as it is, compared as the database compares it
+				}
 			}
 		}
 
 		w := &pending{set: noRows}
-		index := target.index
+		field := target.index
 		w.apply = func() {
 			for j := range rows {
-				w.set(fieldAt(reflect.ValueOf(&rows[j]).Elem(), index), byParent[j])
+				w.set(fieldAt(reflect.ValueOf(&rows[j]).Elem(), field), byParent[j])
 			}
 		}
 		level = append(level, w)
-		if len(keys) == 0 {
+		if keys.len() == 0 {
 			continue // nothing to fetch by, and `IN ()` is not SQL everywhere
 		}
-		w.query, w.args, w.read, err = rel.prepare(q.runner, q.schema, keys, keyType)
+		w.query, w.args, w.read, err = rel.prepare(q.runner, q.schema, keys)
 		if err != nil {
 			return nil, fmt.Errorf("barm: relation %q: %w", rel.field, err)
 		}

@@ -2617,7 +2617,7 @@ type ageChange struct {
 }
 
 // An update reading a VALUES list matches its rows by columns that are not all
-// text, as tms's do: the first row's casts give them their types, so pgx can
+// text: the first row's casts give them their types, so pgx can
 // encode them however the statement runs.
 func TestUpdateFromValuesOnPgx(t *testing.T) {
 	ctx := t.Context()
@@ -2682,8 +2682,7 @@ func TestUpdateFromValuesOnPgx(t *testing.T) {
 	}
 }
 
-// A delete matches a VALUES list on two columns at once, as tms deletes custom
-// field values by test case and version.
+// A delete matches a VALUES list on two columns at once.
 func TestDeleteUsingValuesOnPgx(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -2717,9 +2716,9 @@ type userArchive struct {
 	Age  int    `barm:"age"`
 }
 
-// An insert takes its rows from a query — a CTE over a VALUES list here, as tms
-// fills a table from its own ids — and RETURNING reads what it wrote, through
-// Slice; Exec writes nothing back, having no values, and a batch runs it too.
+// An insert takes its rows from a query — a CTE over a VALUES list here — and
+// RETURNING reads what it wrote, through Slice; Exec writes nothing back,
+// having no values, and a batch runs it too.
 func TestInsertSelectOnPgx(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -2777,7 +2776,7 @@ func TestInsertSelectOnPgx(t *testing.T) {
 }
 
 // DISTINCT ON keeps the row ORDER BY puts first in each group: the oldest user
-// of each age bracket here, as tms keeps a run's latest result.
+// of each age bracket here.
 func TestDistinctOnPgx(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -2830,9 +2829,8 @@ func TestWhereGroupPgx(t *testing.T) {
 	}
 }
 
-// A temp table named at run time joins through Ident, as tms joins its
-// per-request version tables, and a raw expression goes in through Safe — in a
-// plain query, a prepared one and a batch alike.
+// A temp table named at run time joins through Ident, and a raw expression goes
+// in through Safe — in a plain query, a prepared one and a batch alike.
 func TestIdentAndSafePgx(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -2868,4 +2866,162 @@ func TestIdentAndSafePgx(t *testing.T) {
 	r := b.Slice(q())
 	err = b.Run(ctx)
 	check("batch", r.Value(), err)
+}
+
+type ckTemplate struct {
+	barm.BaseModel `barm:"table:ck_templates,alias:p"`
+
+	ID      string `barm:"id,pk"`
+	Version int    `barm:"version,pk"`
+	Text    string `barm:"text"`
+}
+
+type ckPage struct {
+	barm.BaseModel `barm:"table:ck_pages,alias:s"`
+
+	DocID      string `barm:"doc_id"`
+	DocVersion int    `barm:"doc_version"`
+	Pos        int    `barm:"pos"`
+}
+
+type ckDoc struct {
+	barm.BaseModel `barm:"table:ck_docs,alias:t"`
+
+	ID              string      `barm:"id,pk"`
+	Version         int         `barm:"version,pk"`
+	TemplateID      *string     `barm:"template_id"`
+	TemplateVersion *int        `barm:"template_version"`
+	Template        *ckTemplate `barm:"rel:template_id=id,rel:template_version=version"`
+	Pages           []ckPage    `barm:"rel:id=doc_id,rel:version=doc_version"`
+}
+
+// pageLite leaves the key out of its columns, so it is fetched for grouping
+// and nowhere else.
+type pageLite struct {
+	barm.BaseModel `barm:"table:ck_pages"`
+
+	Pos int `barm:"pos"`
+}
+
+type ckDocLite struct {
+	ID      string     `barm:"id"`
+	Version int        `barm:"version"`
+	Pages   []pageLite `barm:"rel:id=doc_id,rel:version=doc_version"`
+}
+
+func seedComposite(t *testing.T, db *barm.DB) {
+	t.Helper()
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS ck_docs, ck_templates, ck_pages`,
+		`CREATE TABLE ck_templates (id text, version int, text text, PRIMARY KEY (id, version))`,
+		`CREATE TABLE ck_docs (id text, version int, template_id text, template_version int, PRIMARY KEY (id, version))`,
+		`CREATE TABLE ck_pages (doc_id text, doc_version int, pos int)`,
+		// Same ids at different versions: a key on either column alone would
+		// hand a doc the wrong template or another version's pages.
+		`INSERT INTO ck_templates VALUES ('t1', 1, 't1 v1'), ('t1', 2, 't1 v2'), ('t2', 1, 't2 v1')`,
+		`INSERT INTO ck_docs VALUES ('a', 1, 't1', 1), ('a', 2, 't1', 2), ('b', 1, 't1', 2), ('c', 1, NULL, NULL)`,
+		`INSERT INTO ck_pages VALUES ('a', 1, 10), ('a', 2, 20), ('a', 2, 21), ('b', 1, 30)`,
+	} {
+		if _, err := db.Exec(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { db.Exec(context.Background(), `DROP TABLE IF EXISTS ck_docs, ck_templates, ck_pages`) })
+}
+
+// A relation keyed on two columns matches on both: a belongs-to by id and
+// version, and a has-many the same way. The keys go as one array per column, so the SQL is the same for any
+// number of parents.
+func TestCompositeRelation(t *testing.T) {
+	ctx := t.Context()
+	var mu sync.Mutex
+	var children []string
+	hook := barm.WithHook(barm.QueryHook{AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+		if strings.HasPrefix(ev.Query, "SELECT") && (strings.Contains(ev.Query, "ck_templates") || strings.Contains(ev.Query, "ck_pages")) {
+			mu.Lock()
+			children = append(children, ev.Query)
+			mu.Unlock()
+		}
+	}})
+	for _, tc := range []struct {
+		name string
+		db   func(*testing.T) *barm.DB
+	}{
+		{"batched", func(t *testing.T) *barm.DB { return open(t, hook) }},
+		{"one by one", func(t *testing.T) *barm.DB { return openPool(t, 1, hook) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			children = nil
+			db := tc.db(t)
+			seedComposite(t, db)
+			docs, err := db.Select[ckDoc]().
+				Relation[ckTemplate]("Template").
+				Relation[ckPage]("Pages", func(q *barm.SelectQuery[ckPage]) *barm.SelectQuery[ckPage] { return q.OrderBy("pos") }).
+				OrderBy("id, version").
+				Slice(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []struct {
+				pre   string
+				pages []int
+			}{{"t1 v1", []int{10}}, {"t1 v2", []int{20, 21}}, {"t1 v2", []int{30}}, {"", nil}}
+			if len(docs) != len(want) {
+				t.Fatalf("%d docs", len(docs))
+			}
+			for i, w := range want {
+				c := docs[i]
+				pre := ""
+				if c.Template != nil {
+					pre = c.Template.Text
+				}
+				var pos []int
+				for _, s := range c.Pages {
+					pos = append(pos, s.Pos)
+					if s.DocID != c.ID || s.DocVersion != c.Version {
+						t.Errorf("%s v%d holds %+v", c.ID, c.Version, s)
+					}
+				}
+				if pre != w.pre || !slices.Equal(pos, w.pages) {
+					t.Errorf("%s v%d: template %q, pages %v; want %q, %v", c.ID, c.Version, pre, pos, w.pre, w.pages)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(children) != 2 {
+				t.Errorf("%d child queries, want one per relation", len(children))
+			}
+			for _, q := range children {
+				if !strings.Contains(q, "IN (SELECT * FROM unnest(") || strings.Count(q, "$") != 2 {
+					t.Errorf("child query = %s, want two array parameters", q)
+				}
+			}
+		})
+	}
+}
+
+// A projection that leaves the key columns out still groups by them: they are
+// fetched for that and land nowhere.
+func TestCompositeRelationKeyNotSelected(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seedComposite(t, db)
+	docs, err := db.Select[ckDoc]().
+		Relation[pageLite]("Pages", func(q *barm.SelectQuery[pageLite]) *barm.SelectQuery[pageLite] { return q.OrderBy("pos") }).
+		OrderBy("id, version").
+		SliceAs[ckDocLite](ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]int
+	for _, c := range docs {
+		var pos []int
+		for _, s := range c.Pages {
+			pos = append(pos, s.Pos)
+		}
+		got = append(got, pos)
+	}
+	if want := [][]int{{10}, {20, 21}, {30}, nil}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pages = %v, want %v", got, want)
+	}
 }
