@@ -804,6 +804,190 @@ func TestQueryHooks(t *testing.T) {
 	}
 }
 
+// A builder reports what it runs on from what it knows rather than from its
+// SQL, so a WITH clause does not hide a SELECT and raw SQL names no table.
+func TestHookSeesTarget(t *testing.T) {
+	ctx := t.Context()
+	rec := &recorder{}
+	db := openAuthors(t, barm.WithHook(rec.hook()))
+	rec.events = nil
+
+	lem := db.Select[Author]().Where("name = ?", "Lem")
+	steps := []func() error{
+		func() error {
+			_, err := db.Select[Book]().With("lem", lem).Where("author_id IN (SELECT id FROM lem)").Slice(ctx)
+			return err
+		},
+		func() error { _, err := db.Select[Book]().Schema("main").Count(ctx); return err },
+		func() error {
+			_, err := db.Select[Book]().Table("(SELECT id, title, author_id FROM books) AS b").Slice(ctx)
+			return err
+		},
+		func() error { _, err := db.Select[Book]().Table("books").Slice(ctx); return err },
+		func() error {
+			_, err := db.Update[Book]().Set("title = ?", "x").Where("id = ?", 0).Exec(ctx)
+			return err
+		},
+		func() error { _, err := db.Delete[Book]().Table("books").Where("id = ?", 0).Exec(ctx); return err },
+		func() error { _, err := db.NewRaw("DELETE FROM books WHERE id = ?", 0).Exec(ctx); return err },
+	}
+	for i, step := range steps {
+		if err := step(); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	want := []struct{ op, table, schema string }{
+		{"SELECT", "books", ""},
+		{"SELECT", "books", "main"},
+		{"SELECT", "", ""},
+		{"SELECT", "books", ""},
+		{"UPDATE", "books", ""},
+		{"DELETE", "books", ""},
+		{"DELETE", "", ""},
+	}
+	if len(rec.events) != len(want) {
+		t.Fatalf("events = %d, want %d", len(rec.events), len(want))
+	}
+	for i, w := range want {
+		if ev := rec.events[i]; ev.Op != w.op || ev.Table != w.table || ev.Schema != w.schema {
+			t.Errorf("event %d = %s %q %q, want %s %q %q", i, ev.Op, ev.Table, ev.Schema, w.op, w.table, w.schema)
+		}
+	}
+}
+
+// The hooks finish once the rows are read, counting them, whoever reads them.
+func TestHookCountsRows(t *testing.T) {
+	ctx := t.Context()
+	rec := &recorder{}
+	db := openAuthors(t, barm.WithHook(rec.hook()))
+	last := func() barm.QueryEvent {
+		t.Helper()
+		if len(rec.events) == 0 {
+			t.Fatal("no event")
+		}
+		ev := rec.events[len(rec.events)-1]
+		rec.events = nil
+		return ev
+	}
+	rec.events = nil
+
+	if _, err := db.Select[Book]().Slice(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ev := last(); ev.Rows != 3 {
+		t.Errorf("Slice: rows = %d, want 3", ev.Rows)
+	}
+	if _, err := db.Select[Book]().Where("id = ?", 0).One(ctx); !errors.Is(err, barm.ErrNoRows) {
+		t.Fatalf("err = %v, want ErrNoRows", err)
+	}
+	if ev := last(); ev.Rows != 0 || !errors.Is(ev.Err, barm.ErrNoRows) {
+		t.Errorf("One: rows = %d, err = %v, want 0 and ErrNoRows", ev.Rows, ev.Err)
+	}
+	if _, err := db.Select[Book]().One(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ev := last(); ev.Rows != 1 {
+		t.Errorf("One: rows = %d, want 1", ev.Rows)
+	}
+
+	n := 0
+	for _, err := range db.Select[Book]().Seq(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rec.events) != 0 {
+			t.Fatal("Seq finished its hooks before the loop ended")
+		}
+		if n++; n == 2 {
+			break
+		}
+	}
+	if ev := last(); ev.Rows != 2 {
+		t.Errorf("Seq: rows = %d, want 2", ev.Rows)
+	}
+
+	rows, err := db.Select[Book]().Rows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+	}
+	if len(rec.events) != 0 {
+		t.Fatal("Rows finished its hooks before they were closed")
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if len(rec.events) != 1 {
+		t.Errorf("Rows: events = %d, want one however many times they close", len(rec.events))
+	}
+	if ev := last(); ev.Rows != 3 {
+		t.Errorf("Rows: rows = %d, want 3", ev.Rows)
+	}
+
+	if _, err := db.Insert[Book]().Values(&Book{Title: "a"}, &Book{Title: "b"}).Returning("id").Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ev := last(); ev.Rows != 2 {
+		t.Errorf("Exec RETURNING: rows = %d, want 2", ev.Rows)
+	}
+	if _, err := db.Delete[Book]().Where("title = ?", "a").Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ev := last(); ev.Rows != 0 || ev.Result == nil {
+		t.Errorf("Exec: rows = %d, result = %v, want 0 and a result", ev.Rows, ev.Result)
+	}
+
+	if _, err := db.Select[Author]().Relation[Book]("Books").Slice(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ev := last(); ev.Table != "books" || ev.Rows != 3 {
+		t.Errorf("relation: table = %q, rows = %d, want books and 3", ev.Table, ev.Rows)
+	}
+}
+
+// A row that fails to scan fails the query the hooks report too.
+func TestHookSeesScanError(t *testing.T) {
+	ctx := t.Context()
+	rec := &recorder{}
+	db := openAuthors(t, barm.WithHook(rec.hook()))
+	type badBook struct {
+		Title int `barm:"title"`
+	}
+	rec.events = nil
+	if _, err := db.Select[Book]().SliceAs[badBook](ctx); err == nil {
+		t.Fatal("expected a scan error")
+	}
+	if _, err := db.Select[Book]().OneAs[badBook](ctx); err == nil {
+		t.Fatal("expected a scan error")
+	}
+	for _, err := range db.Select[Book]().SeqAs[badBook](ctx) {
+		if err == nil {
+			t.Fatal("expected a scan error")
+		}
+	}
+	rows, err := db.Select[Book]().Rows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var title int
+		if rows.Scan(new(any), &title, new(any)) == nil {
+			t.Fatal("expected a scan error")
+		}
+	}
+	_ = rows.Close()
+	if len(rec.events) != 4 {
+		t.Fatalf("events = %d, want 4", len(rec.events))
+	}
+	for i, ev := range rec.events {
+		if ev.Err == nil {
+			t.Errorf("event %d: no error", i)
+		}
+	}
+}
+
 // Every BeforeQuery is paired with an AfterQuery, whichever way the query goes:
 // a hook that opens a span in one and closes it in the other leaks otherwise.
 func TestHooksPairOnEveryPath(t *testing.T) {
@@ -1408,6 +1592,119 @@ func TestQueryHookPartial(t *testing.T) {
 	}
 }
 
+// What a transaction sends on its own, BEGIN, COMMIT and every savepoint, is
+// watched like any query, as it is when a batch queues it.
+func TestTxControlFiresQueryHooks(t *testing.T) {
+	ctx := t.Context()
+	var seen []string
+	sqldb, err := sql.Open("sqlite", "file:"+t.TempDir()+"/ctl.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite, barm.WithHook(barm.QueryHook{
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+			if ev.Err != nil {
+				t.Errorf("%s: %v", ev.Query, ev.Err)
+			}
+			seen = append(seen, ev.Op+": "+ev.Query)
+		},
+	}))
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := tx.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kept.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	undone, err := tx.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := undone.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+		t.Fatalf("err = %v, want ErrTxDone", err)
+	}
+
+	// a batch inside a transaction opens savepoints rather than transactions
+	outer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	undoneBatch := outer.Batch()
+	undoneBatch.Begin()
+	if err := undoneBatch.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := undoneBatch.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keptBatch := outer.Batch()
+	keptBatch.Begin()
+	keptBatch.Commit()
+	if err := keptBatch.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	onConn, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := onConn.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	b := conn.Batch()
+	b.Begin()
+	if err := b.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"BEGIN: BEGIN",
+		`SAVEPOINT: SAVEPOINT "barm_sp_1"`,
+		`RELEASE SAVEPOINT: RELEASE SAVEPOINT "barm_sp_1"`,
+		`SAVEPOINT: SAVEPOINT "barm_sp_2"`,
+		`ROLLBACK TO SAVEPOINT: ROLLBACK TO SAVEPOINT "barm_sp_2"`,
+		`RELEASE SAVEPOINT: RELEASE SAVEPOINT "barm_sp_2"`,
+		"COMMIT: COMMIT",
+		"BEGIN: BEGIN",
+		"SAVEPOINT: SAVEPOINT barm_batch",
+		"ROLLBACK TO SAVEPOINT: ROLLBACK TO SAVEPOINT barm_batch",
+		"SAVEPOINT: SAVEPOINT barm_batch",
+		"RELEASE SAVEPOINT: RELEASE SAVEPOINT barm_batch",
+		"ROLLBACK: ROLLBACK",
+		"BEGIN: BEGIN",
+		"ROLLBACK: ROLLBACK",
+		"BEGIN: BEGIN",
+		"ROLLBACK: ROLLBACK",
+	}
+	if !slices.Equal(seen, want) {
+		t.Errorf("seen:\n%s\nwant:\n%s", strings.Join(seen, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 // Hooks can be registered on one transaction rather than on the DB.
 func TestTxScopedHooks(t *testing.T) {
 	ctx := t.Context()
@@ -1430,8 +1727,8 @@ func TestTxScopedHooks(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if ended != 1 || queries != 1 {
-		t.Fatalf("ended = %d, queries = %d, want 1 and 1", ended, queries)
+	if ended != 1 || queries != 2 { // the SELECT and the COMMIT
+		t.Fatalf("ended = %d, queries = %d, want 1 and 2", ended, queries)
 	}
 
 	// The DB itself never saw them, so a later transaction is unaffected.
@@ -1445,7 +1742,7 @@ func TestTxScopedHooks(t *testing.T) {
 	if err := tx2.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if ended != 1 || queries != 1 {
+	if ended != 1 || queries != 2 {
 		t.Fatalf("ended = %d, queries = %d — the second transaction should not fire", ended, queries)
 	}
 }

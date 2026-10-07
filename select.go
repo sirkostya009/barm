@@ -489,13 +489,26 @@ func (q *SelectQuery[T]) argCount() int {
 	return n
 }
 
+// tableName is what Table set, an expression rather than a name, perhaps; the
+// model's table otherwise.
+func (q *SelectQuery[T]) tableName() string {
+	if q.table != nil {
+		return q.table.sql
+	}
+	return q.model.table
+}
+
+func (q *SelectQuery[T]) target() target {
+	return target{op: "SELECT", table: q.tableName(), schema: q.schema}
+}
+
 // Rows runs the query and returns its rows, for the caller to read and close.
 func (q *SelectQuery[T]) Rows(ctx context.Context) (Rows, error) {
 	query, args, err := q.build()
 	if err != nil {
 		return nil, err
 	}
-	return q.query(ctx, query, args)
+	return q.query(ctx, q.target(), query, args)
 }
 
 // Seq streams rows as an iterator. The error is reported through the second
@@ -507,7 +520,7 @@ func (q *SelectQuery[T]) Seq(ctx context.Context) iter.Seq2[T, error] {
 		// thing a stream does not have. Saying so beats a query per row.
 		err = errors.New("barm: Relation cannot stream — relations need the whole result, so use Slice or One")
 	}
-	return q.seq[T](ctx, query, args, err)
+	return q.seq[T](ctx, q.target(), query, args, err)
 }
 
 // SeqAs streams the rows as U instead of the query's own type.
@@ -525,7 +538,7 @@ func (q *SelectQuery[T]) Slice(ctx context.Context) ([]T, error) {
 		return nil, err
 	}
 	// A LIMIT is the only row-count hint a select has.
-	out, err := q.slice[T](ctx, query, args, q.limit)
+	out, err := q.slice[T](ctx, q.target(), query, args, q.limit)
 	if err != nil || len(q.rels) == 0 || len(out) == 0 {
 		return out, err
 	}
@@ -551,7 +564,7 @@ func (q *SelectQuery[T]) One(ctx context.Context) (T, error) {
 		var zero T
 		return zero, err
 	}
-	v, err := c.one[T](ctx, query, args)
+	v, err := c.one[T](ctx, c.target(), query, args)
 	if err != nil || len(c.rels) == 0 {
 		return v, err
 	}
@@ -659,7 +672,7 @@ func (q *SelectQuery[T]) Count(ctx context.Context) (int64, error) {
 	}
 	c := *q
 	c.name = "" // different SQL text than the query this was derived from
-	return c.one[int64](ctx, query, args)
+	return c.one[int64](ctx, c.target(), query, args)
 }
 
 // Exists reports whether the query matches any row, as
@@ -672,7 +685,7 @@ func (q *SelectQuery[T]) Exists(ctx context.Context) (bool, error) {
 	}
 	c := *q
 	c.name = "" // different SQL text than the query this was derived from
-	return c.one[bool](ctx, query, args)
+	return c.one[bool](ctx, c.target(), query, args)
 }
 
 // ExistsQuery renders the EXISTS form of this query.

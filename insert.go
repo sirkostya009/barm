@@ -396,6 +396,10 @@ func (q *InsertQuery[T]) render(b *builder) error {
 	return nil
 }
 
+func (q *InsertQuery[T]) target() target {
+	return target{op: "INSERT", table: q.tableName(), schema: q.schema}
+}
+
 // Exec runs the insert. With a RETURNING clause the returned columns are
 // scanned back into the pointers given to Value; without one, and on a dialect
 // exposing LastInsertId, a single auto primary key is filled in — except after
@@ -410,7 +414,7 @@ func (q *InsertQuery[T]) Exec(ctx context.Context) (sql.Result, error) {
 		n, err := q.execReturning(ctx, query, args)
 		return rowsAffected(n), err
 	}
-	res, err := q.exec(ctx, query, args)
+	res, err := q.exec(ctx, q.target(), query, args)
 	if err != nil || len(q.rows) != 1 {
 		return res, err
 	}
@@ -458,12 +462,19 @@ func (q *InsertQuery[T]) setLastInsertID(res sql.Result) {
 // execReturning scans the returned rows back into the values and reports how
 // many came back.
 func (q *InsertQuery[T]) execReturning(ctx context.Context, query string, args []any) (int64, error) {
-	rows, err := q.query(ctx, query, args)
+	ctx, ev, e, err := q.start(ctx, q.target(), query, args)
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
-	return q.scanReturning(rows)
+	rows, err := q.runner.rows(ctx, e, query, args)
+	ev.responded()
+	var n int64
+	if err == nil {
+		n, err = q.scanReturning(rows)
+		err = closeRows(rows, err)
+	}
+	q.finish(ctx, ev, nil, n, err)
+	return n, err
 }
 
 // hasReturning reports whether Exec reads rows back, which a batch needs to
@@ -609,7 +620,7 @@ func (q *InsertQuery[T]) One(ctx context.Context) (T, error) {
 		var zero T
 		return zero, err
 	}
-	return q.one[T](ctx, query, args)
+	return q.one[T](ctx, q.target(), query, args)
 }
 
 // Slice runs the insert and scans every returned row into T, which is how a
@@ -621,7 +632,7 @@ func (q *InsertQuery[T]) Slice(ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	return q.slice[T](ctx, query, args, q.rowHint())
+	return q.slice[T](ctx, q.target(), query, args, q.rowHint())
 }
 
 // Seq runs the insert and streams the returned rows as T. A build failure is
@@ -630,7 +641,7 @@ func (q *InsertQuery[T]) Seq(ctx context.Context) iter.Seq2[T, error] {
 	c := *q
 	c.expandReturning()
 	query, args, err := c.Build()
-	return q.seq[T](ctx, query, args, err)
+	return q.seq[T](ctx, q.target(), query, args, err)
 }
 
 // OneAs runs the insert and scans the single returned row into U.

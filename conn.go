@@ -54,13 +54,13 @@ func (c *Conn) Values[T any](rows []T) *ValuesQuery[T] { return newValues(c.runn
 // Exec runs SQL as written on this connection, in the driver's own placeholders.
 func (c *Conn) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	r := c.runner()
-	return r.exec(ctx, query, args)
+	return r.exec(ctx, target{}, query, args)
 }
 
 // Query runs SQL as written on this connection; the caller closes the rows.
 func (c *Conn) Query(ctx context.Context, query string, args ...any) (Rows, error) {
 	r := c.runner()
-	return r.query(ctx, query, args)
+	return r.query(ctx, target{}, query, args)
 }
 
 // WithHook registers query hooks on this connection alone, on top of the DB's.
@@ -84,7 +84,9 @@ func (c *Conn) Batch() *Batch { return newBatch(c.c, &c.session, false, true) }
 // BeginTx starts a transaction on this connection. The connection stays the
 // caller's — Close is still the only thing that gives it back.
 func (c *Conn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	tx, err := c.c.Begin(ctx, opts)
+	bc, ev := startQuery(ctx, c.hooks, opBegin, "", "BEGIN", nil)
+	tx, err := c.c.Begin(bc, opts)
+	finishQuery(bc, c.hooks, ev, nil, 0, err)
 	if err != nil {
 		return nil, err
 	}

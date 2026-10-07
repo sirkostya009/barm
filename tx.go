@@ -59,13 +59,13 @@ func (tx *Tx) executor() Executor { return tx.tx }
 // placeholders.
 func (tx *Tx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	r := tx.runner()
-	return r.exec(ctx, query, args)
+	return r.exec(ctx, target{}, query, args)
 }
 
 // Query runs SQL as written in this transaction; the caller closes the rows.
 func (tx *Tx) Query(ctx context.Context, query string, args ...any) (Rows, error) {
 	r := tx.runner()
-	return r.query(ctx, query, args)
+	return r.query(ctx, target{}, query, args)
 }
 
 // Begin starts a nested transaction, which is the same call that started this
@@ -87,7 +87,7 @@ func (tx *Tx) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	}
 	*tx.seq++
 	name := "barm_sp_" + strconv.Itoa(*tx.seq)
-	_, err := tx.tx.Exec(ctx, "SAVEPOINT "+tx.ident(name), nil)
+	err := tx.control(ctx, opSavepoint, "SAVEPOINT "+tx.ident(name))
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +128,14 @@ func (tx *Tx) WithTxHook(hooks ...TxHook) *Tx {
 	return tx
 }
 
+// control sends a savepoint statement under the query hooks, as any query is.
+func (tx *Tx) control(ctx context.Context, op target, stmt string) error {
+	ctx, ev := startQuery(ctx, tx.hooks, op, "", stmt, nil)
+	res, err := tx.tx.Exec(ctx, stmt, nil)
+	finishQuery(ctx, tx.hooks, ev, res, 0, err)
+	return err
+}
+
 func (tx *Tx) ident(name string) string {
 	return string(tx.Dialect().AppendIdent(nil, name))
 }
@@ -149,7 +157,7 @@ func (tx *Tx) Commit() error {
 		// open, for the deferred Rollback to rewind to: in Postgres a failed
 		// statement aborts everything, and rewinding is the only way back short
 		// of ending the whole transaction.
-		_, err = tx.tx.Exec(context.WithoutCancel(tx.ctx), "RELEASE SAVEPOINT "+tx.ident(tx.savepoint), nil)
+		err = tx.control(context.WithoutCancel(tx.ctx), opReleaseSavepoint, "RELEASE SAVEPOINT "+tx.ident(tx.savepoint))
 		if err == nil {
 			*tx.done = true
 			tx.handHooksUp()
@@ -157,7 +165,9 @@ func (tx *Tx) Commit() error {
 		return err
 	}
 	*tx.done = true
-	err = tx.tx.Commit(context.WithoutCancel(tx.ctx))
+	c, qev := startQuery(context.WithoutCancel(ctx), tx.hooks, opCommit, "", "COMMIT", nil)
+	err = tx.tx.Commit(c)
+	finishQuery(c, tx.hooks, qev, nil, 0, err)
 	tx.afterCommit(ctx, ev, n, err)
 	return err
 }
@@ -181,16 +191,18 @@ func (tx *Tx) Rollback() error {
 		// every snapshot on the server slows down. A rewind that fails keeps the
 		// savepoint, for another attempt.
 		c := context.WithoutCancel(tx.ctx)
-		_, err = tx.tx.Exec(c, "ROLLBACK TO SAVEPOINT "+tx.ident(tx.savepoint), nil)
+		err = tx.control(c, opRollbackSavepoint, "ROLLBACK TO SAVEPOINT "+tx.ident(tx.savepoint))
 		if err == nil {
 			*tx.done = true
 			// The work is gone, so the hooks registered alongside it go too.
 			tx.dropHooks()
-			_, err = tx.tx.Exec(c, "RELEASE SAVEPOINT "+tx.ident(tx.savepoint), nil)
+			err = tx.control(c, opReleaseSavepoint, "RELEASE SAVEPOINT "+tx.ident(tx.savepoint))
 		}
 	} else {
 		*tx.done = true
-		err = tx.tx.Rollback(context.WithoutCancel(tx.ctx))
+		c, qev := startQuery(context.WithoutCancel(ctx), tx.hooks, opRollback, "", "ROLLBACK", nil)
+		err = tx.tx.Rollback(c)
+		finishQuery(c, tx.hooks, qev, nil, 0, err)
 	}
 	tx.afterRollback(ctx, ev, err)
 	return err

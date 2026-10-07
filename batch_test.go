@@ -24,14 +24,18 @@ type batchUser struct {
 // stubBatcher stands in for a driver, so the batch machinery can be tested
 // without one.
 type stubBatcher struct {
-	sent []barm.BatchQuery
-	fail error
+	sent   []barm.BatchQuery
+	fail   error
+	reader barm.BatchReader // stubReader when nil
 }
 
 func (s *stubBatcher) SendBatch(ctx context.Context, qs []barm.BatchQuery, read func(barm.BatchReader) error) error {
 	s.sent = qs
 	if s.fail != nil {
 		return s.fail
+	}
+	if s.reader != nil {
+		return read(s.reader)
 	}
 	return read(stubReader{})
 }
@@ -181,6 +185,7 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 	b := db.Batch()
 	b.Count(db.Select[batchUser]())
 	b.Exec(db.Insert[batchUser]().Values(&batchUser{Name: "a"}))
+	b.Slice(db.Select[batchUser]())
 
 	err := b.Run(t.Context())
 	if err == nil {
@@ -189,15 +194,30 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Fatalf("events = %d, want one per queued query", len(got))
 	}
 	if got[0].Op != "SELECT" || got[1].Op != "INSERT" {
 		t.Errorf("ops = %s, %s", got[0].Op, got[1].Op)
 	}
 	for i, ev := range got {
-		if ev.Query == "" || ev.Duration <= 0 {
-			t.Errorf("event %d = %+v, want a query and a duration", i, ev)
+		if ev.Table != "batch_users" {
+			t.Errorf("event %d: table = %q", i, ev.Table)
+		}
+	}
+	// The first reached the database and failed; the rest never did, so they
+	// report no times.
+	if ev := got[0]; ev.StartedAt.IsZero() || ev.Duration <= 0 || ev.FirstResponse <= 0 || ev.FirstResponse > ev.Duration {
+		t.Errorf("event 0 = %+v, want times", ev)
+	}
+	for i, ev := range got[1:] {
+		if !ev.StartedAt.IsZero() || ev.Duration != 0 || ev.FirstResponse != 0 {
+			t.Errorf("event %d = %+v, want no times", i+1, ev)
+		}
+	}
+	for i, ev := range got {
+		if ev.Query == "" {
+			t.Errorf("event %d has no query", i)
 		}
 	}
 	// The first failed, so the second never ran and says so.
@@ -207,3 +227,57 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 }
 
 type ctxKey struct{}
+
+// slowCountReader answers every query with one count row, which takes rowDelay
+// to arrive after the result does.
+type slowCountReader struct{}
+
+func (slowCountReader) Rows() (barm.Rows, error)       { return &slowCount{}, nil }
+func (slowCountReader) Exec() (barm.ExecResult, error) { return barm.ExecResult{}, nil }
+
+type slowCount struct{ read bool }
+
+func (*slowCount) Columns() ([]string, error) { return []string{"count"}, nil }
+func (*slowCount) Err() error                 { return nil }
+func (*slowCount) Close() error               { return nil }
+
+func (c *slowCount) Next() bool {
+	time.Sleep(rowDelay)
+	ok := !c.read
+	c.read = true
+	return ok
+}
+
+func (*slowCount) Scan(dest ...any) error {
+	*dest[0].(*int64) = 1 //nolint:forcetypeassert // a count scans into an int64
+	return nil
+}
+
+// Each query in a batch responds when its result is reached, and finishes once
+// its rows are read.
+func TestBatchFirstResponse(t *testing.T) {
+	t.Parallel()
+	var got []barm.QueryEvent
+	db := stubbed(&stubBatcher{reader: slowCountReader{}}, barm.WithHook(barm.QueryHook{
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { got = append(got, *ev) },
+	}))
+	b := db.Batch()
+	b.Count(db.Select[batchUser]())
+	b.Count(db.Select[batchUser]())
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("events = %d, want 2", len(got))
+	}
+	for i, ev := range got {
+		if ev.FirstResponse <= 0 || ev.Duration-ev.FirstResponse < rowDelay || ev.Rows != 1 {
+			t.Errorf("event %d: first response %s, duration %s, rows %d", i, ev.FirstResponse, ev.Duration, ev.Rows)
+		}
+	}
+	// The second starts when barm turns to it, once the first is read.
+	if end := got[0].StartedAt.Add(got[0].Duration); got[1].StartedAt.Before(end) {
+		t.Errorf("second started %s before the first ended", end.Sub(got[1].StartedAt))
+	}
+}

@@ -59,5 +59,5 @@ func (q *RawQuery) Exec(ctx context.Context) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return q.exec(ctx, query, args)
+	return q.exec(ctx, target{}, query, args)
 }

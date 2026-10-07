@@ -241,12 +241,16 @@ func (q *DeleteQuery[T]) render(b *builder) error {
 	return nil
 }
 
+func (q *DeleteQuery[T]) target() target {
+	return target{op: "DELETE", table: q.tableName(), schema: q.schema}
+}
+
 func (q *DeleteQuery[T]) Exec(ctx context.Context) (sql.Result, error) {
 	query, args, err := q.Build()
 	if err != nil {
 		return nil, err
 	}
-	return q.exec(ctx, query, args)
+	return q.exec(ctx, q.target(), query, args)
 }
 
 // One runs the delete and scans the single returned row into T, the query's own
@@ -259,7 +263,7 @@ func (q *DeleteQuery[T]) One(ctx context.Context) (T, error) {
 		var zero T
 		return zero, err
 	}
-	return q.one[T](ctx, query, args)
+	return q.one[T](ctx, q.target(), query, args)
 }
 
 // Slice runs the delete and scans every returned row into T, which is how you
@@ -271,7 +275,7 @@ func (q *DeleteQuery[T]) Slice(ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	return q.slice[T](ctx, query, args, q.rowHint())
+	return q.slice[T](ctx, q.target(), query, args, q.rowHint())
 }
 
 // Seq runs the delete and streams the removed rows as T, so a big delete need
@@ -281,7 +285,7 @@ func (q *DeleteQuery[T]) Seq(ctx context.Context) iter.Seq2[T, error] {
 	c := *q
 	c.expandReturning()
 	query, args, err := c.Build()
-	return q.seq[T](ctx, query, args, err)
+	return q.seq[T](ctx, q.target(), query, args, err)
 }
 
 // OneAs runs the delete and scans the single returned row into U.

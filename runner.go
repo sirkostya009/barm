@@ -32,56 +32,64 @@ func (r *runner) Dialect() Dialect { return r.h.Dialect() }
 // ErrNoConn is returned by a DB that renders SQL but has nothing to run it on.
 var ErrNoConn = errors.New("barm: this DB has no connection — it renders SQL only")
 
-// executor is what the query runs on, or ErrNoConn for a DB from NewBuilder.
-func (r *runner) executor() (Executor, error) {
+// reach is what the query runs on, its Prepare name bound to it, or why it
+// cannot reach the database: ErrNoConn for a DB from NewBuilder, or a name
+// already bound to other SQL.
+func (r *runner) reach(query string) (Executor, error) {
 	e := r.h.executor()
 	if e == nil {
 		return nil, ErrNoConn
+	}
+	if r.name != "" {
+		err := r.h.sess().names.bind(r.name, query)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return e, nil
 }
 
 // query runs a query and returns its rows, for the caller to read and close.
-// The hooks finish once it has run, before the rows are read.
-func (r *runner) query(ctx context.Context, query string, args []any) (Rows, error) {
-	ctx, ev := r.start(ctx, query, args)
-	rows, err := r.rows(ctx, query, args)
-	r.finish(ctx, ev, nil, err)
-	return rows, err
+// With a hook registered they come wrapped, so the hooks finish once they are
+// closed, counting what was read.
+func (r *runner) query(ctx context.Context, t target, query string, args []any) (Rows, error) {
+	ctx, ev, e, err := r.start(ctx, t, query, args)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.rows(ctx, e, query, args)
+	if ev == nil {
+		return rows, err
+	}
+	if err != nil {
+		r.finish(ctx, ev, nil, 0, err)
+		return nil, err
+	}
+	ev.responded()
+	return &hookedRows{Rows: rows, ctx: ctx, hooks: r.h.sess().hooks, ev: ev}, nil
 }
 
-// rows runs a query, prepared when it was named, leaving the hooks to the
-// caller.
-func (r *runner) rows(ctx context.Context, query string, args []any) (Rows, error) {
-	e, err := r.executor()
-	if err != nil {
-		return nil, err
-	}
+// rows runs a query on what start reached, prepared when it was named, leaving
+// the hooks to the caller.
+func (r *runner) rows(ctx context.Context, e Executor, query string, args []any) (Rows, error) {
 	if r.name == "" {
 		return e.Query(ctx, query, args)
-	}
-	err = r.h.sess().names.bind(r.name, query)
-	if err != nil {
-		return nil, err
 	}
 	return e.QueryPrepared(ctx, r.name, query, args)
 }
 
-func (r *runner) exec(ctx context.Context, query string, args []any) (sql.Result, error) {
-	ctx, ev := r.start(ctx, query, args)
-	var res sql.Result
-	e, err := r.executor()
-	switch {
-	case err != nil:
-	case r.name == "":
-		res, err = e.Exec(ctx, query, args)
-	default:
-		err = r.h.sess().names.bind(r.name, query)
-		if err == nil {
-			res, err = e.ExecPrepared(ctx, r.name, query, args)
-		}
+func (r *runner) exec(ctx context.Context, t target, query string, args []any) (sql.Result, error) {
+	ctx, ev, e, err := r.start(ctx, t, query, args)
+	if err != nil {
+		return nil, err
 	}
-	r.finish(ctx, ev, res, err)
+	var res sql.Result
+	if r.name == "" {
+		res, err = e.Exec(ctx, query, args)
+	} else {
+		res, err = e.ExecPrepared(ctx, r.name, query, args)
+	}
+	r.finish(ctx, ev, res, 0, err)
 	return res, err
 }
 
@@ -93,30 +101,41 @@ func (r *runner) exec(ctx context.Context, query string, args []any) (sql.Result
 // one takes the first row. It reads the columns' names off the result, as
 // slice does, so any projection maps, and the hooks see the scan's error,
 // ErrNoRows included.
-func (r *runner) one[U any](ctx context.Context, query string, args []any) (U, error) {
+func (r *runner) one[U any](ctx context.Context, t target, query string, args []any) (U, error) {
 	var v U
-	ctx, ev := r.start(ctx, query, args)
-	rows, err := r.rows(ctx, query, args)
-	if err == nil {
-		err = scanRow(rows, &v)
-		cerr := rows.Close()
-		if err == nil {
-			err = cerr
-		}
+	ctx, ev, e, err := r.start(ctx, t, query, args)
+	if err != nil {
+		return v, err
 	}
-	r.finish(ctx, ev, nil, err)
+	rows, err := r.rows(ctx, e, query, args)
+	ev.responded()
+	if err == nil {
+		err = closeRows(rows, scanRow(rows, &v))
+	}
+	n := int64(0)
+	if err == nil {
+		n = 1
+	}
+	r.finish(ctx, ev, nil, n, err)
 	return v, err
 }
 
 // slice collects every row. The hint is how many to expect — a LIMIT for a
 // select, the row count for an insert, one for a write keyed by primary key.
-func (r *runner) slice[U any](ctx context.Context, query string, args []any, hint int64) ([]U, error) {
-	rows, err := r.query(ctx, query, args)
+func (r *runner) slice[U any](ctx context.Context, t target, query string, args []any, hint int64) ([]U, error) {
+	ctx, ev, e, err := r.start(ctx, t, query, args)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanSlice[U](rows, hint)
+	rows, err := r.rows(ctx, e, query, args)
+	ev.responded()
+	var out []U
+	if err == nil {
+		out, err = scanSlice[U](rows, hint)
+		err = closeRows(rows, err)
+	}
+	r.finish(ctx, ev, nil, int64(len(out)), err)
+	return out, err
 }
 
 // seq streams the rows. The query has already run by the time the first row
@@ -126,20 +145,33 @@ func (r *runner) slice[U any](ctx context.Context, query string, args []any, hin
 //
 // The rows hold their connection until the loop ends, so a loop that queries
 // the transaction it is reading from waits on itself on drivers that run one
-// statement at a time per connection, pgx among them.
-func (r *runner) seq[U any](ctx context.Context, query string, args []any, err error) iter.Seq2[U, error] {
+// statement at a time per connection, pgx among them. The hooks finish then
+// too, the loop's own work included.
+func (r *runner) seq[U any](ctx context.Context, t target, query string, args []any, err error) iter.Seq2[U, error] {
+	if err != nil { // the build failed; the sequence is how the caller hears it
+		return func(yield func(U, error) bool) {
+			var zero U
+			yield(zero, err)
+		}
+	}
+	// The sequence holding all of the target would push it past its size class.
+	tp := keepTarget(r.h.sess().hooks, t)
 	return func(yield func(U, error) bool) {
 		var zero U
-		if err != nil { // the build failed; the sequence is how the caller hears it
-			yield(zero, err)
-			return
-		}
-		rows, err := r.query(ctx, query, args)
+		ctx, ev, e, err := r.start(ctx, tp.get(), query, args)
 		if err != nil {
 			yield(zero, err)
 			return
 		}
-		defer rows.Close()
+		rows, err := r.rows(ctx, e, query, args)
+		if err != nil {
+			r.finish(ctx, ev, nil, 0, err)
+			yield(zero, err)
+			return
+		}
+		ev.responded()
+		var n int64
+		defer func() { r.finish(ctx, ev, nil, n, closeRows(rows, err)) }()
 
 		// The loop is written out rather than delegated to a scan.go helper the
 		// way slice delegates to scanSlice. Handing yield across another closure
@@ -151,7 +183,9 @@ func (r *runner) seq[U any](ctx context.Context, query string, args []any, err e
 			return
 		}
 		for rows.Next() {
-			v, err := sc.scan(rows)
+			var v U
+			v, err = sc.scan(rows)
+			n++
 			if !yield(v, err) || err != nil {
 				return
 			}

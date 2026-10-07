@@ -86,27 +86,65 @@ type Batch struct {
 	inTx bool
 	// held says the batch runs on a connection it keeps past Run, which is what
 	// Rollback needs to reach.
-	held  bool
-	names *names
-	qs    []BatchQuery
-	items []item
+	held bool
+	// fallback says a driver that cannot batch has its queries sent one at a
+	// time instead, which reports them, so the batch must not.
+	fallback bool
+	names    *names
+	qs       []BatchQuery
+	items    []item
 	// rels renders the relations of the queries that asked for them, which
 	// hang off rows the batch hands over only once it is done with its
 	// connection. They load then, a depth at a time across every query.
 	rels  []relLoad
-	hooks []QueryHook
+	hooks *batchHooks
 	err   error
 }
 
+// batchHooks are a batch's hooks, with the target of each query queued. They sit
+// behind a pointer that is nil without a hook, so a batch pays a word for them
+// and its queries nothing.
+type batchHooks struct {
+	hooks []QueryHook
+	ts    []target
+}
+
+func newBatchHooks(hooks []QueryHook) *batchHooks {
+	if len(hooks) == 0 {
+		return nil
+	}
+	return &batchHooks{hooks: hooks}
+}
+
+func (h *batchHooks) list() []QueryHook {
+	if h == nil {
+		return nil
+	}
+	return h.hooks
+}
+
+func (h *batchHooks) start(ctx context.Context, i int, q BatchQuery) (context.Context, *QueryEvent) {
+	if h == nil {
+		return ctx, nil
+	}
+	return startQuery(ctx, h.hooks, h.ts[i], q.Name, q.Query, q.Args)
+}
+
+func (h *batchHooks) unsent(ctx context.Context, i int, q BatchQuery, err error) {
+	if h != nil {
+		unsentQuery(ctx, h.hooks, h.ts[i], q.Name, q.Query, q.Args, err)
+	}
+}
+
 type item struct {
-	// read returns the exec result when there is one, for the hooks; a query
-	// reading rows has none.
-	read func(BatchReader) (sql.Result, error)
+	// read returns the exec result when there is one, for the hooks, and how
+	// many rows it read when there is none.
+	read func(BatchReader) (sql.Result, int64, error)
 	fail func(error)
 }
 
 func newBatch(e Executor, s *session, inTx, held bool) *Batch {
-	out := &Batch{e: e, hooks: s.hooks, names: s.names, inTx: inTx, held: held}
+	out := &Batch{e: e, hooks: newBatchHooks(s.hooks), names: s.names, inTx: inTx, held: held}
 	if e == nil {
 		out.err = ErrNoConn
 	}
@@ -121,7 +159,7 @@ func (b *Batch) Err() error { return b.err }
 
 // queue renders a query and records how to read its result. A named one is
 // bound to its SQL as any named query is.
-func (b *Batch) queue(name, query string, args []any, err error, it item) {
+func (b *Batch) queue(t target, name, query string, args []any, err error, it item) {
 	if err == nil && b.err != nil {
 		err = b.err // a batch with nothing to run on fails every query
 	}
@@ -136,6 +174,9 @@ func (b *Batch) queue(name, query string, args []any, err error, it item) {
 		return
 	}
 	b.qs = append(b.qs, BatchQuery{Query: query, Args: args, Name: name})
+	if b.hooks != nil {
+		b.hooks.ts = append(b.hooks.ts, t)
+	}
 	b.items = append(b.items, it)
 }
 
@@ -152,19 +193,19 @@ func (b *Batch) Slice[U any](q *SelectQuery[U]) *BatchResult[[]U] {
 	r := newResult[[]U]()
 	query, args, err := q.Build()
 
-	b.queue(q.name, query, args, err, item{
+	b.queue(q.target(), q.name, query, args, err, item{
 		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, error) {
+		read: func(br BatchReader) (sql.Result, int64, error) {
 			rows, err := br.Rows()
 			if err != nil {
 				r.err = err
-				return nil, err
+				return nil, 0, err
 			}
 			defer rows.Close()
 
 			v, err := scanSlice[U](rows, q.limit)
 			r.set(v, err)
-			return nil, err
+			return nil, int64(len(v)), err
 		},
 	})
 	if len(q.rels) > 0 {
@@ -185,7 +226,7 @@ func (b *Batch) One[U any](q *SelectQuery[U]) *BatchResult[U] {
 	c := *q
 	c.limit = 1
 	query, args, err := c.Build()
-	r := queueRow[U](b, q.name, query, args, err)
+	r := queueRow[U](b, c.target(), q.name, query, args, err)
 	if len(q.rels) > 0 {
 		rows := make([]U, 1)
 		b.rels = append(b.rels, relLoad{
@@ -202,32 +243,35 @@ func (b *Batch) One[U any](q *SelectQuery[U]) *BatchResult[U] {
 // Count queues the query as a COUNT(*).
 func (b *Batch) Count[T any](q *SelectQuery[T]) *BatchResult[int64] {
 	query, args, err := q.CountQuery()
-	return queueRow[int64](b, "", query, args, err)
+	return queueRow[int64](b, q.target(), "", query, args, err)
 }
 
 // Exists queues the query as SELECT EXISTS (...).
 func (b *Batch) Exists[T any](q *SelectQuery[T]) *BatchResult[bool] {
 	query, args, err := q.ExistsQuery()
-	return queueRow[bool](b, "", query, args, err)
+	return queueRow[bool](b, q.target(), "", query, args, err)
 }
 
 // queueRow queues a query read as a single row, its first.
-func queueRow[U any](b *Batch, name, query string, args []any, err error) *BatchResult[U] {
+func queueRow[U any](b *Batch, t target, name, query string, args []any, err error) *BatchResult[U] {
 	r := newResult[U]()
-	b.queue(name, query, args, err, item{
+	b.queue(t, name, query, args, err, item{
 		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, error) {
+		read: func(br BatchReader) (sql.Result, int64, error) {
 			rows, err := br.Rows()
 			if err != nil {
 				r.err = err
-				return nil, err
+				return nil, 0, err
 			}
 			defer rows.Close()
 
 			var v U
 			err = scanRow(rows, &v)
 			r.set(v, err)
-			return nil, err
+			if err != nil {
+				return nil, 0, err
+			}
+			return nil, 1, nil
 		},
 	})
 	return r
@@ -259,18 +303,18 @@ const BatchSavepoint = "barm_batch"
 // It goes out with the rest, so the transaction costs no round trip of its own.
 func (b *Batch) Begin() *BatchResult[ExecResult] {
 	if b.inTx {
-		return b.queueExec("", "SAVEPOINT "+BatchSavepoint, nil, nil)
+		return b.queueExec(opSavepoint, "", "SAVEPOINT "+BatchSavepoint, nil, nil)
 	}
-	return b.queueExec("", "BEGIN", nil, nil)
+	return b.queueExec(opBegin, "", "BEGIN", nil, nil)
 }
 
 // Commit queues the statement that ends what Begin opened: RELEASE SAVEPOINT
 // inside a transaction, COMMIT otherwise.
 func (b *Batch) Commit() *BatchResult[ExecResult] {
 	if b.inTx {
-		return b.queueExec("", "RELEASE SAVEPOINT "+BatchSavepoint, nil, nil)
+		return b.queueExec(opReleaseSavepoint, "", "RELEASE SAVEPOINT "+BatchSavepoint, nil, nil)
 	}
-	return b.queueExec("", "COMMIT", nil, nil)
+	return b.queueExec(opCommit, "", "COMMIT", nil, nil)
 }
 
 // Rollback undoes what Begin opened, and runs immediately rather than queueing:
@@ -300,11 +344,14 @@ func (b *Batch) Rollback(ctx context.Context) error {
 	if !b.held {
 		return errors.New("barm: rolling back a batch needs the connection it ran on, and the pool does not hold one — batch on a transaction or a held connection")
 	}
-	stmt := "ROLLBACK"
+	stmt, op := "ROLLBACK", opRollback
 	if b.inTx {
-		stmt = "ROLLBACK TO SAVEPOINT " + BatchSavepoint
+		stmt, op = "ROLLBACK TO SAVEPOINT "+BatchSavepoint, opRollbackSavepoint
 	}
-	_, err := b.e.Exec(context.WithoutCancel(ctx), stmt, nil)
+	hooks := b.hooks.list()
+	ctx, ev := startQuery(context.WithoutCancel(ctx), hooks, op, "", stmt, nil)
+	res, err := b.e.Exec(ctx, stmt, nil)
+	finishQuery(ctx, hooks, ev, res, 0, err)
 	return err
 }
 
@@ -315,7 +362,7 @@ func (b *Batch) Exec(q Query) *BatchResult[ExecResult] {
 		return b.queueReturning(q, w)
 	}
 	query, args, err := q.Build()
-	return b.queueExec(stmtName(q), query, args, err)
+	return b.queueExec(targetOf(q), stmtName(q), query, args, err)
 }
 
 // stmtName is the name q was given to Prepare, if any.
@@ -337,18 +384,18 @@ type returningWrite interface {
 func (b *Batch) queueReturning(q Query, w returningWrite) *BatchResult[ExecResult] {
 	r := newResult[ExecResult]()
 	query, args, err := q.Build()
-	b.queue(stmtName(q), query, args, err, item{
+	b.queue(targetOf(q), stmtName(q), query, args, err, item{
 		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, error) {
+		read: func(br BatchReader) (sql.Result, int64, error) {
 			rows, err := br.Rows()
 			if err != nil {
 				r.err = err
-				return nil, err
+				return nil, 0, err
 			}
 			defer rows.Close()
 			n, err := w.scanReturning(rows)
 			r.set(ExecResult{RowsAffected: n}, err)
-			return rowsAffected(n), err
+			return rowsAffected(n), n, err
 		},
 	})
 	return r
@@ -357,14 +404,14 @@ func (b *Batch) queueReturning(q Query, w returningWrite) *BatchResult[ExecResul
 // queueExec queues a statement whose result is a row count. A write and a
 // transaction-control statement report the same shape, so they read the same
 // way; only where the SQL comes from differs.
-func (b *Batch) queueExec(name, query string, args []any, err error) *BatchResult[ExecResult] {
+func (b *Batch) queueExec(t target, name, query string, args []any, err error) *BatchResult[ExecResult] {
 	r := newResult[ExecResult]()
-	b.queue(name, query, args, err, item{
+	b.queue(t, name, query, args, err, item{
 		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, error) {
+		read: func(br BatchReader) (sql.Result, int64, error) {
 			res, err := br.Exec()
 			r.set(res, err)
-			return rowsAffected(res.RowsAffected), err
+			return rowsAffected(res.RowsAffected), 0, err
 		},
 	})
 	return r
@@ -378,47 +425,43 @@ func (b *Batch) queueExec(name, query string, args []any, err error) *BatchResul
 func (b *Batch) Run(ctx context.Context) error {
 	items, qs, rels, err := b.items, b.qs, b.rels, b.err
 	b.items, b.qs, b.rels, b.err = nil, nil, nil, nil // a batch runs once
+	hooks := b.hooks
+	b.hooks = newBatchHooks(hooks.list())
 	if err != nil {
+		for i, q := range qs {
+			hooks.unsent(ctx, i, q, ErrNotRun)
+		}
 		return err
 	}
 	if len(items) == 0 {
 		return nil
 	}
 
-	// Every query in a batch goes out at the same moment, so they all start
-	// together, once the driver has sent them; each one finishes when its own
-	// result is read. A query that never ran finishes too, with the error that
-	// stopped it. A driver that cannot batch sent nothing, so nothing starts.
-	var ctxs []context.Context
-	var evs []*QueryEvent
-	start := func() {
-		if len(b.hooks) == 0 || evs != nil {
-			return
-		}
-		ctxs, evs = make([]context.Context, len(items)), make([]*QueryEvent, len(items))
-		for i, q := range qs {
-			ctxs[i], evs[i] = startQuery(ctx, b.hooks, q.Name, q.Query, q.Args) //nolint:fatcontext // each call derives from the same base ctx, not from the previous iteration's
-		}
-	}
-	done := func(i int, res sql.Result, err error) {
-		if evs == nil || evs[i] == nil {
-			return
-		}
-		finishQuery(ctxs[i], b.hooks, evs[i], res, err)
-		evs[i] = nil // an event finishes once, whichever path reaches it first
-	}
-
+	// A query's event starts when barm turns to its result, the first one as the
+	// batch goes out. On a driver that pipelines that is how long the query kept
+	// the batch waiting, and on one sending a query at a time it is that query's
+	// round trip. A query that never reached the database reports no times.
 	var runErr error
+	reached := false
 	sendErr := b.e.SendBatch(ctx, qs, func(br BatchReader) error {
-		start()
+		reached = true
+		var rr *respondedReader
+		if hooks != nil {
+			rr = &respondedReader{BatchReader: br}
+			br = rr
+		}
 		for i, it := range items {
 			if runErr != nil {
 				it.fail(ErrNotRun)
-				done(i, nil, ErrNotRun)
+				hooks.unsent(ctx, i, qs[i], ErrNotRun)
 				continue
 			}
-			res, err := it.read(br)
-			done(i, res, err)
+			c, ev := hooks.start(ctx, i, qs[i])
+			if rr != nil {
+				rr.ev = ev
+			}
+			res, n, err := it.read(br)
+			finishQuery(c, hooks.list(), ev, res, n, err)
 			if err != nil {
 				runErr = fmt.Errorf("barm: batch query %d: %w", i, err)
 			}
@@ -429,12 +472,13 @@ func (b *Batch) Run(ctx context.Context) error {
 		return runErr
 	}
 	if sendErr != nil {
-		if !errors.Is(sendErr, ErrNoBatcher) {
-			start()
-		}
-		for i, it := range items {
+		for _, it := range items {
 			it.fail(sendErr)
-			done(i, nil, sendErr) // the batch never reached them
+		}
+		if !reached && (!b.fallback || !errors.Is(sendErr, ErrNoBatcher)) {
+			for i, q := range qs {
+				hooks.unsent(ctx, i, q, sendErr)
+			}
 		}
 		return sendErr
 	}
@@ -459,7 +503,7 @@ func (b *Batch) loadRelations(ctx context.Context, rels []relLoad) error {
 	}
 	if err == nil {
 		err = loadLevels(ctx, level, func(ctx context.Context, level []*pending) error {
-			return batchRelations(ctx, &Batch{e: b.e, hooks: b.hooks, names: b.names, inTx: b.inTx, held: b.held}, level)
+			return batchRelations(ctx, &Batch{e: b.e, hooks: newBatchHooks(b.hooks.list()), names: b.names, inTx: b.inTx, held: b.held}, level)
 		})
 	}
 	for _, l := range rels {

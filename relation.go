@@ -20,7 +20,7 @@ import (
 // reader turns one child result into its rows, grouped by the key they join on.
 // It also hands back what renders the rows' own relations, if they have any,
 // for the next depth.
-type reader func(context.Context, Rows) (setter, func() ([]*pending, error), error)
+type reader func(context.Context, Rows) (setter, func() ([]*pending, error), int64, error)
 
 // setter stores the rows for key into field, a pointer to the parent's field.
 type setter func(field, key any)
@@ -36,7 +36,7 @@ type relation struct {
 	field      string // the Go field name on the result type
 	childType  reflect.Type
 	parentCols []string
-	prepare    func(r runner, schema string, keys relKeys) (string, []any, reader, error)
+	prepare    func(r runner, schema string, keys relKeys, w *pending) error
 }
 
 // maxKeyCols bounds a composite key, which groups as an array of its parts.
@@ -119,7 +119,7 @@ func (q *SelectQuery[T]) Relation[U any](field string, fns ...func(*SelectQuery[
 		field:      field,
 		childType:  reflect.TypeFor[U](),
 		parentCols: rel.parentCols,
-		prepare: func(r runner, schema string, keys relKeys) (string, []any, reader, error) {
+		prepare: func(r runner, schema string, keys relKeys, w *pending) error {
 			r.name = "" // the key list changes the SQL, so it is not the parent's statement
 			c := newSelect[U](r)
 			c.model = child // table and relations from the model, columns from U
@@ -129,14 +129,14 @@ func (q *SelectQuery[T]) Relation[U any](field string, fns ...func(*SelectQuery[
 					c = fn(c)
 				}
 			}
-			return prepareRelation(c, childCols, keys)
+			return prepareRelation(c, childCols, keys, w)
 		},
 	})
 	return q
 }
 
-// prepareRelation renders the child query and hands back the reader for it.
-func prepareRelation[U any](c *SelectQuery[U], childCols []string, keys relKeys) (string, []any, reader, error) {
+// prepareRelation renders the child query into w, with the reader for it.
+func prepareRelation[U any](c *SelectQuery[U], childCols []string, keys relKeys, w *pending) error {
 	// The key has to come back with every row to group by, whether or not the
 	// projection asked for it, so it goes in front of whatever was being
 	// selected — after the caller's fns, which therefore cannot displace it.
@@ -173,15 +173,16 @@ func prepareRelation[U any](c *SelectQuery[U], childCols []string, keys relKeys)
 
 	query, args, err := c.build()
 	if err != nil {
-		return "", nil, nil, err
+		return err
 	}
 	// Only what grouping needs goes in the closure, so the keys themselves stay
 	// off the heap.
 	types, nkeys := keys.types, keys.len()
-	read := func(_ context.Context, rows Rows) (setter, func() ([]*pending, error), error) {
+	w.query, w.args, w.t = query, args, keepTarget(c.h.sess().hooks, c.target())
+	w.read = func(_ context.Context, rows Rows) (setter, func() ([]*pending, error), int64, error) {
 		return groupRelation(c, rows, n, nkeys, types, inRow)
 	}
-	return query, args, read, nil
+	return nil
 }
 
 // keyPredicate matches the child rows against the keys. One array parameter
@@ -251,14 +252,14 @@ func typedSlice(t reflect.Type, values []any) any {
 // slice of its own. Rows of their own load first, before anyone holds a window.
 func groupRelation[U any](
 	c *SelectQuery[U], rows Rows, n, nkeys int, types [maxKeyCols]reflect.Type, inRow [maxKeyCols]bool,
-) (setter, func() ([]*pending, error), error) {
+) (setter, func() ([]*pending, error), int64, error) {
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	p, err := planFor(reflect.TypeFor[U](), cols)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	// The key columns come first. One the row selects too scans into it and is
@@ -281,7 +282,7 @@ func groupRelation[U any](
 			continue
 		}
 		if p.paths[i] == nil {
-			return nil, nil, fmt.Errorf("barm: %s maps no field to %q", reflect.TypeFor[U](), cols[i])
+			return nil, nil, 0, fmt.Errorf("barm: %s maps no field to %q", reflect.TypeFor[U](), cols[i])
 		}
 		ft := reflect.TypeFor[U]().FieldByIndex(p.paths[i]).Type
 		if ft.Kind() == reflect.Pointer {
@@ -289,7 +290,7 @@ func groupRelation[U any](
 		}
 		if ft != t {
 			if !ft.ConvertibleTo(t) {
-				return nil, nil, fmt.Errorf("barm: key %q is %s on the row but %s on the parent", cols[i], ft, t)
+				return nil, nil, 0, fmt.Errorf("barm: key %q is %s on the row but %s on the parent", cols[i], ft, t)
 			}
 			kr.conv[i] = true
 		}
@@ -309,7 +310,7 @@ func groupRelation[U any](
 		}
 		err = rows.Scan(dest...)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 		var k any
 		if n == 1 {
@@ -330,7 +331,7 @@ func groupRelation[U any](
 	}
 	err = rows.Err()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	// start[g]..start[g+1] is group g's run.
@@ -395,7 +396,7 @@ func groupRelation[U any](
 			*f = &sorted[lo]
 		}
 	}
-	return set, next, nil
+	return set, next, int64(len(flat)), nil
 }
 
 // keyReader reads a child row's key, a column at a time.
@@ -424,7 +425,8 @@ func (kr *keyReader) part(rv reflect.Value, i int) any {
 type pending struct {
 	query string
 	args  []any
-	read  reader // nil when there were no keys to fetch by
+	t     *target // for the hooks, nil without one
+	read  reader  // nil when there were no keys to fetch by
 	set   setter
 	next  func() ([]*pending, error) // renders the rows' own relations, if they have any
 	apply func()                     // hands the rows to the parents
@@ -563,7 +565,7 @@ func (q *SelectQuery[T]) prepareRelations(rows []T) ([]*pending, error) {
 		if keys.len() == 0 {
 			continue // nothing to fetch by, and `IN ()` is not SQL everywhere
 		}
-		w.query, w.args, w.read, err = rel.prepare(q.runner, q.schema, keys)
+		err = rel.prepare(q.runner, q.schema, keys, w)
 		if err != nil {
 			return nil, fmt.Errorf("barm: relation %q: %w", rel.field, err)
 		}
@@ -639,7 +641,9 @@ func (r *runner) sendRelations(ctx context.Context, level []*pending) error {
 	if e := r.h.executor(); n > 1 && e != nil {
 		// A driver that cannot batch says so before sending anything, so falling
 		// back cannot run a query twice.
-		err := batchRelations(ctx, newBatch(e, r.h.sess(), false, false), level)
+		b := newBatch(e, r.h.sess(), false, false)
+		b.fallback = true
+		err := batchRelations(ctx, b, level)
 		if !errors.Is(err, ErrNoBatcher) {
 			return err
 		}
@@ -650,12 +654,18 @@ func (r *runner) sendRelations(ctx context.Context, level []*pending) error {
 		if w.read == nil {
 			continue
 		}
-		rows, err := c.query(ctx, w.query, w.args)
+		ctx, ev, e, err := c.start(ctx, w.t.get(), w.query, w.args)
 		if err != nil {
 			return err
 		}
-		w.set, w.next, err = w.read(ctx, rows)
-		rows.Close()
+		rows, err := c.rows(ctx, e, w.query, w.args)
+		ev.responded()
+		var n int64
+		if err == nil {
+			w.set, w.next, n, err = w.read(ctx, rows)
+			err = closeRows(rows, err)
+		}
+		c.finish(ctx, ev, nil, n, err)
 		if err != nil {
 			return err
 		}
@@ -669,16 +679,17 @@ func batchRelations(ctx context.Context, batch *Batch, level []*pending) error {
 		if w.read == nil {
 			continue
 		}
-		batch.queue("", w.query, w.args, nil, item{
+		batch.queue(w.t.get(), "", w.query, w.args, nil, item{
 			fail: func(error) {},
-			read: func(br BatchReader) (sql.Result, error) {
+			read: func(br BatchReader) (sql.Result, int64, error) {
 				rows, err := br.Rows()
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 				defer rows.Close()
-				w.set, w.next, err = w.read(ctx, rows)
-				return nil, err
+				var n int64
+				w.set, w.next, n, err = w.read(ctx, rows)
+				return nil, n, err
 			},
 		})
 	}

@@ -7,6 +7,7 @@
 package barm
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"slices"
@@ -15,18 +16,77 @@ import (
 
 // QueryEvent describes one database call.
 type QueryEvent struct {
-	// Op is the leading keyword of the query: SELECT, INSERT, UPDATE, DELETE.
-	Op    string
-	Query string
-	Args  []any
+	// Op is what the statement does: SELECT, INSERT, UPDATE or DELETE for a
+	// builder, whatever its WITH clause holds, and the leading keyword of raw
+	// SQL.
+	Op string
+	// Table is the table a builder reads or writes, as its model or Table names
+	// it, and Schema what Schema qualified it with. Raw SQL has neither, and a
+	// select from an expression rather than a table name has no Table.
+	Table  string
+	Schema string
+	Query  string
+	Args   []any
 	// Prepared is the name given to Prepare, if any.
-	Prepared  string
+	Prepared string
+	// StartedAt is when the call went to the database. It is zero for a call
+	// that never reached it, which reports no FirstResponse or Duration either.
 	StartedAt time.Time
 
 	// Set before AfterQuery runs.
-	Err      error
-	Result   sql.Result // exec only
+	Err    error
+	Result sql.Result // exec only
+	// Rows counts the rows read from the result. An exec reads none, and
+	// reports what it changed through Result.
+	Rows int64
+	// FirstResponse is how long the database took to start answering.
+	FirstResponse time.Duration
+	// Duration is how long until the rows were read and closed: the end of a Seq
+	// loop, or the Close of rows handed to the caller, the caller's own work
+	// included.
 	Duration time.Duration
+}
+
+// target is what a builder knows about its statement and raw SQL does not.
+type target struct {
+	op, table, schema string
+}
+
+// The ops of the statements barm sends to begin and end transactions, named in
+// full where a leading keyword alone would pass a rewind for a rollback.
+var (
+	opBegin             = target{op: "BEGIN"}
+	opCommit            = target{op: "COMMIT"}
+	opRollback          = target{op: "ROLLBACK"}
+	opSavepoint         = target{op: "SAVEPOINT"}
+	opReleaseSavepoint  = target{op: "RELEASE SAVEPOINT"}
+	opRollbackSavepoint = target{op: "ROLLBACK TO SAVEPOINT"}
+)
+
+// keepTarget moves t to the heap for something that holds on to it, and only
+// when a hook will read it: without one, holding it costs a nil pointer.
+func keepTarget(hooks []QueryHook, t target) *target {
+	if len(hooks) == 0 {
+		return nil
+	}
+	p := new(target)
+	*p = t
+	return p
+}
+
+func (t *target) get() target {
+	if t == nil {
+		return target{}
+	}
+	return *t
+}
+
+// targetOf is q's target, empty for raw SQL.
+func targetOf(q Query) target {
+	if t, ok := q.(interface{ target() target }); ok {
+		return t.target()
+	}
+	return target{}
 }
 
 // QueryHook observes queries. Both fields are optional: a hook that only logs
@@ -193,20 +253,47 @@ func (tx *Tx) afterRollback(ctx context.Context, ev *TxEvent, err error) {
 	}
 }
 
-// startQuery fires BeforeQuery. It returns a nil event when no hook is
-// registered, which is the fast path: no timestamp, no allocation. It takes the
-// hooks rather than a runner because a batch has queries but no runner.
-func startQuery(ctx context.Context, hooks []QueryHook, name, query string, args []any) (context.Context, *QueryEvent) {
+// startQuery fires BeforeQuery for a call about to reach the database. It
+// returns a nil event when no hook is registered, which is the fast path: no
+// timestamp, no allocation. It takes the hooks rather than a runner because a
+// batch has queries but no runner.
+func startQuery(ctx context.Context, hooks []QueryHook, t target, name, query string, args []any) (context.Context, *QueryEvent) {
 	if len(hooks) == 0 {
 		return ctx, nil
 	}
-	ev := &QueryEvent{
-		Op:        operation(query),
-		Query:     query,
-		Args:      slices.Clone(args), // a hook that masks a value in place must not change what is bound
-		Prepared:  name,
-		StartedAt: time.Now(),
+	ev := newEvent(t, name, query, args)
+	ev.StartedAt = time.Now()
+	return beforeQuery(ctx, hooks, ev), ev
+}
+
+// unsentQuery fires both hooks for a call that never reached the database. It
+// has no round trip to time, so its times stay zero.
+func unsentQuery(ctx context.Context, hooks []QueryHook, t target, name, query string, args []any, err error) {
+	if len(hooks) == 0 {
+		return
 	}
+	ev := newEvent(t, name, query, args)
+	finishQuery(beforeQuery(ctx, hooks, ev), hooks, ev, nil, 0, err)
+}
+
+func newEvent(t target, name, query string, args []any) *QueryEvent {
+	ev := &QueryEvent{
+		Op:       t.op,
+		Schema:   t.schema,
+		Query:    query,
+		Args:     slices.Clone(args), // a hook that masks a value in place must not change what is bound
+		Prepared: name,
+	}
+	if ev.Op == "" {
+		ev.Op = operation(query)
+	}
+	if isName(t.table) {
+		ev.Table = t.table
+	}
+	return ev
+}
+
+func beforeQuery(ctx context.Context, hooks []QueryHook, ev *QueryEvent) context.Context {
 	for _, h := range hooks {
 		if h.BeforeQuery == nil {
 			continue
@@ -215,15 +302,21 @@ func startQuery(ctx context.Context, hooks []QueryHook, name, query string, args
 			ctx = c //nolint:fatcontext // hooks thread ctx through each other by design; the loop bound is len(hooks)
 		}
 	}
-	return ctx, ev
+	return ctx
 }
 
 // finishQuery fires AfterQuery in reverse order, so hooks unwind like defers.
-func finishQuery(ctx context.Context, hooks []QueryHook, ev *QueryEvent, res sql.Result, err error) {
+func finishQuery(ctx context.Context, hooks []QueryHook, ev *QueryEvent, res sql.Result, rows int64, err error) {
 	if ev == nil {
 		return
 	}
-	ev.Err, ev.Result, ev.Duration = err, res, time.Since(ev.StartedAt)
+	ev.Err, ev.Result, ev.Rows = err, res, rows
+	if !ev.StartedAt.IsZero() {
+		ev.Duration = time.Since(ev.StartedAt)
+		if ev.FirstResponse == 0 {
+			ev.FirstResponse = ev.Duration
+		}
+	}
 	for _, v := range slices.Backward(hooks) {
 		if v.AfterQuery != nil {
 			v.AfterQuery(ctx, ev)
@@ -231,12 +324,106 @@ func finishQuery(ctx context.Context, hooks []QueryHook, ev *QueryEvent, res sql
 	}
 }
 
-func (r *runner) start(ctx context.Context, query string, args []any) (context.Context, *QueryEvent) {
-	return startQuery(ctx, r.h.sess().hooks, r.name, query, args)
+// start readies a call and fires BeforeQuery. A call that cannot reach the
+// database comes back as its error, its hooks already finished.
+func (r *runner) start(ctx context.Context, t target, query string, args []any) (context.Context, *QueryEvent, Executor, error) {
+	e, err := r.reach(query)
+	if err != nil {
+		unsentQuery(ctx, r.h.sess().hooks, t, r.name, query, args, err)
+		return ctx, nil, nil, err
+	}
+	ctx, ev := startQuery(ctx, r.h.sess().hooks, t, r.name, query, args)
+	return ctx, ev, e, nil
 }
 
-func (r *runner) finish(ctx context.Context, ev *QueryEvent, res sql.Result, err error) {
-	finishQuery(ctx, r.h.sess().hooks, ev, res, err)
+func (r *runner) finish(ctx context.Context, ev *QueryEvent, res sql.Result, rows int64, err error) {
+	finishQuery(ctx, r.h.sess().hooks, ev, res, rows, err)
+}
+
+// responded marks the database's first response to a query whose rows are
+// read before the hooks finish.
+func (ev *QueryEvent) responded() {
+	if ev != nil {
+		ev.FirstResponse = time.Since(ev.StartedAt)
+	}
+}
+
+// hookedRows are rows handed to the caller while a hook watches: the hooks
+// finish when they are closed, with the rows read through them counted.
+type hookedRows struct {
+	Rows
+	ctx   context.Context
+	hooks []QueryHook
+	ev    *QueryEvent
+	n     int64
+	err   error // the first Scan failure
+}
+
+func (r *hookedRows) Next() bool {
+	if !r.Rows.Next() {
+		return false
+	}
+	r.n++
+	return true
+}
+
+func (r *hookedRows) Scan(dest ...any) error {
+	err := r.Rows.Scan(dest...)
+	if r.err == nil {
+		r.err = err
+	}
+	return err
+}
+
+func (r *hookedRows) Close() error {
+	err := r.Err()
+	cerr := r.Rows.Close()
+	if r.ev != nil {
+		finishQuery(r.ctx, r.hooks, r.ev, nil, r.n, cmp.Or(r.err, err, cerr))
+		r.ev = nil // closing twice finishes once
+	}
+	return cerr
+}
+
+// NativeJSON and NativeArrays pass through, so that wrapping the rows does not
+// hide from the scan what they decode themselves.
+func (r *hookedRows) NativeJSON() bool {
+	n, ok := r.Rows.(NativeJSON)
+	return ok && n.NativeJSON()
+}
+
+func (r *hookedRows) NativeArrays() bool {
+	n, ok := r.Rows.(NativeArrays)
+	return ok && n.NativeArrays()
+}
+
+// respondedReader marks the first response of each batch query as its result
+// is reached.
+type respondedReader struct {
+	BatchReader
+	ev *QueryEvent
+}
+
+func (r *respondedReader) Rows() (Rows, error) {
+	rows, err := r.BatchReader.Rows()
+	r.ev.responded()
+	return rows, err
+}
+
+func (r *respondedReader) Exec() (ExecResult, error) {
+	res, err := r.BatchReader.Exec()
+	r.ev.responded()
+	return res, err
+}
+
+// closeRows closes rows barm read itself, and reports the error the reading
+// ended in, or else the one closing did.
+func closeRows(rows Rows, err error) error {
+	cerr := rows.Close()
+	if err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // operation returns the leading SQL keyword.
@@ -248,4 +435,21 @@ func operation(query string) string {
 		}
 	}
 	return query
+}
+
+// isName reports whether table is a name, dotted or not, rather than an
+// expression a select reads from.
+func isName(table string) bool {
+	if table == "" {
+		return false
+	}
+	for i := range len(table) {
+		switch c := table[i]; {
+		case c == '_' || c == '.' || c == '$' || c >= 0x80,
+			'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }

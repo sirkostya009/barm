@@ -216,13 +216,13 @@ func NewBuilder(d Dialect, opts ...Option) *DB { return New(nil, d, opts...) }
 // Exec runs SQL as written, in the driver's own placeholders.
 func (db *DB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	r := db.runner()
-	return r.exec(ctx, query, args)
+	return r.exec(ctx, target{}, query, args)
 }
 
 // Query runs SQL as written and returns its rows, which the caller closes.
 func (db *DB) Query(ctx context.Context, query string, args ...any) (Rows, error) {
 	r := db.runner()
-	return r.query(ctx, query, args)
+	return r.query(ctx, target{}, query, args)
 }
 
 func (db *DB) runner() runner { return runner{h: db} }
@@ -279,9 +279,12 @@ func (db *DB) Ping(ctx context.Context) error {
 // holds its connection until it ends, so one nobody finishes holds it for good.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	if db.pool == nil {
+		unsentQuery(ctx, db.hooks, opBegin, "", "BEGIN", nil, ErrNoConn)
 		return nil, ErrNoConn
 	}
-	tx, err := db.pool.Begin(ctx, opts)
+	c, ev := startQuery(ctx, db.hooks, opBegin, "", "BEGIN", nil)
+	tx, err := db.pool.Begin(c, opts)
+	finishQuery(c, db.hooks, ev, nil, 0, err)
 	if err != nil {
 		return nil, err
 	}

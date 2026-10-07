@@ -710,57 +710,32 @@ type relAuthorLite struct {
 // them together: two round trips for the lot, not three.
 func TestRelationsAreBatched(t *testing.T) {
 	ctx := t.Context()
-	var mu sync.Mutex
-	var seq []string
-	note := func(what, q string) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case strings.Contains(q, "rel_books"):
-			seq = append(seq, what+":books")
-		case strings.Contains(q, "rel_tags"):
-			seq = append(seq, what+":tags")
-		}
-	}
-	db := open(t, barm.WithHook(barm.QueryHook{
-		BeforeQuery: func(c context.Context, ev *barm.QueryEvent) context.Context {
-			note("before", ev.Query)
-			return c
-		},
-		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { note("after", ev.Query) },
-	}))
+	db, sc := openCounted(t)
 	seedRel(t, db)
 
-	mu.Lock()
-	seq = nil
-	mu.Unlock()
-
-	authors, err := db.Select[RelAuthor]().OrderBy("id").
-		Relation[relBookLite]("Books").
-		Relation[relTagLite]("Tags").
-		SliceAs[relAuthorLite](ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(authors) != 2 {
-		t.Fatalf("authors = %d", len(authors))
-	}
-	if len(authors[0].Books) != 2 || len(authors[0].Tags) != 1 {
-		t.Errorf("lem = books %+v tags %+v", authors[0].Books, authors[0].Tags)
-	}
-	if len(authors[1].Books) != 1 || len(authors[1].Tags) != 0 {
-		t.Errorf("borges = books %+v tags %+v", authors[1].Books, authors[1].Tags)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seq) != 4 {
-		t.Fatalf("relation events = %v, want two apiece", seq)
-	}
-	// Pipelined, both go out before either comes back; run one at a time, the
-	// second cannot start until the first has finished.
-	if !strings.HasPrefix(seq[1], "before") {
-		t.Errorf("relations ran one at a time, not batched: %v", seq)
+	// The first run describes each statement new to the pool, so the second is
+	// the one whose round trips are the loading's own.
+	for i, want := range []int64{-1, 2} {
+		before := sc.n.Load()
+		authors, err := db.Select[RelAuthor]().OrderBy("id").
+			Relation[relBookLite]("Books").
+			Relation[relTagLite]("Tags").
+			SliceAs[relAuthorLite](ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(authors) != 2 {
+			t.Fatalf("authors = %d", len(authors))
+		}
+		if len(authors[0].Books) != 2 || len(authors[0].Tags) != 1 {
+			t.Errorf("lem = books %+v tags %+v", authors[0].Books, authors[0].Tags)
+		}
+		if len(authors[1].Books) != 1 || len(authors[1].Tags) != 0 {
+			t.Errorf("borges = books %+v tags %+v", authors[1].Books, authors[1].Tags)
+		}
+		if got := sc.n.Load() - before; want >= 0 && got != want {
+			t.Errorf("run %d: %d round trips, want %d", i, got, want)
+		}
 	}
 }
 
@@ -836,25 +811,7 @@ func TestRelationKeysUseAnyArray(t *testing.T) {
 // relations batch like any other query's.
 func TestRelationsBatchInConnTx(t *testing.T) {
 	ctx := t.Context()
-	var mu sync.Mutex
-	var seq []string
-	note := func(what, q string) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case strings.Contains(q, "rel_books"):
-			seq = append(seq, what+":books")
-		case strings.Contains(q, "rel_tags"):
-			seq = append(seq, what+":tags")
-		}
-	}
-	db := open(t, barm.WithHook(barm.QueryHook{
-		BeforeQuery: func(c context.Context, ev *barm.QueryEvent) context.Context {
-			note("before", ev.Query)
-			return c
-		},
-		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { note("after", ev.Query) },
-	}))
+	db, sc := openCounted(t)
 	seedRel(t, db)
 
 	c, err := db.Conn(ctx)
@@ -868,28 +825,21 @@ func TestRelationsBatchInConnTx(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	mu.Lock()
-	seq = nil
-	mu.Unlock()
-
-	authors, err := tx.Select[RelAuthor]().OrderBy("id").
-		Relation[relBookLite]("Books").
-		Relation[relTagLite]("Tags").
-		SliceAs[relAuthorLite](ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(authors) != 2 || len(authors[0].Books) != 2 || len(authors[0].Tags) != 1 {
-		t.Fatalf("authors = %+v", authors)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seq) != 4 {
-		t.Fatalf("relation events = %v", seq)
-	}
-	if !strings.HasPrefix(seq[1], "before") {
-		t.Errorf("relations ran one at a time inside the transaction: %v", seq)
+	for i, want := range []int64{-1, 2} { // described on the first run
+		before := sc.n.Load()
+		authors, err := tx.Select[RelAuthor]().OrderBy("id").
+			Relation[relBookLite]("Books").
+			Relation[relTagLite]("Tags").
+			SliceAs[relAuthorLite](ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(authors) != 2 || len(authors[0].Books) != 2 || len(authors[0].Tags) != 1 {
+			t.Fatalf("authors = %+v", authors)
+		}
+		if got := sc.n.Load() - before; want >= 0 && got != want {
+			t.Errorf("run %d: %d round trips, want %d", i, got, want)
+		}
 	}
 }
 
@@ -1151,38 +1101,6 @@ type tagNote struct {
 	Body  string `barm:"body"`
 }
 
-// relationEvents records when each relation query starts and finishes, by the
-// table it reads.
-type relationEvents struct {
-	mu  sync.Mutex
-	seq []string
-}
-
-func (e *relationEvents) hook() barm.QueryHook {
-	note := func(what, q string) {
-		for _, table := range []string{"rel_books", "rel_tags", "rel_reviews", "rel_tag_notes"} {
-			if strings.Contains(q, `FROM "`+table+`"`) {
-				e.mu.Lock()
-				e.seq = append(e.seq, what+":"+table)
-				e.mu.Unlock()
-			}
-		}
-	}
-	return barm.QueryHook{
-		BeforeQuery: func(c context.Context, ev *barm.QueryEvent) context.Context { note("before", ev.Query); return c },
-		AfterQuery:  func(_ context.Context, ev *barm.QueryEvent) { note("after", ev.Query) },
-	}
-}
-
-// together reports whether every query of the pair started before either one
-// finished, which is what going out in one batch looks like.
-func (e *relationEvents) together(a, b string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	first := slices.IndexFunc(e.seq, func(s string) bool { return s == "after:"+a || s == "after:"+b })
-	return first >= 0 && slices.Contains(e.seq[:first], "before:"+a) && slices.Contains(e.seq[:first], "before:"+b)
-}
-
 func seedDeepRel(t *testing.T, db *barm.DB) {
 	t.Helper()
 	seedRel(t, db)
@@ -1205,51 +1123,54 @@ func seedDeepRel(t *testing.T, db *barm.DB) {
 // one per relation that has relations of its own.
 func TestRelationsLoadByDepth(t *testing.T) {
 	ctx := t.Context()
-	var ev relationEvents
-	db := open(t, barm.WithHook(ev.hook()))
+	db, sc := openCounted(t)
 	seedDeepRel(t, db)
 
-	authors, err := db.Select[bfsAuthor]().OrderBy("id").
-		Relation("Books", func(q *barm.SelectQuery[nestBook]) *barm.SelectQuery[nestBook] {
-			return q.OrderBy("id").Relation[nestReview]("Reviews")
-		}).
-		Relation("Tags", func(q *barm.SelectQuery[bfsTag]) *barm.SelectQuery[bfsTag] {
-			return q.Relation[tagNote]("Notes")
-		}).
-		Slice(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lem := authors[0]
-	if len(lem.Books) != 2 || len(lem.Books[0].Reviews) != 2 || len(lem.Tags) != 1 || len(lem.Tags[0].Notes) != 1 {
-		t.Fatalf("lem = %+v", lem)
-	}
-	if !ev.together("rel_books", "rel_tags") {
-		t.Errorf("depth 1 went out separately: %v", ev.seq)
-	}
-	if !ev.together("rel_reviews", "rel_tag_notes") {
-		t.Errorf("depth 2 went out separately: %v", ev.seq)
+	// The first run describes each statement new to the pool, so the second is
+	// the one whose round trips are the loading's own.
+	for i, want := range []int64{-1, 3} { // the authors, then one per depth
+		before := sc.n.Load()
+		authors, err := db.Select[bfsAuthor]().OrderBy("id").
+			Relation("Books", func(q *barm.SelectQuery[nestBook]) *barm.SelectQuery[nestBook] {
+				return q.OrderBy("id").Relation[nestReview]("Reviews")
+			}).
+			Relation("Tags", func(q *barm.SelectQuery[bfsTag]) *barm.SelectQuery[bfsTag] {
+				return q.Relation[tagNote]("Notes")
+			}).
+			Slice(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lem := authors[0]
+		if len(lem.Books) != 2 || len(lem.Books[0].Reviews) != 2 || len(lem.Tags) != 1 || len(lem.Tags[0].Notes) != 1 {
+			t.Fatalf("lem = %+v", lem)
+		}
+		if got := sc.n.Load() - before; want >= 0 && got != want {
+			t.Errorf("run %d: %d round trips, want %d", i, got, want)
+		}
 	}
 }
 
 // Relations of different queries in one batch share their round trips too.
 func TestBatchRelationsLoadTogether(t *testing.T) {
 	ctx := t.Context()
-	var ev relationEvents
-	db := open(t, barm.WithHook(ev.hook()))
+	db, sc := openCounted(t)
 	seedDeepRel(t, db)
 
-	b := db.Batch()
-	books := b.Slice(db.Select[RelAuthor]().OrderBy("id").Relation[RelBook]("Books"))
-	tags := b.One(db.Select[bfsAuthor]().Where("id = ?", 1).Relation[bfsTag]("Tags"))
-	if err := b.Run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if len(books.Value()) != 2 || len(books.Value()[0].Books) != 2 || len(tags.Value().Tags) != 1 {
-		t.Fatalf("books %+v, tags %+v", books.Value(), tags.Value())
-	}
-	if !ev.together("rel_books", "rel_tags") {
-		t.Errorf("the queries' relations went out separately: %v", ev.seq)
+	for i, want := range []int64{-1, 2} { // the batch, then both relations at once
+		before := sc.n.Load()
+		b := db.Batch()
+		books := b.Slice(db.Select[RelAuthor]().OrderBy("id").Relation[RelBook]("Books"))
+		tags := b.One(db.Select[bfsAuthor]().Where("id = ?", 1).Relation[bfsTag]("Tags"))
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(books.Value()) != 2 || len(books.Value()[0].Books) != 2 || len(tags.Value().Tags) != 1 {
+			t.Fatalf("books %+v, tags %+v", books.Value(), tags.Value())
+		}
+		if got := sc.n.Load() - before; want >= 0 && got != want {
+			t.Errorf("run %d: %d round trips, want %d", i, got, want)
+		}
 	}
 }
 

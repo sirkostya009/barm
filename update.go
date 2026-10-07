@@ -304,12 +304,16 @@ func (b *builder) assign(f *field, v reflect.Value) {
 	b.ident(f.name).str(" = ").placeholder(b.value(f, fieldValue(v, f.index)))
 }
 
+func (q *UpdateQuery[T]) target() target {
+	return target{op: "UPDATE", table: q.tableName(), schema: q.schema}
+}
+
 func (q *UpdateQuery[T]) Exec(ctx context.Context) (sql.Result, error) {
 	query, args, err := q.Build()
 	if err != nil {
 		return nil, err
 	}
-	return q.exec(ctx, query, args)
+	return q.exec(ctx, q.target(), query, args)
 }
 
 // One runs the update and scans the single returned row into T, the query's own
@@ -322,7 +326,7 @@ func (q *UpdateQuery[T]) One(ctx context.Context) (T, error) {
 		var zero T
 		return zero, err
 	}
-	return q.one[T](ctx, query, args)
+	return q.one[T](ctx, q.target(), query, args)
 }
 
 // Slice runs the update and scans every returned row into T.
@@ -333,7 +337,7 @@ func (q *UpdateQuery[T]) Slice(ctx context.Context) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	return q.slice[T](ctx, query, args, q.rowHint())
+	return q.slice[T](ctx, q.target(), query, args, q.rowHint())
 }
 
 // Seq runs the update and streams the returned rows as T. A build failure is
@@ -342,7 +346,7 @@ func (q *UpdateQuery[T]) Seq(ctx context.Context) iter.Seq2[T, error] {
 	c := *q
 	c.expandReturning()
 	query, args, err := c.Build()
-	return q.seq[T](ctx, query, args, err)
+	return q.seq[T](ctx, q.target(), query, args, err)
 }
 
 // OneAs runs the update and scans the single returned row into U.

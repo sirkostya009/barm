@@ -1222,20 +1222,43 @@ unwinding like defers. The context `BeforeQuery` returns goes to the database ca
 
 `QueryEvent` has:
 
-- **Before the query:** `Op` (`SELECT`, `INSERT`, …), `Query`, `Args`, `Prepared` (the
-  `Prepare` name) and `StartedAt`. `Args` is a copy, so a hook that masks a value in place
-  changes what it reports, not what is written.
-- **After it:** `Err`, `Duration` and, for execs, `Result`.
+- **Before the query:** `Op`, `Table`, `Schema`, `Query`, `Args`, `Prepared` (the `Prepare`
+  name) and `StartedAt`. `Args` is a copy, so a hook that masks a value in place changes
+  what it reports, not what is written.
+- **After it:** `Err`, `Rows`, `FirstResponse`, `Duration` and, for execs, `Result`.
+
+A builder fills `Op` (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), `Table` and `Schema` from
+what it was built with, not from its SQL, so a `WITH` clause does not change `Op`. Raw SQL
+reports its leading keyword as `Op`, with no table or schema. A select from an expression
+rather than a table name has no `Table`. That is what a tracing hook needs for
+`db.operation.name`, `db.collection.name` and a short span name.
 
 When events finish:
 
-- **Single-row reads** (`One`, `Count`, `Exists`) finish after the row is scanned, so a
-  no-rows error is reported.
-- **`Seq`** reports the query itself, not the iteration that follows.
-- **In a batch,** each query gets its own event. All of them start when the batch is sent,
-  and each finishes when its result is read. A query an earlier failure kept from running
-  finishes with `ErrNotRun`. A batched exec reports its row count in `Result`, but no insert
-  id.
+- **Reads finish once their rows are read and closed:** after the scan for `Slice`, `One`,
+  `Count`, `Exists`, relations and `RETURNING` back into values, when the loop ends for
+  `Seq`, and at `Close` for rows handed to you by `Rows` and `Query`. `Rows` counts what was
+  read, and an error partway through the result, a failed scan or no rows at all, is the
+  event's `Err`. Rows that are never closed never finish.
+- **An exec** finishes when the database answers. `Rows` is 0, and `Result` reports what
+  changed.
+- **Transaction statements** are events too, with the statement as `Op`: `BEGIN` (its time
+  includes waiting for a connection), `COMMIT`, `ROLLBACK`, and the `SAVEPOINT`,
+  `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT` of nested transactions. A batch's `Begin`,
+  `Commit` and `Rollback` are events the same way.
+- **In a batch,** each query gets its own event, which starts when barm turns to its result:
+  the first as the batch goes out, each later one once the one before it is read. On a
+  driver that pipelines, that is how long the query kept the batch waiting. On one sending
+  a query at a time, it is that query's round trip. A batched exec reports its row count in
+  `Result`, but no insert id.
+- **A call that never reached the database** fires its hooks all the same, with its error
+  and no times: `StartedAt` is zero, and so are `FirstResponse` and `Duration`. That is a
+  batch query an earlier failure kept from running (`ErrNotRun`), a batch the driver could
+  not send, a `Prepare` name already bound to other SQL, and `ErrNoConn`.
+
+`FirstResponse` is how long the database took to start answering, and `Duration` how long
+until the event finished. Between the two is the time spent receiving and reading the rows,
+which for `Seq`, `Rows` and `Query` includes your own code between them.
 
 With no hook registered, hooks cost nothing: no timestamp, no allocation.
 
