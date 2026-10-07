@@ -190,11 +190,18 @@ func WithTxHook(hooks ...TxHook) Option {
 	}
 }
 
-// New runs barm on a pool, building queries in dialect d:
+// New runs barm on a pool, building queries in the pool's dialect:
 //
-//	db := barm.New(barm.SQL(sqldb), barm.SQLite)
-//	db := barm.New(pgxdriver.Pool(pgxpool), barm.Postgres)
-func New(pool Pool, d Dialect, opts ...Option) *DB {
+//	db := barm.New(barm.SQL(sqldb, barm.SQLite))
+//	db := barm.New(pgxdriver.Pool(pgxpool))
+func New(pool Pool, opts ...Option) *DB { return newDB(pool, pool.Dialect(), opts) }
+
+// NewBuilder returns a DB that renders SQL but executes nothing — the queries
+// carry their own text and arguments, which is all a caller running them
+// elsewhere needs.
+func NewBuilder(d Dialect, opts ...Option) *DB { return newDB(nil, d, opts) }
+
+func newDB(pool Pool, d Dialect, opts []Option) *DB {
 	out := &DB{pool: pool, dialect: d, names: &names{}, txHooks: new([]txHook)}
 	if n, ok := pool.(NativeJSON); ok {
 		out.nativeJSON = n.NativeJSON()
@@ -207,11 +214,6 @@ func New(pool Pool, d Dialect, opts ...Option) *DB {
 	}
 	return out
 }
-
-// NewBuilder returns a DB that renders SQL but executes nothing — the queries
-// carry their own text and arguments, which is all a caller running them
-// elsewhere needs.
-func NewBuilder(d Dialect, opts ...Option) *DB { return New(nil, d, opts...) }
 
 // Exec runs SQL as written, in the driver's own placeholders.
 func (db *DB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {

@@ -20,14 +20,15 @@ type SQLOption func(*SQLPool)
 // pipelined batch's; the round trips are one per statement.
 func SequentialBatches() SQLOption { return func(p *SQLPool) { p.seq = true } }
 
-// SQL runs barm on a *sql.DB:
+// SQL runs barm on a *sql.DB speaking dialect d, which database/sql has no way
+// to report:
 //
 //	sqldb, err := sql.Open("sqlite", dsn)
-//	db := barm.New(barm.SQL(sqldb), barm.SQLite)
+//	db := barm.New(barm.SQL(sqldb, barm.SQLite))
 //
 // The *sql.DB stays the caller's to use directly, and DB.Close closes it.
-func SQL(db *sql.DB, opts ...SQLOption) *SQLPool {
-	p := &SQLPool{db: db, stmts: &stmtCache{p: db}}
+func SQL(db *sql.DB, d Dialect, opts ...SQLOption) *SQLPool {
+	p := &SQLPool{db: db, d: d, stmts: &stmtCache{p: db}}
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -37,12 +38,15 @@ func SQL(db *sql.DB, opts ...SQLOption) *SQLPool {
 // SQLPool is the Pool over a *sql.DB.
 type SQLPool struct {
 	db    *sql.DB
+	d     Dialect
 	stmts *stmtCache
 	seq   bool
 }
 
 // DB returns the *sql.DB the pool runs on.
 func (p *SQLPool) DB() *sql.DB { return p.db }
+
+func (p *SQLPool) Dialect() Dialect { return p.d }
 
 func (p *SQLPool) Underlying() any { return p.db }
 

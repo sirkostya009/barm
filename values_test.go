@@ -36,7 +36,7 @@ func check(t *testing.T, q string, args []any, err error, wantQ string, wantArgs
 // binds as it would in an insert: json encoded, nullzero as NULL.
 func TestUpdateFromValues(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	rows := []change{{ID: 1, Name: "a", Meta: map[string]any{"k": 1}}, {ID: 2, Name: "b", Note: "n"}}
 
 	q, args, err := db.Update[User]().
@@ -58,7 +58,7 @@ func TestUpdateFromValues(t *testing.T) {
 // assignment, and their arguments take their place in the text.
 func TestUpdateFromOrder(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Update[User]().
 		From("teams AS t").
 		Set("name = t.name").
@@ -74,7 +74,7 @@ func TestUpdateFromOrder(t *testing.T) {
 
 func TestDeleteUsingValues(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Delete[User]().
 		With("data", db.Values([]change{{ID: 7, Name: "x"}})).
 		Using("data").
@@ -91,7 +91,7 @@ func TestDeleteUsingValues(t *testing.T) {
 // has no WHERE, and one condition beside it is not wrapped as if among several.
 func TestUsingIsNotACondition(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	_, _, err := db.Delete[User]().Using("data").Build()
 	if err == nil || !strings.Contains(err.Error(), "no WHERE") {
 		t.Errorf("Using alone: %v, want the missing WHERE reported", err)
@@ -108,7 +108,7 @@ func TestUsingIsNotACondition(t *testing.T) {
 // A VALUES list goes wherever a query does, and reports what it cannot render.
 func TestValuesElsewhere(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	type pair struct {
 		A int64  `barm:"a"`
 		B string `barm:"b"`
@@ -137,7 +137,7 @@ func TestValuesElsewhere(t *testing.T) {
 // From and Using do not grow the builders: they ride in slices already there.
 func TestFromKeepsWhereShape(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	u := &User{ID: 3, Name: "n"}
 	q, args, err := db.Update[User]().Value(u).Column("name").From("x").WherePK().Build()
 	check(t, q, args, err, `UPDATE "users" SET "name" = $1 FROM x WHERE "id" = $2`, "n", int64(3))
@@ -177,7 +177,7 @@ type kind string
 func TestValuesCasts(t *testing.T) {
 	t.Parallel()
 	rows := []casts{{}, {}}
-	q, _, err := barm.New(nil, barm.Postgres).Values(rows).Build()
+	q, _, err := barm.NewBuilder(barm.Postgres).Values(rows).Build()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestValuesCasts(t *testing.T) {
 		t.Errorf("rows after the first are cast too: %s", q)
 	}
 	for _, d := range []barm.Dialect{barm.SQLite, barm.MySQL} {
-		q, _, err := barm.New(nil, d).Values(rows[:1]).Build()
+		q, _, err := barm.NewBuilder(d).Values(rows[:1]).Build()
 		if err != nil || strings.Contains(q, "::") {
 			t.Errorf("%s: %s, %v", d.Name(), q, err)
 		}
@@ -203,7 +203,7 @@ func TestValuesCasts(t *testing.T) {
 // query, then the conflict clause, numbered in that order.
 func TestInsertSelect(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Insert[User]().
 		With("recent", db.Select[User]().Where("u.age > ?", 30)).
 		Column("name", "age").
@@ -222,7 +222,7 @@ func TestInsertSelect(t *testing.T) {
 // itself, which here leaves out the autoincrement key.
 func TestInsertSelectDefaultColumns(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, _, err := db.Insert[User]().Table("archive").Select(db.Select[User]().Column("name", "email", "age", "created_at")).Build()
 	check(t, q, nil, err,
 		`INSERT INTO "archive" ("name", "email", "age", "created_at") SELECT "name", "email", "age", "created_at" FROM "users" AS "u"`)
@@ -230,7 +230,7 @@ func TestInsertSelectDefaultColumns(t *testing.T) {
 
 func TestInsertSelectErrors(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	_, _, err := db.Insert[User]().Values(&User{}).Select(db.NewRaw("SELECT 1")).Build()
 	if err == nil || !strings.Contains(err.Error(), "both") {
 		t.Errorf("values and a Select: %v", err)
@@ -249,7 +249,7 @@ func TestInsertSelectErrors(t *testing.T) {
 // too until either changes it: neither may see the other's.
 func TestInsertSelectClone(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	base := db.Insert[User]().Column("name").Select(db.NewRaw("SELECT 'a'"))
 	withOn := base.Clone().On("CONFLICT DO NOTHING")
 	other := base.Clone().Select(db.NewRaw("SELECT 'b'"))

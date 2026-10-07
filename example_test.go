@@ -217,7 +217,7 @@ func ExampleNew() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	db := barm.New(barm.SQL(sqldb), barm.Postgres)
+	db := barm.New(barm.SQL(sqldb, barm.Postgres))
 	defer db.Close()
 
 	authors, err := db.Select[Author]().Where("born >= ?", 1900).Slice(context.Background())
@@ -332,7 +332,7 @@ func ExampleWithHook() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	db := barm.New(barm.SQL(sqldb), barm.Postgres, barm.WithHook(barm.QueryHook{
+	db := barm.New(barm.SQL(sqldb, barm.Postgres), barm.WithHook(barm.QueryHook{
 		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
 			if ev.Duration > time.Second {
 				log.Printf("slow %s (%s): %s", ev.Op, ev.Duration, ev.Query)
@@ -353,7 +353,7 @@ func ExampleWithTxHook() {
 	}
 	var outbox interface{ flush(context.Context) error }
 
-	db := barm.New(barm.SQL(sqldb), barm.Postgres, barm.WithTxHook(barm.TxHook{
+	db := barm.New(barm.SQL(sqldb, barm.Postgres), barm.WithTxHook(barm.TxHook{
 		BeforeCommit: func(ctx context.Context, ev *barm.TxEvent) (context.Context, error) {
 			return ctx, outbox.flush(ctx)
 		},

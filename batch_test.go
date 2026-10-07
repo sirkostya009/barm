@@ -55,12 +55,13 @@ func (stubPool) Acquire(context.Context) (barm.DriverConn, error) { panic("unuse
 func (stubPool) Begin(context.Context, *sql.TxOptions) (barm.DriverTx, error) {
 	panic("unused")
 }
+func (stubPool) Dialect() barm.Dialect      { return barm.Postgres }
 func (stubPool) Ping(context.Context) error { return nil }
 func (stubPool) Underlying() any            { return nil }
 func (stubPool) Close() error               { return nil }
 
 func stubbed(stub *stubBatcher, opts ...barm.Option) *barm.DB {
-	return barm.New(stubPool{stub}, barm.Postgres, opts...)
+	return barm.New(stubPool{stub}, opts...)
 }
 
 type stubReader struct{}
@@ -144,7 +145,7 @@ func TestBatchWithoutConnection(t *testing.T) {
 // sending anything, unless SequentialBatches asked for one at a time.
 func TestSQLBatchNeedsSequential(t *testing.T) {
 	t.Parallel()
-	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres))
 	b := db.Batch()
 	users := b.Slice(db.Select[User]())
 	err := b.Run(t.Context())
@@ -152,7 +153,7 @@ func TestSQLBatchNeedsSequential(t *testing.T) {
 		t.Errorf("Run() = %v, result = %v, want ErrNoBatcher", err, users.Err())
 	}
 
-	seq := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.SequentialBatches()), barm.Postgres)
+	seq := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres, barm.SequentialBatches()))
 	b = seq.Batch()
 	users = b.Slice(seq.Select[User]())
 	one := b.One(seq.Select[User]())

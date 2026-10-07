@@ -26,7 +26,7 @@ type User struct {
 
 func TestBuildSelect(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, args, err := db.Select[User]().
 		Where("u.age >= ?", 18).
@@ -52,7 +52,7 @@ func TestBuildSelect(t *testing.T) {
 // AND joining them cannot bind tighter than an OR inside one.
 func TestMultilineConditionIsWrapped(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, _, err := db.Delete[User]().Where("name = ?", "x").Where(`email = ?
 		OR email = ?`, "a", "b").Build()
@@ -67,7 +67,7 @@ func TestMultilineConditionIsWrapped(t *testing.T) {
 
 func TestBuildInsertMySQLPlaceholders(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.MySQL)
+	db := barm.NewBuilder(barm.MySQL)
 
 	q, args, err := db.Insert[User]().
 		Values(&User{Name: "a"}, &User{Name: "b"}).
@@ -86,7 +86,7 @@ func TestBuildInsertMySQLPlaceholders(t *testing.T) {
 
 func TestBuildUpdateUsesPK(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, args, err := db.Update[User]().Value(&User{ID: 7, Name: "x"}).Column("name").WherePK().Build()
 	if err != nil {
@@ -103,7 +103,7 @@ func TestBuildUpdateUsesPK(t *testing.T) {
 
 func TestBuildByCompositePK(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	type member struct {
 		barm.BaseModel `barm:"table:members"`
 
@@ -140,7 +140,7 @@ func TestBuildByCompositePK(t *testing.T) {
 // where it was asked for: a Value on its own picks no rows.
 func TestWherePK(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	u := &User{ID: 7, Name: "x", Age: 3}
 
 	q, args, err := db.Delete[User]().Value(u).WherePK().Where("age = ?", 3).Build()
@@ -226,7 +226,7 @@ func TestOnSet(t *testing.T) {
 
 func TestUpdateRequiresWhere(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	_, _, err := db.Update[User]().Set("age = 1").Build()
 	if err == nil {
 		t.Fatal("expected an error for an unconditional UPDATE")
@@ -235,7 +235,7 @@ func TestUpdateRequiresWhere(t *testing.T) {
 
 func TestExistsSQL(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, args, err := db.Select[User]().Where("age > ?", 10).OrderBy("id").ExistsQuery()
 	if err != nil {
@@ -255,7 +255,7 @@ func TestExistsSQL(t *testing.T) {
 // without a clone of their own would write the same slot.
 func TestCloneBranches(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	check := func(what string, q barm.Query, suffix string) {
 		t.Helper()
 		sql, _, err := q.Build()
@@ -444,7 +444,7 @@ func TestSliceBindsAsOneArgument(t *testing.T) {
 // A count that has to go around the query, rather than into it, wraps it whole.
 func TestCountQueryWrapsShapedQueries(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, _, err := db.Select[User]().Where("age > ?", 1).GroupBy("name").OrderBy("name").CountQuery()
 	if err != nil {
@@ -467,7 +467,7 @@ func TestCountQueryWrapsShapedQueries(t *testing.T) {
 
 func TestSubsetProjection(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	// a narrower row type selects only its own columns
 	q, _, err := db.Select[User]().Where("age > ?", 5).BuildAs[struct {
@@ -504,7 +504,7 @@ func TestSubsetProjection(t *testing.T) {
 // query's own — the SQL must come out identical either way.
 func TestResultTypeSkipIsInvisible(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q := db.Select[User]().Where("age > ?", 5).OrderBy("id").Limit(3)
 
@@ -543,7 +543,7 @@ func TestResultTypeSkipIsInvisible(t *testing.T) {
 
 func TestTableOverrideSQL(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	// As adopts the model's columns, but the table expression stays as written
 	q, _, err := db.Select[User]().Table("users u").Where("u.age > ?", 5).Build()
@@ -569,7 +569,7 @@ func TestTableOverrideSQL(t *testing.T) {
 // rendering an empty identifier into the SQL.
 func TestWriteWithoutTable(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	type untabled struct {
 		A int `barm:"a"`
 	}
@@ -601,7 +601,7 @@ func TestWriteWithoutTable(t *testing.T) {
 // numbering — the thing that splicing separately built SQL together cannot do.
 func TestCTESQL(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	recent := db.Select[User]().Column("id").Where("age > ?", 30)
 
@@ -746,7 +746,7 @@ func TestCTESQL(t *testing.T) {
 
 func TestSchemaSQL(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	for _, tc := range []struct {
 		name string
@@ -778,7 +778,7 @@ func TestSchemaSQL(t *testing.T) {
 
 func TestSelectWithoutTable(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	type Untagged struct {
 		N int `barm:"n"`
 	}
@@ -801,7 +801,7 @@ func TestSelectWithoutTable(t *testing.T) {
 
 func TestReturningNeedsDialectSupport(t *testing.T) {
 	t.Parallel()
-	my := barm.New(nil, barm.MySQL)
+	my := barm.NewBuilder(barm.MySQL)
 
 	_, err := my.Insert[User]().Values(&User{Name: "a"}).OneAs[User](t.Context())
 	if err == nil {
@@ -1013,7 +1013,7 @@ func TestIn(t *testing.T) {
 // With no Returning, the clause is the result type's own tagged columns.
 func TestReturningDefaultsToResultColumns(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, _, err := db.Insert[User]().Values(&User{Name: "a"}).BuildAs[struct {
 		ID   int64  `barm:"id"`
@@ -1053,7 +1053,7 @@ func TestReturningDefaultsToResultColumns(t *testing.T) {
 
 func TestApply(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	adult := func(q *barm.SelectQuery[User]) *barm.SelectQuery[User] {
 		return q.Where("age >= ?", 18)
@@ -1093,7 +1093,7 @@ func TestApply(t *testing.T) {
 
 func TestIndexedPlaceholders(t *testing.T) {
 	t.Parallel()
-	pg := barm.New(nil, barm.Postgres)
+	pg := barm.NewBuilder(barm.Postgres)
 
 	// ?1 binds once and is referenced twice
 	q, args, err := pg.Select[User]().
@@ -1126,7 +1126,7 @@ func TestIndexedPlaceholders(t *testing.T) {
 	}
 
 	// a positional dialect cannot reference a placeholder twice, so it re-binds
-	my := barm.New(nil, barm.MySQL)
+	my := barm.NewBuilder(barm.MySQL)
 	q, args, err = my.Select[User]().Where("name = ?1 OR email = ?1", "root").Build()
 	if err != nil {
 		t.Fatal(err)
@@ -1162,7 +1162,7 @@ func TestArgDedup(t *testing.T) {
 	blob := strings.Repeat("x", 200)
 	small := "y"
 
-	db := barm.New(nil, barm.Postgres, barm.WithArgDedup())
+	db := barm.NewBuilder(barm.Postgres, barm.WithArgDedup())
 
 	// the same backing array reaches two placeholders: bound once
 	q, args, err := db.Select[User]().Where("a = ?", blob).Where("b = ?", blob).Build()
@@ -1227,7 +1227,7 @@ func TestArgDedup(t *testing.T) {
 	}
 
 	// off by default
-	plain := barm.New(nil, barm.Postgres)
+	plain := barm.NewBuilder(barm.Postgres)
 	q, _, err = plain.Select[User]().Where("a = ?", blob).Where("b = ?", blob).Build()
 	if err != nil {
 		t.Fatal(err)
@@ -1241,7 +1241,7 @@ func TestArgDedup(t *testing.T) {
 // scanned; a value seen before the switch must still be found after it.
 func TestArgDedupIndexed(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres, barm.WithArgDedup())
+	db := barm.NewBuilder(barm.Postgres, barm.WithArgDedup())
 
 	vals := make([]string, 40)
 	q := db.Select[User]()
@@ -1264,7 +1264,7 @@ func TestArgDedupIndexed(t *testing.T) {
 // The builder is pooled, so a query must not see another's buffer or args.
 func TestPooledBuilderIsolation(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	var wg sync.WaitGroup
 	for i := range 64 {
@@ -1297,7 +1297,7 @@ func TestPooledBuilderIsolation(t *testing.T) {
 // An outsized query must not leave a huge buffer pinned, nor corrupt the next.
 func TestPooledBuilderAfterLargeQuery(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	big := db.Select[User]()
 	for range 4000 {
@@ -1537,7 +1537,7 @@ func TestHandleAcceptsEveryKind(t *testing.T) {
 	}
 	// And the database/sql adapter is a Pool.
 	_ = func() {
-		var _ = barm.SQL((*sql.DB)(nil))
+		var _ = barm.SQL((*sql.DB)(nil), barm.Postgres)
 	}
 	_, _, _ = db, tx, c
 }
@@ -1567,7 +1567,7 @@ func TestBeginSignatures(t *testing.T) {
 // its argument numbering.
 func TestRawQuery(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 
 	q, args, err := db.NewRaw("DELETE FROM sessions WHERE seen < ? AND kind = ?", 5, "web").Build()
 	if err != nil {

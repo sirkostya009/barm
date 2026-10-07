@@ -13,7 +13,7 @@ const usersFrom = `SELECT "u"."id", "u"."name", "u"."email", "u"."age", "u"."cre
 // place in the numbering.
 func TestWhereGroup(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Select[User]().
 		Where("u.team_id = ?", 1).
 		WhereGroup(func(q *barm.SelectQuery[User]) *barm.SelectQuery[User] {
@@ -28,7 +28,7 @@ func TestWhereGroup(t *testing.T) {
 
 func TestWhereGroupShapes(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	for _, tc := range []struct {
 		name  string
 		build func(*barm.SelectQuery[User]) *barm.SelectQuery[User]
@@ -71,7 +71,7 @@ func TestWhereGroupShapes(t *testing.T) {
 // Update and delete group the same way, WherePK beside a group but not in one.
 func TestWhereGroupOnWrites(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	u := &User{ID: 9}
 	q, args, err := db.Delete[User]().Value(u).WherePK().
 		WhereGroup(func(q *barm.DeleteQuery[User]) *barm.DeleteQuery[User] {

@@ -3,7 +3,7 @@
 // JSON, UUIDs — and batches pipeline in one round trip.
 //
 //	pool, err := pgxpool.New(ctx, dsn)
-//	db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
+//	db := barm.New(pgxdriver.Pool(pool))
 //
 // A plain query is handed to pgx as it is, so how it runs is the pool's
 // DefaultQueryExecMode: pgx's own statement cache unless configured otherwise.
@@ -123,6 +123,8 @@ func (p *pool) Begin(ctx context.Context, opts *sql.TxOptions) (barm.DriverTx, e
 }
 
 func (p *pool) Ping(ctx context.Context) error { return p.p.Ping(ctx) }
+
+func (*pool) Dialect() barm.Dialect { return barm.Postgres }
 
 func (p *pool) Underlying() any { return p.p }
 

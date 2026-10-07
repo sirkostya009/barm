@@ -68,7 +68,7 @@ func TestCompositeRelationTags(t *testing.T) {
 	if _, ok := m.rel("Bad"); ok {
 		t.Error("a pair without = should not make a relation")
 	}
-	_, _, err = New(nil, Postgres).Select[parent]().Relation[child]("Five").Build()
+	_, _, err = NewBuilder(Postgres).Select[parent]().Relation[child]("Five").Build()
 	if err == nil || !strings.Contains(err.Error(), "5 columns") {
 		t.Errorf("five key columns: %v", err)
 	}

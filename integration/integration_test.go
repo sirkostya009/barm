@@ -1602,7 +1602,7 @@ func TestTxControlFiresQueryHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqldb.SetMaxOpenConns(1)
-	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite, barm.WithHook(barm.QueryHook{
+	db := barm.New(barm.SQL(sqldb, barm.SQLite, barm.SequentialBatches()), barm.WithHook(barm.QueryHook{
 		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
 			if ev.Err != nil {
 				t.Errorf("%s: %v", ev.Query, ev.Err)
@@ -3669,7 +3669,7 @@ func openSQL(driver, dsn string, d barm.Dialect, opts ...barm.Option) (*barm.DB,
 	if err != nil {
 		return nil, err
 	}
-	return barm.New(barm.SQL(sqldb), d, opts...), nil
+	return barm.New(barm.SQL(sqldb, d), opts...), nil
 }
 
 // row is the first row of a raw query, scanned positionally.
@@ -3794,7 +3794,7 @@ func TestPreparedNameAcrossDBsOnOnePool(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	other := barm.New(db.Pool(), barm.SQLite)
+	other := barm.New(db.Pool())
 	if _, err := db.Select[User]().Where("age < ?", 50).Prepare("shared").Slice(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -3813,7 +3813,7 @@ func TestFailedPoolBatchDropsItsConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqldb.SetMaxOpenConns(1)
-	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
+	db := barm.New(barm.SQL(sqldb, barm.SQLite, barm.SequentialBatches()))
 	defer db.Close()
 	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)
@@ -3954,7 +3954,7 @@ func TestSQLBatchPreparesNamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
+	db := barm.New(barm.SQL(sqldb, barm.SQLite, barm.SequentialBatches()))
 	defer db.Close()
 	if _, err := db.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, age INTEGER, created_at TIMESTAMP)`); err != nil {
 		t.Fatal(err)

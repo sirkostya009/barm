@@ -10,7 +10,7 @@ import (
 // so the value after them is still the first argument.
 func TestIdentAndSafe(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Select[User]().
 		Column("name").
 		Join("JOIN ? AS tv ON tv.id = u.id", barm.Ident("tmp_versions")).
@@ -36,7 +36,7 @@ func TestIdentQuoting(t *testing.T) {
 		{barm.MySQL, "db.t", "`db`.`t`"},
 		{barm.MySQL, "a`b", "`a``b`"},
 	} {
-		q, args, err := barm.New(nil, tc.d).NewRaw("SELECT id FROM ?", barm.Ident(tc.name)).Build()
+		q, args, err := barm.NewBuilder(tc.d).NewRaw("SELECT id FROM ?", barm.Ident(tc.name)).Build()
 		check(t, q, nil, err, "SELECT id FROM "+tc.want)
 		if len(args) != 0 {
 			t.Errorf("an identifier bound %v", args)
@@ -49,10 +49,10 @@ func TestIdentQuoting(t *testing.T) {
 // placeholder.
 func TestSafeIsVerbatim(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.NewRaw("SELECT ?1, ?1, ?2, ?3", barm.Safe("data ? 'k'"), barm.Ident("c"), 5).Build()
 	check(t, q, args, err, `SELECT data ? 'k', data ? 'k', "c", $1`, 5)
 
-	q, args, err = barm.New(nil, barm.SQLite).NewRaw("SELECT ? FROM t WHERE x = ?", barm.Ident("c"), 1).Build()
+	q, args, err = barm.NewBuilder(barm.SQLite).NewRaw("SELECT ? FROM t WHERE x = ?", barm.Ident("c"), 1).Build()
 	check(t, q, args, err, `SELECT "c" FROM t WHERE x = ?`, 1)
 }

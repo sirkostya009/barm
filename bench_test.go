@@ -14,7 +14,7 @@ import (
 )
 
 func BenchmarkBuildSelect(b *testing.B) {
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	b.ReportAllocs()
 	for b.Loop() {
 		q, args, err := db.Select[User]().
@@ -30,7 +30,7 @@ func BenchmarkBuildSelect(b *testing.B) {
 }
 
 func BenchmarkBuildInsert(b *testing.B) {
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	rows := make([]*User, 10)
 	for i := range rows {
 		rows[i] = &User{Name: "n", Email: "e", Age: i, CreatedAt: time.Now()}
@@ -45,7 +45,7 @@ func BenchmarkBuildInsert(b *testing.B) {
 }
 
 func BenchmarkExistsQuery(b *testing.B) {
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	b.ReportAllocs()
 	for b.Loop() {
 		q, _, err := db.Select[User]().Where("age > ?", 10).ExistsQuery()
@@ -56,7 +56,7 @@ func BenchmarkExistsQuery(b *testing.B) {
 }
 
 func BenchmarkBuildUpdateByValue(b *testing.B) {
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	u := &User{ID: 7, Name: "n", Email: "e", Age: 30, CreatedAt: time.Now()}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -68,7 +68,7 @@ func BenchmarkBuildUpdateByValue(b *testing.B) {
 }
 
 func BenchmarkBuildDeleteByValue(b *testing.B) {
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	u := &User{ID: 7}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -82,7 +82,7 @@ func BenchmarkBuildDeleteByValue(b *testing.B) {
 // A wide insert with argument dedup on: every row carries distinct strings, so
 // nothing merges and the cost is all in looking.
 func BenchmarkBuildInsertDedup(b *testing.B) {
-	db := barm.New(nil, barm.Postgres, barm.WithArgDedup())
+	db := barm.NewBuilder(barm.Postgres, barm.WithArgDedup())
 	rows := make([]*User, 1000)
 	for i := range rows {
 		rows[i] = &User{Name: strconv.Itoa(i), Email: strconv.Itoa(i) + "@x", Age: i, CreatedAt: time.Now()}
@@ -97,7 +97,7 @@ func BenchmarkBuildInsertDedup(b *testing.B) {
 }
 
 func BenchmarkOne(b *testing.B) {
-	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres))
 	ctx := b.Context()
 	b.ReportAllocs()
 	for b.Loop() {
@@ -109,7 +109,7 @@ func BenchmarkOne(b *testing.B) {
 }
 
 func BenchmarkSlice(b *testing.B) {
-	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 10})), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 10}), barm.Postgres))
 	ctx := b.Context()
 	b.ReportAllocs()
 	for b.Loop() {
@@ -122,7 +122,7 @@ func BenchmarkSlice(b *testing.B) {
 
 // Via on a query built once should cost what building on the handle does.
 func BenchmarkVia(b *testing.B) {
-	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres))
 	c, err := db.Conn(b.Context())
 	if err != nil {
 		b.Fatal(err)

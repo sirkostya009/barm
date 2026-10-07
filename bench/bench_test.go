@@ -55,7 +55,7 @@ func open(tb testing.TB, rows int) (*barm.DB, *bun.DB) {
 		tb.Fatal(err)
 	}
 
-	bd := barm.New(barm.SQL(sqldb), barm.SQLite)
+	bd := barm.New(barm.SQL(sqldb, barm.SQLite))
 	if rows > 0 {
 		users := make([]*barmUser, rows)
 		now := time.Now()
@@ -76,7 +76,7 @@ func builders(tb testing.TB) (*barm.DB, *bun.DB) {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { sqldb.Close() })
-	return barm.New(barm.SQL(sqldb), barm.SQLite), bun.NewDB(sqldb, sqlitedialect.New())
+	return barm.New(barm.SQL(sqldb, barm.SQLite)), bun.NewDB(sqldb, sqlitedialect.New())
 }
 
 var (

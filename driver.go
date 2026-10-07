@@ -46,6 +46,8 @@ type NativeArrays interface {
 // Pool is the database a DB runs on.
 type Pool interface {
 	Executor
+	// Dialect is the SQL flavor the database speaks, which a DB builds in.
+	Dialect() Dialect
 	// Acquire takes one connection out of the pool, until its Release.
 	Acquire(ctx context.Context) (DriverConn, error)
 	Begin(ctx context.Context, opts *sql.TxOptions) (DriverTx, error)

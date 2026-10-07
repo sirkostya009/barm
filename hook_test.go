@@ -40,7 +40,7 @@ func (r slowRows) Next(dest []driver.Value) error {
 func TestHookFirstResponse(t *testing.T) {
 	t.Parallel()
 	var got []barm.QueryEvent
-	db := barm.New(barm.SQL(sql.OpenDB(slowConnector{rows: 2})), barm.Postgres, barm.WithHook(barm.QueryHook{
+	db := barm.New(barm.SQL(sql.OpenDB(slowConnector{rows: 2}), barm.Postgres), barm.WithHook(barm.QueryHook{
 		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { got = append(got, *ev) },
 	}))
 	ctx := t.Context()
@@ -104,7 +104,7 @@ func TestHookUnsentHasNoTimes(t *testing.T) {
 	_, err = nothing.BeginTx(ctx, nil)
 	unsent("BEGIN with no connection", err)
 
-	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1})), barm.Postgres, hook)
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres), hook)
 	_, _ = db.Select[User]().Prepare("taken").Slice(ctx) // binds the name; the fake cannot prepare, which is beside the point
 	got = nil
 	_, err = db.Select[User]().Where("id = 1").Prepare("taken").Slice(ctx)

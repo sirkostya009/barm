@@ -4,7 +4,7 @@ A fast, typed query builder and ORM for Go, built on Go 1.27 generic methods and
 iterators. It runs natively on pgx's pool, or on any `database/sql` driver.
 
 ```go
-db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
+db := barm.New(pgxdriver.Pool(pool))
 
 users, err := db.Select[User]().Where("age >= ?", 18).OrderBy("id DESC").Limit(20).Slice(ctx)
 user, err  := db.Select[User]().Where("email = ?", email).One(ctx)
@@ -74,14 +74,15 @@ go get github.com/sirkostya009/barm/pgxdriver
 
 ```go
 pool, err := pgxpool.New(ctx, dsn)
-db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
+db := barm.New(pgxdriver.Pool(pool))
 ```
 
-For SQLite, MySQL or any other `database/sql` driver, wrap the `*sql.DB`:
+For SQLite, MySQL or any other `database/sql` driver, wrap the `*sql.DB` and name its
+dialect, which `database/sql` cannot report:
 
 ```go
 sqldb, err := sql.Open("sqlite", dsn)
-db := barm.New(barm.SQL(sqldb), barm.SQLite)
+db := barm.New(barm.SQL(sqldb, barm.SQLite))
 ```
 
 See [Drivers](#drivers) for what each one does differently.
@@ -103,7 +104,7 @@ pool, err := pgxpool.New(ctx, dsn)
 if err != nil {
 	return err
 }
-db := barm.New(pgxdriver.Pool(pool), barm.Postgres)
+db := barm.New(pgxdriver.Pool(pool))
 defer db.Close() // closes the pool
 
 u := &User{Name: "Ada", Email: "ada@example.com", Age: 36}
@@ -1115,7 +1116,7 @@ of row types, and a loop can queue as many as it likes.
 time anyway, on one connection, say so when creating the pool:
 
 ```go
-db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.SQLite)
+db := barm.New(barm.SQL(sqldb, barm.SQLite, barm.SequentialBatches()))
 ```
 
 20 lookups on a local Postgres, batched versus one at a time. Over a real network the gap
@@ -1206,7 +1207,7 @@ statements Postgres accepts in that state, so `Rollback` sends it as a second ro
 ### Query hooks
 
 ```go
-db := barm.New(pgxdriver.Pool(pool), barm.Postgres, barm.WithHook(barm.QueryHook{
+db := barm.New(pgxdriver.Pool(pool), barm.WithHook(barm.QueryHook{
 	AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
 		if ev.Duration > time.Second {
 			log.Printf("slow %s (%s): %s", ev.Op, ev.Duration, ev.Query)
@@ -1268,7 +1269,7 @@ handle.
 ### Transaction hooks
 
 ```go
-db := barm.New(pgxdriver.Pool(pool), barm.Postgres, barm.WithTxHook(barm.TxHook{
+db := barm.New(pgxdriver.Pool(pool), barm.WithTxHook(barm.TxHook{
 	AfterCommit: func(_ context.Context, ev *barm.TxEvent) {
 		log.Printf("commit after %s: %v", ev.Duration, ev.Err)
 	},
@@ -1313,7 +1314,7 @@ transactions it begins.
 barm talks to the database through a small interface of its own, `barm.Pool`, and ships
 two:
 
-|                | `pgxdriver.Pool(pool)`                                     | `barm.SQL(sqldb)`                                      |
+|                | `pgxdriver.Pool(pool)`                                     | `barm.SQL(sqldb, dialect)`                             |
 | -------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
 | databases      | Postgres                                                   | anything with a `database/sql` driver                  |
 | column types   | everything pgx encodes and decodes: arrays, JSON, UUIDs, … | what `database/sql` converts; `json` and `array` tags  |
@@ -1330,8 +1331,8 @@ two:
   `*sql.DB`, and `Driver()` on a `Conn` or `Tx` returns the driver's own connection or
   transaction.
 - **Writing your own:** implement `barm.Pool`. It is an `Executor` (query, exec, the prepared
-  forms, and batches) that can also hand out a held connection and begin a transaction,
-  each of which is an `Executor` too.
+  forms, and batches) that reports its `Dialect` and can also hand out a held connection
+  and begin a transaction, each of which is an `Executor` too.
 
 ## Interfaces
 
@@ -1397,7 +1398,8 @@ Three dialects are built in: `barm.Postgres`, `barm.MySQL` and `barm.SQLite`.
 | `OFFSET` without `LIMIT`  | as is          | adds the max `LIMIT` | adds `LIMIT -1`          |
 | first `VALUES` row        | cast           | as is                | as is                    |
 
-`Dialect` is an interface, so you can supply your own.
+`Dialect` is an interface, so you can supply your own. A pool reports the one a `DB` built
+on it uses. `NewBuilder`, with no pool, takes it as an argument.
 
 ## Not yet
 

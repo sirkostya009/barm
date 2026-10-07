@@ -92,7 +92,7 @@ func openDSN(t *testing.T, dsn string, size int32, configure func(*pgxpool.Confi
 			t.Fatal(err)
 		}
 	}
-	return barm.New(pgxdriver.Pool(p), barm.Postgres, opts...)
+	return barm.New(pgxdriver.Pool(p), opts...)
 }
 
 // row is the first row of a raw query, scanned positionally.
@@ -2508,7 +2508,7 @@ func TestArrayTagOverSQL(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.Postgres)
+			db := barm.New(barm.SQL(sqldb, barm.Postgres, barm.SequentialBatches()))
 			defer db.Close()
 			if err := sqldb.Ping(); err != nil {
 				t.Skipf("no postgres: %v", err)
@@ -2572,7 +2572,7 @@ func TestUpdateFromValuesOnPgx(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db := barm.New(barm.SQL(sqldb, barm.SequentialBatches()), barm.Postgres)
+			db := barm.New(barm.SQL(sqldb, barm.Postgres, barm.SequentialBatches()))
 			t.Cleanup(func() { db.Close() })
 			if _, err := db.Exec(ctx, `DROP TABLE IF EXISTS batch_users`); err != nil {
 				t.Skipf("no postgres: %v", err)

@@ -11,7 +11,7 @@ import (
 // numbers, and a second call adds to the list.
 func TestDistinctOn(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Select[User]().
 		DistinctOn("u.team_id").
 		DistinctOn("u.age > ?", 30).
@@ -30,7 +30,7 @@ func TestDistinctOn(t *testing.T) {
 // A Clone keeps the ON list it had: adding to one does not reach the other.
 func TestDistinctOnClone(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	base := db.Select[User]().Column("name").DistinctOn("a")
 	more := base.Clone().DistinctOn("b")
 	plain := base.Clone().Distinct()
@@ -50,7 +50,7 @@ func TestDistinctOnClone(t *testing.T) {
 // A DISTINCT ON query decides what a row is, so it is counted from outside.
 func TestDistinctOnCount(t *testing.T) {
 	t.Parallel()
-	db := barm.New(nil, barm.Postgres)
+	db := barm.NewBuilder(barm.Postgres)
 	q, args, err := db.Select[User]().Column("name").DistinctOn("u.age % ?", 10).CountQuery()
 	if err != nil {
 		t.Fatal(err)

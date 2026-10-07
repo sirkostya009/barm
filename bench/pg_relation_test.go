@@ -58,7 +58,7 @@ func openPG(b *testing.B, authors, perAuthor int) (*barm.DB, *bun.DB) {
 		b.Fatal(err)
 	}
 	b.Cleanup(pool.Close)
-	return barm.New(pgxdriver.Pool(pool), barm.Postgres), bun.NewDB(sqldb, pgdialect.New())
+	return barm.New(pgxdriver.Pool(pool)), bun.NewDB(sqldb, pgdialect.New())
 }
 
 // barmLoad loads the first n relations through h.
