@@ -378,6 +378,18 @@ func serverName(name, query string) string {
 	return "barm_" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
+// queued is the description to hand SendQueryStatement. pgconn keeps it until it
+// reads the result, and sends a Describe when it has no fields, which a pending
+// statement does not yet: parsed fills them in before the result is read, so
+// pgconn gets its own copy and still expects the row description it asked for.
+func queued(s *stmt) *pgconn.StatementDescription {
+	if !s.pending {
+		return &s.StatementDescription
+	}
+	sd := s.StatementDescription
+	return &sd
+}
+
 // prepare queues a statement's Parse, with its parameter types when known.
 // The Close ahead of it drops one left over under the same name — from a run
 // that failed after its Parse, say — and is no error when there is none.
@@ -495,7 +507,7 @@ func queryNamed(ctx context.Context, c *pgx.Conn, t *types, name, query string, 
 	}
 	p := pc.StartPipeline(ctx)
 	prepare(p, s)
-	p.SendQueryStatement(&s.StatementDescription, st.eqb.ParamValues, st.eqb.ParamFormats, s.formats)
+	p.SendQueryStatement(queued(s), st.eqb.ParamValues, st.eqb.ParamFormats, s.formats)
 	err = p.Sync()
 	if err == nil {
 		err = parsed(p, m, t, s)
@@ -651,7 +663,7 @@ func sendBatch(ctx context.Context, c *pgx.Conn, t *types, qs []barm.BatchQuery,
 			r.p.SendQueryParams(q.Query, st.eqb.ParamValues, nil, st.eqb.ParamFormats, nil)
 			continue
 		}
-		r.p.SendQueryStatement(&s.StatementDescription, st.eqb.ParamValues, st.eqb.ParamFormats, s.formats)
+		r.p.SendQueryStatement(queued(s), st.eqb.ParamValues, st.eqb.ParamFormats, s.formats)
 	}
 	for st.lru.Len() > st.capacity {
 		s, _ := st.lru.Back().Value.(*stmt)

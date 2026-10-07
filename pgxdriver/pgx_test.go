@@ -1331,6 +1331,50 @@ func TestPreparedInTxOnFullPool(t *testing.T) {
 	}
 }
 
+// A statement with no arguments skips the describe and is prepared in the
+// flush that runs it, so its rows arrive with a row description pgconn has to
+// expect. Inside a transaction a misread there would leave the one connection
+// unusable for everything after.
+func TestPreparedNoArgs(t *testing.T) {
+	db := openPool(t, 1)
+	seed(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	for i := range 2 { // prepared in the flush, then by name
+		us, err := db.Select[User]().OrderBy("age").Prepare("everyone").Slice(ctx)
+		if err != nil || len(us) != 3 {
+			t.Fatalf("pool, call %d: %+v, %v", i, us, err)
+		}
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for i := range 2 {
+		us, err := tx.Select[User]().OrderBy("age").Prepare("tx_everyone").Slice(ctx)
+		if err != nil || len(us) != 3 {
+			t.Fatalf("tx, call %d: %+v, %v", i, us, err)
+		}
+	}
+	if _, err := tx.Select[User]().Where("age = ?", 30).One(ctx); err != nil {
+		t.Fatalf("the transaction did not survive: %v", err)
+	}
+
+	// a batch prepares in its own flush the same way
+	b := tx.Batch()
+	all := b.Slice(tx.Select[User]().OrderBy("age").Prepare("batch_everyone"))
+	oldest := b.One(tx.Select[User]().OrderBy("age DESC").Prepare("batch_oldest"))
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if len(all.Value()) != 3 || oldest.Value().Name != "cy" {
+		t.Errorf("batch read %+v, %+v", all.Value(), oldest.Value())
+	}
+}
+
 // A statement the server has forgotten — DEALLOCATE, or a pooler resetting the
 // session — fails the call that finds out, and pgx drops it, so the next call
 // prepares it again rather than every call after failing.

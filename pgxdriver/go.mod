@@ -3,7 +3,7 @@ module github.com/sirkostya009/barm/pgxdriver
 go 1.27.0
 
 require (
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/sirkostya009/barm v0.0.0-20261007110015-66b51f7d9799
 )
 
