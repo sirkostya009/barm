@@ -31,6 +31,15 @@ type session struct {
 	dedup   bool
 	// The pool encodes JSON, or arrays, itself.
 	nativeJSON, nativeArrays bool
+	watch                    watch // what WithCallStats and WithCaller add to an event
+}
+
+func (s *session) startCall(ctx context.Context, t target, name, query string, args []any) (context.Context, *QueryEvent) {
+	return startQuery(ctx, s.hooks, s.watch, t, name, query, args)
+}
+
+func (s *session) unsent(ctx context.Context, t target, name, query string, args []any, err error) {
+	unsentQuery(ctx, s.hooks, s.watch, t, name, query, args, err)
 }
 
 // own returns a copy of the session with a transaction-hook list of its own, so
@@ -176,6 +185,21 @@ type Option func(*DB)
 // itself.
 func WithArgDedup() Option { return func(db *DB) { db.dedup = true } }
 
+// WithCallStats has the driver report on every call a hook watches, in the
+// event's CallStats: how long it waited for a connection, whether it had to
+// describe the statement first, and the backend that ran it.
+//
+// Off by default, as reporting changes how a driver works: pgxdriver takes a
+// connection from the pool itself, to time the wait, rather than leave that to
+// pgx. barm.SQL reports nothing either way.
+func WithCallStats() Option { return func(db *DB) { db.watch |= watchStats } }
+
+// WithCaller records where in your code each call a hook watches was made, in
+// the event's Caller: the first frame outside barm, which for a batch's query
+// is where it was queued. It walks the stack on every such call, a few hundred
+// nanoseconds once a call site has been seen.
+func WithCaller() Option { return func(db *DB) { db.watch |= watchCaller } }
+
 // WithHook registers a QueryHook. Hooks run in registration order before a
 // query and in reverse after it.
 func WithHook(hooks ...QueryHook) Option {
@@ -284,10 +308,10 @@ func (db *DB) Ping(ctx context.Context) error {
 // holds its connection until it ends, so one nobody finishes holds it for good.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	if db.pool == nil {
-		unsentQuery(ctx, db.hooks, opBegin, "", "BEGIN", nil, ErrNoConn)
+		db.unsent(ctx, opBegin, "", "BEGIN", nil, ErrNoConn)
 		return nil, ErrNoConn
 	}
-	c, ev := startQuery(ctx, db.hooks, opBegin, "", "BEGIN", nil)
+	c, ev := db.startCall(ctx, opBegin, "", "BEGIN", nil)
 	tx, err := db.pool.Begin(c, opts)
 	finishQuery(c, db.hooks, ev, nil, 0, err)
 	if err != nil {

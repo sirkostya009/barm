@@ -10,7 +10,11 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"reflect"
+	"runtime"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,17 +29,30 @@ type QueryEvent struct {
 	// select from an expression rather than a table name has no Table.
 	Table  string
 	Schema string
-	Query  string
-	Args   []any
+	// Relation names the relation a query loads, as Type.Field, and is empty
+	// for any query you wrote.
+	Relation string
+	Query    string
+	Args     []any
 	// Prepared is the name given to Prepare, if any.
 	Prepared string
+	// Caller is where in your code the call was made, with WithCaller: the first
+	// frame outside barm, or for a batch's query where it was queued. It is
+	// shared by every call from that place, so it must not be changed, and nil
+	// without WithCaller.
+	Caller *runtime.Frame
+	// BatchSize is how many queries went in the batch this one is part of, and
+	// BatchIndex its place among them. Both are zero outside a batch, and
+	// int32 so that the event fits the 256-byte allocation class.
+	BatchSize, BatchIndex int32
 	// StartedAt is when the call went to the database. It is zero for a call
 	// that never reached it, which reports no FirstResponse or Duration either.
 	StartedAt time.Time
 
 	// Set before AfterQuery runs.
-	Err    error
-	Result sql.Result // exec only
+	CallStats // what the driver reports, with WithCallStats
+	Err       error
+	Result    sql.Result // exec only
 	// Rows counts the rows read from the result. An exec reads none, and
 	// reports what it changed through Result.
 	Rows int64
@@ -43,13 +60,15 @@ type QueryEvent struct {
 	FirstResponse time.Duration
 	// Duration is how long until the rows were read and closed: the end of a Seq
 	// loop, or the Close of rows handed to the caller, the caller's own work
-	// included.
+	// included. Both include CallStats.Wait.
 	Duration time.Duration
+
+	call statsCtx // what the driver is handed, pointing at CallStats
 }
 
 // target is what a builder knows about its statement and raw SQL does not.
 type target struct {
-	op, table, schema string
+	op, table, schema, rel string
 }
 
 // The ops of the statements barm sends to begin and end transactions, named in
@@ -257,22 +276,89 @@ func (tx *Tx) afterRollback(ctx context.Context, ev *TxEvent, err error) {
 // returns a nil event when no hook is registered, which is the fast path: no
 // timestamp, no allocation. It takes the hooks rather than a runner because a
 // batch has queries but no runner.
-func startQuery(ctx context.Context, hooks []QueryHook, t target, name, query string, args []any) (context.Context, *QueryEvent) {
+func startQuery(ctx context.Context, hooks []QueryHook, w watch, t target, name, query string, args []any) (context.Context, *QueryEvent) {
 	if len(hooks) == 0 {
 		return ctx, nil
 	}
 	ev := newEvent(t, name, query, args)
+	if w&watchCaller != 0 {
+		ev.Caller = callerFrame() // ahead of the clock, so its cost is not the call's
+	}
 	ev.StartedAt = time.Now()
-	return beforeQuery(ctx, hooks, ev), ev
+	ctx = beforeQuery(ctx, hooks, ev)
+	if w&watchStats != 0 {
+		ctx = ev.report(ctx)
+	}
+	return ctx, ev
+}
+
+// watch is what an event records beyond the call itself, as options asked.
+type watch uint8
+
+const (
+	watchStats  watch = 1 << iota // CallStats, by WithCallStats
+	watchCaller                   // Caller, by WithCaller
+)
+
+// barmFuncs prefixes the names of barm's own functions, generic ones included.
+var barmFuncs = reflect.TypeFor[DB]().PkgPath() + "."
+
+// callerFrame is the first frame outside barm on the way to this call.
+func callerFrame() *runtime.Frame {
+	var pcs [32]uintptr
+	for _, pc := range pcs[:runtime.Callers(2, pcs[:])] {
+		if s := siteOf(pc); !s.barm {
+			return &s.frame
+		}
+	}
+	return nil
+}
+
+// callSite is what a return address resolves to: barm's own code, or the first
+// frame outside it, of the functions inlined there.
+type callSite struct {
+	frame runtime.Frame
+	barm  bool
+}
+
+// callSites caches each return address resolved, since resolving one costs
+// more than the query being watched: a program has only so many of them.
+var callSites sync.Map // uintptr → *callSite
+
+func siteOf(pc uintptr) *callSite {
+	if s, ok := callSites.Load(pc); ok {
+		return s.(*callSite) //nolint:forcetypeassert // callSites only ever stores *callSite
+	}
+	site := &callSite{barm: true}
+	frames := runtime.CallersFrames([]uintptr{pc})
+	for more := true; more; {
+		var f runtime.Frame
+		f, more = frames.Next()
+		if !strings.HasPrefix(f.Function, barmFuncs) {
+			site = &callSite{frame: f}
+			break
+		}
+	}
+	s, _ := callSites.LoadOrStore(pc, site)
+	return s.(*callSite) //nolint:forcetypeassert // callSites only ever stores *callSite
+}
+
+// report is the ctx to hand the driver, so it can report on the call.
+func (ev *QueryEvent) report(ctx context.Context) context.Context {
+	ev.call = statsCtx{ctx, &ev.CallStats}
+	return &ev.call
 }
 
 // unsentQuery fires both hooks for a call that never reached the database. It
 // has no round trip to time, so its times stay zero.
-func unsentQuery(ctx context.Context, hooks []QueryHook, t target, name, query string, args []any, err error) {
+func unsentQuery(ctx context.Context, hooks []QueryHook, w watch, t target, name, query string, args []any, err error) {
 	if len(hooks) == 0 {
 		return
 	}
 	ev := newEvent(t, name, query, args)
+	if w&watchCaller != 0 {
+		ev.Caller = callerFrame()
+	}
 	finishQuery(beforeQuery(ctx, hooks, ev), hooks, ev, nil, 0, err)
 }
 
@@ -280,6 +366,7 @@ func newEvent(t target, name, query string, args []any) *QueryEvent {
 	ev := &QueryEvent{
 		Op:       t.op,
 		Schema:   t.schema,
+		Relation: t.rel,
 		Query:    query,
 		Args:     slices.Clone(args), // a hook that masks a value in place must not change what is bound
 		Prepared: name,
@@ -329,10 +416,10 @@ func finishQuery(ctx context.Context, hooks []QueryHook, ev *QueryEvent, res sql
 func (r *runner) start(ctx context.Context, t target, query string, args []any) (context.Context, *QueryEvent, Executor, error) {
 	e, err := r.reach(query)
 	if err != nil {
-		unsentQuery(ctx, r.h.sess().hooks, t, r.name, query, args, err)
+		r.h.sess().unsent(ctx, t, r.name, query, args, err)
 		return ctx, nil, nil, err
 	}
-	ctx, ev := startQuery(ctx, r.h.sess().hooks, t, r.name, query, args)
+	ctx, ev := r.h.sess().startCall(ctx, t, r.name, query, args)
 	return ctx, ev, e, nil
 }
 

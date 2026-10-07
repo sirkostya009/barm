@@ -569,6 +569,9 @@ func (q *SelectQuery[T]) prepareRelations(rows []T) ([]*pending, error) {
 		if err != nil {
 			return nil, fmt.Errorf("barm: relation %q: %w", rel.field, err)
 		}
+		if w.t != nil { // a hook will read it
+			w.t.rel = m.typ.Name() + "." + rel.field
+		}
 	}
 	return level, nil
 }

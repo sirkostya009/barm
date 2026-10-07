@@ -852,6 +852,9 @@ func TestHookSeesTarget(t *testing.T) {
 		if ev := rec.events[i]; ev.Op != w.op || ev.Table != w.table || ev.Schema != w.schema {
 			t.Errorf("event %d = %s %q %q, want %s %q %q", i, ev.Op, ev.Table, ev.Schema, w.op, w.table, w.schema)
 		}
+		if ev := rec.events[i]; ev.CallStats != (barm.CallStats{}) {
+			t.Errorf("event %d: database/sql reported %+v, which it cannot know", i, ev.CallStats)
+		}
 	}
 }
 
@@ -3732,18 +3735,66 @@ func TestHookArgsAreACopy(t *testing.T) {
 func TestRelationHooksWithoutBatching(t *testing.T) {
 	ctx := t.Context()
 	var errs []error
+	var rels []string
 	db := openAuthors(t, barm.WithHook(barm.QueryHook{
-		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) { errs = append(errs, ev.Err) },
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+			errs, rels = append(errs, ev.Err), append(rels, ev.Relation)
+			if ev.BatchSize != 0 {
+				t.Errorf("%s: batch size %d outside a batch", ev.Query, ev.BatchSize)
+			}
+		},
 	}))
 	if _, err := db.Exec(ctx, `CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, label TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	errs = nil
+	errs, rels = nil, nil
 	if _, err := db.Select[Author]().Relation[Book]("Books").Relation[tagRow]("Tags").Slice(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if len(errs) != 3 || slices.ContainsFunc(errs, func(e error) bool { return e != nil }) {
 		t.Errorf("hooks saw %v, want three queries that ran fine", errs)
+	}
+	if want := []string{"", "Author.Books", "Author.Tags"}; !slices.Equal(rels, want) {
+		t.Errorf("relations = %q, want %q", rels, want)
+	}
+}
+
+// Relations batched together report which relation each loads, and where it
+// sat in the batch.
+func TestRelationHooksBatched(t *testing.T) {
+	ctx := t.Context()
+	sqldb, err := sql.Open("sqlite", "file:"+t.TempDir()+"/relb.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type seen struct {
+		rel         string
+		index, size int32
+	}
+	var got []seen
+	db := barm.New(barm.SQL(sqldb, barm.SQLite, barm.SequentialBatches()), barm.WithHook(barm.QueryHook{
+		AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+			got = append(got, seen{ev.Relation, ev.BatchIndex, ev.BatchSize})
+		},
+	}))
+	defer db.Close()
+	for _, q := range []string{
+		`CREATE TABLE authors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT)`,
+		`CREATE TABLE books (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, author_id INTEGER)`,
+		`CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, label TEXT)`,
+		`INSERT INTO authors (name, email) VALUES ('lem', 'l@x.io')`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got = nil
+	if _, err := db.Select[Author]().Relation[Book]("Books").Relation[tagRow]("Tags").Slice(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []seen{{"", 0, 0}, {"Author.Books", 0, 2}, {"Author.Tags", 1, 2}}
+	if !slices.Equal(got, want) {
+		t.Errorf("events = %+v, want %+v", got, want)
 	}
 }
 

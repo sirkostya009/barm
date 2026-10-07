@@ -1235,9 +1235,9 @@ unwinding like defers. The context `BeforeQuery` returns goes to the database ca
 
 `QueryEvent` has:
 
-- **Before the query:** `Op`, `Table`, `Schema`, `Query`, `Args`, `Prepared` (the `Prepare`
-  name) and `StartedAt`. `Args` is a copy, so a hook that masks a value in place changes
-  what it reports, not what is written.
+- **Before the query:** `Op`, `Table`, `Schema`, `Relation`, `Query`, `Args`, `Prepared`
+  (the `Prepare` name), `BatchSize`, `BatchIndex` and `StartedAt`. `Args` is a copy, so a
+  hook that masks a value in place changes what it reports, not what is written.
 - **After it:** `Err`, `Rows`, `FirstResponse`, `Duration` and, for execs, `Result`.
 
 A builder fills `Op` (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), `Table` and `Schema` from
@@ -1245,6 +1245,11 @@ what it was built with, not from its SQL, so a `WITH` clause does not change `Op
 reports its leading keyword as `Op`, with no table or schema. A select from an expression
 rather than a table name has no `Table`. That is what a tracing hook needs for
 `db.operation.name`, `db.collection.name` and a short span name.
+
+`Relation` names the relation a query loads, as `Type.Field` (`Author.Books`), so loading
+can be told apart from the queries you wrote. `BatchSize` is how many queries went in the
+batch a query is part of, for `db.operation.batch.size`, and `BatchIndex` its place there.
+Both are zero outside a batch.
 
 When events finish:
 
@@ -1272,6 +1277,29 @@ When events finish:
 `FirstResponse` is how long the database took to start answering, and `Duration` how long
 until the event finished. Between the two is the time spent receiving and reading the rows,
 which for `Seq`, `Rows` and `Query` includes your own code between them.
+
+With `barm.WithCallStats()`, the event also carries `CallStats`, what the driver reports
+about the call. pgxdriver fills all of it, and `barm.SQL` none of it. It is off by default
+because it changes how pgxdriver works: to time the wait, it takes a connection from the
+pool itself rather than leave that to pgx.
+
+- **`Wait`** is how long the call waited for a pool connection. `FirstResponse` and
+  `Duration` include it, so subtract it for the database's own time. In a batch it goes on
+  the first query, since the batch waited before any of them.
+- **`Described`** says the statement's parameter types had to be asked for first, a round
+  trip of its own. It happens once per statement per pool, for named statements and batches.
+- **`PID`** is the Postgres backend that ran the call, to find it in `pg_stat_activity` and
+  the server logs.
+
+A driver reports through `barm.CallStatsFrom(ctx)`, nil unless a hook watches the call and
+`WithCallStats` asked for it.
+
+With `barm.WithCaller()`, `Caller` is where in your code the call was made: the first stack
+frame outside barm, a `*runtime.Frame` with the function, file and line, shared by every
+call from that place and nil without the option. A batch's query
+reports where it was queued. That fills `code.function.name`, `code.file.path` and
+`code.line.number`. It walks the stack on every watched call, a few hundred nanoseconds
+once a call site has been seen.
 
 With no hook registered, hooks cost nothing: no timestamp, no allocation.
 

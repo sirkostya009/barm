@@ -84,7 +84,7 @@ func (c *Conn) Batch() *Batch { return newBatch(c.c, &c.session, false, true) }
 // BeginTx starts a transaction on this connection. The connection stays the
 // caller's — Close is still the only thing that gives it back.
 func (c *Conn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	bc, ev := startQuery(ctx, c.hooks, opBegin, "", "BEGIN", nil)
+	bc, ev := c.startCall(ctx, opBegin, "", "BEGIN", nil)
 	tx, err := c.c.Begin(bc, opts)
 	finishQuery(bc, c.hooks, ev, nil, 0, err)
 	if err != nil {

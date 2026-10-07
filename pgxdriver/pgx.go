@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -57,21 +58,61 @@ type pool struct {
 func (p *pool) NativeJSON() bool   { return p.typed }
 func (p *pool) NativeArrays() bool { return p.typed }
 
+// acquire takes a connection for a call, reporting how long it took to get and
+// whose it is when a hook watches.
+func (p *pool) acquire(ctx context.Context, s *barm.CallStats) (*pgxpool.Conn, error) {
+	if s == nil {
+		return p.p.Acquire(ctx)
+	}
+	start := time.Now()
+	c, err := p.p.Acquire(ctx)
+	s.Wait = time.Since(start)
+	if err == nil {
+		s.PID = c.Conn().PgConn().PID()
+	}
+	return c, err
+}
+
+// Query leaves the connection to pgx's pool unless a hook watches, which takes
+// it here, as the pool would, to see the wait for it.
 func (p *pool) Query(ctx context.Context, query string, args []any) (barm.Rows, error) {
-	rows, err := p.p.Query(ctx, query, args...)
+	s := barm.CallStatsFrom(ctx)
+	if s == nil {
+		rows, err := p.p.Query(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		return pgxRows{rows}, nil
+	}
+	c, err := p.acquire(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	return pgxRows{rows}, nil
+	rows, err := c.Query(ctx, query, args...)
+	if err != nil {
+		c.Release()
+		return nil, err
+	}
+	return &pooledRows{pgxRows{rows}, c}, nil
 }
 
 func (p *pool) Exec(ctx context.Context, query string, args []any) (sql.Result, error) {
-	tag, err := p.p.Exec(ctx, query, args...)
+	s := barm.CallStatsFrom(ctx)
+	if s == nil {
+		tag, err := p.p.Exec(ctx, query, args...)
+		return result(tag.RowsAffected()), err
+	}
+	c, err := p.acquire(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+	tag, err := c.Exec(ctx, query, args...)
 	return result(tag.RowsAffected()), err
 }
 
 func (p *pool) QueryPrepared(ctx context.Context, name, query string, args []any) (barm.Rows, error) {
-	c, err := p.p.Acquire(ctx)
+	c, err := p.acquire(ctx, barm.CallStatsFrom(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +126,7 @@ func (p *pool) QueryPrepared(ctx context.Context, name, query string, args []any
 }
 
 func (p *pool) ExecPrepared(ctx context.Context, name, query string, args []any) (sql.Result, error) {
-	c, err := p.p.Acquire(ctx)
+	c, err := p.acquire(ctx, barm.CallStatsFrom(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +135,7 @@ func (p *pool) ExecPrepared(ctx context.Context, name, query string, args []any)
 }
 
 func (p *pool) SendBatch(ctx context.Context, qs []barm.BatchQuery, read func(barm.BatchReader) error) error {
-	c, err := p.p.Acquire(ctx)
+	c, err := p.acquire(ctx, barm.CallStatsFrom(ctx))
 	if err != nil {
 		return err
 	}
@@ -115,11 +156,24 @@ func (p *pool) Begin(ctx context.Context, opts *sql.TxOptions) (barm.DriverTx, e
 	if err != nil {
 		return nil, err
 	}
-	t, err := p.p.BeginTx(ctx, o)
+	s := barm.CallStatsFrom(ctx)
+	if s == nil {
+		t, err := p.p.BeginTx(ctx, o)
+		if err != nil {
+			return nil, err
+		}
+		return &tx{t: t, ts: p.t}, nil
+	}
+	c, err := p.acquire(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	return &tx{t, p.t}, nil
+	t, err := c.BeginTx(ctx, o)
+	if err != nil {
+		c.Release()
+		return nil, err
+	}
+	return &tx{t: t, ts: p.t, c: c}, nil
 }
 
 func (p *pool) Ping(ctx context.Context) error { return p.p.Ping(ctx) }
@@ -139,7 +193,15 @@ type conn struct {
 	t *types
 }
 
+// pid reports the backend that runs a call when a hook watches it.
+func pid(ctx context.Context, c *pgx.Conn) {
+	if s := barm.CallStatsFrom(ctx); s != nil {
+		s.PID = c.PgConn().PID()
+	}
+}
+
 func (c *conn) Query(ctx context.Context, query string, args []any) (barm.Rows, error) {
+	pid(ctx, c.c.Conn())
 	rows, err := c.c.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -148,11 +210,13 @@ func (c *conn) Query(ctx context.Context, query string, args []any) (barm.Rows, 
 }
 
 func (c *conn) Exec(ctx context.Context, query string, args []any) (sql.Result, error) {
+	pid(ctx, c.c.Conn())
 	tag, err := c.c.Exec(ctx, query, args...)
 	return result(tag.RowsAffected()), err
 }
 
 func (c *conn) QueryPrepared(ctx context.Context, name, query string, args []any) (barm.Rows, error) {
+	pid(ctx, c.c.Conn())
 	rows, err := queryNamed(ctx, c.c.Conn(), c.t, name, query, args)
 	if err != nil {
 		return nil, err
@@ -161,10 +225,12 @@ func (c *conn) QueryPrepared(ctx context.Context, name, query string, args []any
 }
 
 func (c *conn) ExecPrepared(ctx context.Context, name, query string, args []any) (sql.Result, error) {
+	pid(ctx, c.c.Conn())
 	return execNamed(ctx, c.c.Conn(), c.t, name, query, args)
 }
 
 func (c *conn) SendBatch(ctx context.Context, qs []barm.BatchQuery, read func(barm.BatchReader) error) error {
+	pid(ctx, c.c.Conn())
 	return sendBatch(ctx, c.c.Conn(), c.t, qs, read)
 }
 
@@ -173,11 +239,12 @@ func (c *conn) Begin(ctx context.Context, opts *sql.TxOptions) (barm.DriverTx, e
 	if err != nil {
 		return nil, err
 	}
+	pid(ctx, c.c.Conn())
 	t, err := c.c.BeginTx(ctx, o)
 	if err != nil {
 		return nil, err
 	}
-	return &tx{t, c.t}, nil
+	return &tx{t: t, ts: c.t}, nil
 }
 
 func (c *conn) Release() error {
@@ -189,9 +256,11 @@ func (c *conn) Release() error {
 type tx struct {
 	t  pgx.Tx
 	ts *types
+	c  *pgxpool.Conn // taken from the pool for it, to give back when it ends
 }
 
 func (t *tx) Query(ctx context.Context, query string, args []any) (barm.Rows, error) {
+	pid(ctx, t.t.Conn())
 	rows, err := t.t.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -200,11 +269,13 @@ func (t *tx) Query(ctx context.Context, query string, args []any) (barm.Rows, er
 }
 
 func (t *tx) Exec(ctx context.Context, query string, args []any) (sql.Result, error) {
+	pid(ctx, t.t.Conn())
 	tag, err := t.t.Exec(ctx, query, args...)
 	return result(tag.RowsAffected()), err
 }
 
 func (t *tx) QueryPrepared(ctx context.Context, name, query string, args []any) (barm.Rows, error) {
+	pid(ctx, t.t.Conn())
 	rows, err := queryNamed(ctx, t.t.Conn(), t.ts, name, query, args)
 	if err != nil {
 		return nil, err
@@ -213,15 +284,37 @@ func (t *tx) QueryPrepared(ctx context.Context, name, query string, args []any) 
 }
 
 func (t *tx) ExecPrepared(ctx context.Context, name, query string, args []any) (sql.Result, error) {
+	pid(ctx, t.t.Conn())
 	return execNamed(ctx, t.t.Conn(), t.ts, name, query, args)
 }
 
 func (t *tx) SendBatch(ctx context.Context, qs []barm.BatchQuery, read func(barm.BatchReader) error) error {
+	pid(ctx, t.t.Conn())
 	return sendBatch(ctx, t.t.Conn(), t.ts, qs, read)
 }
 
-func (t *tx) Commit(ctx context.Context) error   { return t.t.Commit(ctx) }
-func (t *tx) Rollback(ctx context.Context) error { return t.t.Rollback(ctx) }
+func (t *tx) Commit(ctx context.Context) error {
+	pid(ctx, t.t.Conn())
+	err := t.t.Commit(ctx)
+	t.release()
+	return err
+}
+
+func (t *tx) Rollback(ctx context.Context) error {
+	pid(ctx, t.t.Conn())
+	err := t.t.Rollback(ctx)
+	t.release()
+	return err
+}
+
+// release gives back the connection taken for the transaction, as pgx's pool
+// does with its own once one ends.
+func (t *tx) release() {
+	if t.c != nil {
+		t.c.Release()
+		t.c = nil
+	}
+}
 
 func txOptions(opts *sql.TxOptions) (pgx.TxOptions, error) {
 	var o pgx.TxOptions
@@ -489,6 +582,9 @@ func queryNamed(ctx context.Context, c *pgx.Conn, t *types, name, query string, 
 	if s == nil {
 		s = newStmt(m, t, name, query)
 		if !s.typed && len(args) > 0 {
+			if cs := barm.CallStatsFrom(ctx); cs != nil {
+				cs.Described = true
+			}
 			err := describe(ctx, pc, m, t, []*stmt{s}, false)
 			if err != nil {
 				return nil, err
@@ -614,6 +710,7 @@ func sendBatch(ctx context.Context, c *pgx.Conn, t *types, qs []barm.BatchQuery,
 			r.steps[i].prepare = true
 			if !s.typed && len(q.Args) > 0 {
 				unknown = append(unknown, s)
+				r.steps[i].described = true
 			}
 		case s.lru != nil:
 			st.lru.MoveToFront(s.lru)
@@ -698,8 +795,9 @@ func sendBatch(ctx context.Context, c *pgx.Conn, t *types, qs []barm.BatchQuery,
 
 // step is how one query of a batch goes out.
 type step struct {
-	s       *stmt // nil for a statement not kept
-	prepare bool  // parsed in the batch's own pipeline
+	s         *stmt // nil for a statement not kept
+	prepare   bool  // parsed in the batch's own pipeline
+	described bool  // its types asked for in a round trip ahead of the batch
 }
 
 type reader struct {
@@ -722,6 +820,10 @@ func (r *reader) next() (*pgconn.ResultReader, error) {
 	return readResult(r.p)
 }
 
+// Described reports whether the statement whose result was read last had its
+// types asked for ahead of the batch.
+func (r *reader) Described() bool { return r.i > 0 && r.steps[r.i-1].described }
+
 func (r *reader) Rows() (barm.Rows, error) {
 	rr, err := r.next()
 	if err != nil {
@@ -737,6 +839,30 @@ func (r *reader) Exec() (barm.ExecResult, error) {
 	}
 	tag, err := rr.Close()
 	return barm.ExecResult{RowsAffected: tag.RowsAffected()}, err
+}
+
+// pooledRows hold the connection taken for them, and give it back once read to
+// the end or closed, as pgx's pool does with its own.
+type pooledRows struct {
+	pgxRows
+	c *pgxpool.Conn
+}
+
+func (r *pooledRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	_ = r.Close()
+	return false
+}
+
+func (r *pooledRows) Close() error {
+	r.Rows.Close()
+	if r.c != nil {
+		r.c.Release()
+		r.c = nil
+	}
+	return r.Err()
 }
 
 // pgxRows presents pgx.Rows as barm.Rows.

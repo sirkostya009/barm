@@ -73,6 +73,11 @@ name too, and lets the driver decide the rest. On pgx that means the pool's
 `DefaultQueryExecMode` — pgx's statement cache unless configured otherwise — is
 how a plain query runs; barm never overrides it.
 
+While a hook watches a call on a DB opened `WithCallStats`, the ctx barm passes
+carries somewhere to report on it, `CallStatsFrom(ctx)`, which is a type check
+on that ctx: a driver asks with the ctx it was given, and does nothing extra
+when it gets nil.
+
 Batches and named queries on pgx are the driver's own pipelines, because pgx's
 batch spends a round trip describing statements and another on a savepoint that
 must exist before anything can fail. Every batch is one round trip: Postgres runs

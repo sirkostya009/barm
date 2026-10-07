@@ -130,7 +130,7 @@ func (tx *Tx) WithTxHook(hooks ...TxHook) *Tx {
 
 // control sends a savepoint statement under the query hooks, as any query is.
 func (tx *Tx) control(ctx context.Context, op target, stmt string) error {
-	ctx, ev := startQuery(ctx, tx.hooks, op, "", stmt, nil)
+	ctx, ev := tx.startCall(ctx, op, "", stmt, nil)
 	res, err := tx.tx.Exec(ctx, stmt, nil)
 	finishQuery(ctx, tx.hooks, ev, res, 0, err)
 	return err
@@ -165,7 +165,7 @@ func (tx *Tx) Commit() error {
 		return err
 	}
 	*tx.done = true
-	c, qev := startQuery(context.WithoutCancel(ctx), tx.hooks, opCommit, "", "COMMIT", nil)
+	c, qev := tx.startCall(context.WithoutCancel(ctx), opCommit, "", "COMMIT", nil)
 	err = tx.tx.Commit(c)
 	finishQuery(c, tx.hooks, qev, nil, 0, err)
 	tx.afterCommit(ctx, ev, n, err)
@@ -200,7 +200,7 @@ func (tx *Tx) Rollback() error {
 		}
 	} else {
 		*tx.done = true
-		c, qev := startQuery(context.WithoutCancel(ctx), tx.hooks, opRollback, "", "ROLLBACK", nil)
+		c, qev := tx.startCall(context.WithoutCancel(ctx), opRollback, "", "ROLLBACK", nil)
 		err = tx.tx.Rollback(c)
 		finishQuery(c, tx.hooks, qev, nil, 0, err)
 	}

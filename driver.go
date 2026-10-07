@@ -9,6 +9,7 @@ package barm
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 // Executor runs statements on whatever a driver hands barm: the pool, one
@@ -72,4 +73,35 @@ type DriverTx interface {
 	Executor
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
+}
+
+// CallStats is what a driver tells the hooks about one call, beyond its result.
+// A driver fills what it knows and leaves the rest zero.
+type CallStats struct {
+	// Wait is how long the call waited for a connection from the pool.
+	Wait time.Duration
+	// Described says the statement's parameter types had to be asked of the
+	// database first, in a round trip of its own.
+	Described bool
+	// PID is the server process that ran the call, to find it in the server's
+	// own logs and activity.
+	PID uint32
+}
+
+// CallStatsFrom is where a driver reports on the call it was handed ctx for,
+// and nil unless a hook watches it with WithCallStats, which is when to skip
+// measuring. It checks
+// ctx itself rather than walking up its values, so it costs a type check, and
+// a driver asks with the ctx barm passed rather than one derived from it.
+func CallStatsFrom(ctx context.Context) *CallStats {
+	if c, ok := ctx.(*statsCtx); ok {
+		return c.s
+	}
+	return nil
+}
+
+// statsCtx is the ctx barm hands a driver for a call a hook watches.
+type statsCtx struct {
+	context.Context
+	s *CallStats
 }

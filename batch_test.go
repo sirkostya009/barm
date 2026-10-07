@@ -221,6 +221,9 @@ func TestBatchFiresQueryHooks(t *testing.T) {
 		if ev.Query == "" {
 			t.Errorf("event %d has no query", i)
 		}
+		if ev.BatchSize != 3 || int(ev.BatchIndex) != i {
+			t.Errorf("event %d: batch %d of %d, want %d of 3", i, ev.BatchIndex, ev.BatchSize, i)
+		}
 	}
 	// The first failed, so the second never ran and says so.
 	if got[0].Err == nil || !errors.Is(got[1].Err, barm.ErrNotRun) {

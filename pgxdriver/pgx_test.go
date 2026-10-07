@@ -3086,3 +3086,183 @@ func TestCompositeRelationKeyNotSelected(t *testing.T) {
 		t.Errorf("pages = %v, want %v", got, want)
 	}
 }
+
+// statsRec keeps the events of the calls it watches.
+type statsRec struct {
+	mu  sync.Mutex
+	evs []barm.QueryEvent
+}
+
+// hook watches every call, asking the driver to report on each.
+func (r *statsRec) hook() []barm.Option {
+	return []barm.Option{barm.WithCallStats(), barm.WithHook(barm.QueryHook{AfterQuery: func(_ context.Context, ev *barm.QueryEvent) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.evs = append(r.evs, *ev)
+	}})}
+}
+
+func (r *statsRec) take() []barm.QueryEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	evs := r.evs
+	r.evs = nil
+	return evs
+}
+
+type pidRow struct {
+	PID int64 `barm:"pid"`
+}
+
+// backendPID reads the backend that ran the query out of its own result, and
+// checks the event reported the same one.
+func backendPID(t *testing.T, rec *statsRec, what string, read func() (int64, error)) {
+	t.Helper()
+	rec.take()
+	pid, err := read()
+	if err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	evs := rec.take()
+	if len(evs) == 0 {
+		t.Fatalf("%s: no event", what)
+	}
+	if got := evs[len(evs)-1].PID; got == 0 || int64(got) != pid {
+		t.Errorf("%s: reported backend %d, ran on %d", what, got, pid)
+	}
+}
+
+// Every path reports the backend that ran it: the pool's, a held connection's
+// and a transaction's, plain or named.
+func TestCallStatsPID(t *testing.T) {
+	ctx := t.Context()
+	var rec statsRec
+	db := open(t, rec.hook()...)
+	const q = "(SELECT pg_backend_pid() AS pid) AS p"
+	one := func(h barm.IDB, name string) func() (int64, error) {
+		return func() (int64, error) {
+			r, err := barm.Handle{IDB: h}.Select[pidRow]().Table(q).Prepare(name).One(ctx)
+			return r.PID, err
+		}
+	}
+	rows := func(h barm.IDB) func() (int64, error) {
+		return func() (int64, error) {
+			rows, err := barm.Handle{IDB: h}.Select[pidRow]().Table(q).Rows(ctx)
+			if err != nil {
+				return 0, err
+			}
+			var pid int64
+			for rows.Next() {
+				err = rows.Scan(&pid)
+			}
+			return pid, errors.Join(err, rows.Close())
+		}
+	}
+	backendPID(t, &rec, "pool", rows(db))
+	backendPID(t, &rec, "pool, named", one(db, "pid_pool"))
+
+	c, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	backendPID(t, &rec, "conn", rows(c))
+	backendPID(t, &rec, "conn, named", one(c, "pid_conn"))
+
+	rec.take()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	begin := rec.take()
+	backendPID(t, &rec, "tx", rows(tx))
+	backendPID(t, &rec, "tx, named", one(tx, "pid_tx"))
+	pid, err := one(tx, "pid_tx")()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.take()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	commit := rec.take()
+	if len(begin) != 1 || int64(begin[0].PID) != pid || len(commit) != 1 || int64(commit[0].PID) != pid {
+		t.Errorf("BEGIN %+v and COMMIT %+v, want both on %d", begin, commit, pid)
+	}
+}
+
+// A call waiting for the pool's only connection reports how long it waited,
+// and still gives the connection back.
+func TestCallStatsWait(t *testing.T) {
+	// Every call shares the one connection, so one that keeps it fails the
+	// next on this deadline rather than hanging.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var rec statsRec
+	db := openPool(t, 1, rec.hook()...)
+	const held = 50 * time.Millisecond
+	for _, call := range []struct {
+		what string
+		run  func() error
+	}{
+		{"exec", func() error { _, err := db.Exec(ctx, "SELECT 1"); return err }},
+		{"query", func() error { _, err := db.Select[User]().Slice(ctx); return err }},
+		{"begin", func() error {
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			return tx.Commit()
+		}},
+	} {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.take()
+		time.AfterFunc(held, func() { c.Close() })
+		if err := call.run(); err != nil {
+			t.Fatalf("%s: %v", call.what, err)
+		}
+		if evs := rec.take(); len(evs) == 0 || evs[0].Wait < held || evs[0].PID == 0 {
+			t.Errorf("%s: %+v, want a wait of at least %s", call.what, evs, held)
+		}
+	}
+	if _, err := db.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("the connection was not given back: %v", err)
+	}
+}
+
+// A statement with arguments new to the pool is described once, and says so.
+func TestCallStatsDescribed(t *testing.T) {
+	ctx := t.Context()
+	var rec statsRec
+	db := open(t, rec.hook()...)
+	seed(t, db)
+	for i, want := range []bool{true, false} {
+		rec.take()
+		if _, err := db.Select[User]().Where("age > ?", 1).Prepare("described").Slice(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if evs := rec.take(); len(evs) != 1 || evs[0].Described != want {
+			t.Errorf("named, run %d: described %v, want %v", i, evs[0].Described, want)
+		}
+	}
+	for i, want := range []bool{true, false} {
+		rec.take()
+		b := db.Batch()
+		b.Exec(db.NewRaw("SELECT 1"))
+		b.Slice(db.Select[User]().Where("age < ?", 100))
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		evs := rec.take()
+		if len(evs) != 2 || evs[0].Described || evs[1].Described != want {
+			t.Fatalf("batch, run %d: %+v, want only the second described: %v", i, evs, want)
+		}
+		if evs[0].PID == 0 || evs[1].PID != evs[0].PID || evs[1].Wait != 0 {
+			t.Errorf("batch, run %d: %+v, want one backend and the wait on the first only", i, evs)
+		}
+	}
+}
