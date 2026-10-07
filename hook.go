@@ -314,8 +314,9 @@ func callerFrame() *runtime.Frame {
 	return nil
 }
 
-// callSite is what a return address resolves to: barm's own code, or the first
-// frame outside it, of the functions inlined there.
+// callSite is what a return address resolves to: barm's own code, or the frame
+// outside it. runtime.Callers gives an inlined call an address of its own, so
+// one address is one frame.
 type callSite struct {
 	frame runtime.Frame
 	barm  bool
@@ -329,16 +330,8 @@ func siteOf(pc uintptr) *callSite {
 	if s, ok := callSites.Load(pc); ok {
 		return s.(*callSite) //nolint:forcetypeassert // callSites only ever stores *callSite
 	}
-	site := &callSite{barm: true}
-	frames := runtime.CallersFrames([]uintptr{pc})
-	for more := true; more; {
-		var f runtime.Frame
-		f, more = frames.Next()
-		if !strings.HasPrefix(f.Function, barmFuncs) {
-			site = &callSite{frame: f}
-			break
-		}
-	}
+	f, _ := runtime.CallersFrames([]uintptr{pc}).Next()
+	site := &callSite{frame: f, barm: strings.HasPrefix(f.Function, barmFuncs)}
 	s, _ := callSites.LoadOrStore(pc, site)
 	return s.(*callSite) //nolint:forcetypeassert // callSites only ever stores *callSite
 }

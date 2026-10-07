@@ -278,3 +278,17 @@ func TestHookCaller(t *testing.T) {
 		t.Errorf("without WithCaller: %+v", got)
 	}
 }
+
+// Once a call site has been seen, recording it costs no allocation: a cache
+// that stopped working would resolve the stack again on every call.
+func TestHookCallerAllocs(t *testing.T) { //nolint:paralleltest // AllocsPerRun counts every goroutine's allocations
+	ctx := t.Context()
+	hook := barm.WithHook(barm.QueryHook{AfterQuery: func(context.Context, *barm.QueryEvent) {}})
+	allocs := func(opts ...barm.Option) float64 {
+		db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres), opts...)
+		return testing.AllocsPerRun(100, func() { _, _ = db.Select[User]().One(ctx) })
+	}
+	if without, with := allocs(hook), allocs(hook, barm.WithCaller()); with != without {
+		t.Errorf("a query allocates %v times with WithCaller and %v without", with, without)
+	}
+}
