@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -280,5 +281,88 @@ func TestBatchFirstResponse(t *testing.T) {
 	// The second starts when barm turns to it, once the first is read.
 	if end := got[0].StartedAt.Add(got[0].Duration); got[1].StartedAt.Before(end) {
 		t.Errorf("second started %s before the first ended", end.Sub(got[1].StartedAt))
+	}
+}
+
+type batchUserName struct {
+	Name string `barm:"name"`
+}
+
+type newBatchUser struct {
+	Name  string `barm:"name"`
+	Email string `barm:"email"`
+}
+
+type batchAuthor struct {
+	barm.BaseModel `barm:"table:authors"`
+
+	ID    int64       `barm:"id,pk"`
+	Books []batchBook `barm:"rel:id=author_id"`
+}
+
+type batchBook struct {
+	barm.BaseModel `barm:"table:books"`
+
+	AuthorID int64 `barm:"author_id"`
+}
+
+// The As calls queue a query rendered for the type its rows are read into, as
+// the query's own As terminals render it.
+func TestBatchAsRendersForTheResult(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{}
+	db := stubbed(stub)
+	ins := db.Insert[newBatchUser]().Table("batch_users").Values(&newBatchUser{Name: "a", Email: "a@x"})
+	sel := db.Select[batchUser]().Where("age > ?", 1).Limit(10)
+	upd := db.Update[batchUser]().Set("age = age + 1").Where("age > ?", 1)
+	del := db.Delete[batchUser]().Where("age > ?", 1)
+	raw := db.NewRaw("SELECT max(age) FROM batch_users WHERE age > ?", 1)
+
+	b := db.Batch()
+	b.OneAs[batchUser](ins)
+	b.OneAs[batchUserName](sel)
+	b.SliceAs[batchUserName](sel)
+	b.SliceAs[batchUser](upd)
+	b.SliceAs[batchUser](del)
+	b.OneAs[int64](raw)
+	_ = b.Run(t.Context())
+
+	for i, build := range []func() (string, []any, error){
+		func() (string, []any, error) { return ins.BuildAs[batchUser]() },
+		func() (string, []any, error) { return sel.Clone().Limit(1).BuildAs[batchUserName]() },
+		func() (string, []any, error) { return sel.BuildAs[batchUserName]() },
+		func() (string, []any, error) { return upd.BuildAs[batchUser]() },
+		func() (string, []any, error) { return del.BuildAs[batchUser]() },
+		raw.Build,
+	} {
+		query, args, err := build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i >= len(stub.sent) {
+			t.Fatalf("sent %d queries, want %d", len(stub.sent), i+1)
+		}
+		if got := stub.sent[i]; got.Query != query || len(got.Args) != len(args) {
+			t.Errorf("query %d = %q %v, want %q %v", i, got.Query, got.Args, query, args)
+		}
+	}
+	if q, _, _ := sel.Build(); !strings.Contains(q, "LIMIT 10") {
+		t.Errorf("queueing changed the query it was given: %q", q)
+	}
+}
+
+// A batch loads relations through One and Slice, so the As calls refuse a
+// select that asks for them rather than leave them unloaded.
+func TestBatchAsRefusesRelations(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{})
+	b := db.Batch()
+	r := b.SliceAs[batchAuthor](db.Select[batchAuthor]().Relation[batchBook]("Books"))
+	err := b.Err()
+	if err == nil || !strings.Contains(err.Error(), "relations") {
+		t.Errorf("queue error = %v, want one about relations", err)
+	}
+	if r.Err() == nil {
+		t.Error("the result carries no error")
 	}
 }

@@ -1525,6 +1525,7 @@ func TestHandleAcceptsEveryKind(t *testing.T) {
 		_ = h.Insert[User]()
 		_ = h.Update[User]()
 		_ = h.Delete[User]()
+		_ = h.Batch()
 	}
 	// Every builder returning a User satisfies TypedQuery[User].
 	_ = func(dbh *barm.DB) {

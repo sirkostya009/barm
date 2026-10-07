@@ -190,24 +190,8 @@ type relLoad struct {
 // Slice queues the query and collects its rows. Its relations load once the
 // batch is done, together with every other query's, a round trip per depth.
 func (b *Batch) Slice[U any](q *SelectQuery[U]) *BatchResult[[]U] {
-	r := newResult[[]U]()
 	query, args, err := q.Build()
-
-	b.queue(q.target(), q.name, query, args, err, item{
-		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, int64, error) {
-			rows, err := br.Rows()
-			if err != nil {
-				r.err = err
-				return nil, 0, err
-			}
-			defer rows.Close()
-
-			v, err := scanSlice[U](rows, q.limit)
-			r.set(v, err)
-			return nil, int64(len(v)), err
-		},
-	})
+	r := queueSlice[U](b, q.target(), q.name, query, args, err, q.limit)
 	if len(q.rels) > 0 {
 		b.rels = append(b.rels, relLoad{
 			prepare: func() ([]*pending, error) { return q.prepareRelations(r.v) },
@@ -250,6 +234,64 @@ func (b *Batch) Count[T any](q *SelectQuery[T]) *BatchResult[int64] {
 func (b *Batch) Exists[T any](q *SelectQuery[T]) *BatchResult[bool] {
 	query, args, err := q.ExistsQuery()
 	return queueRow[bool](b, q.target(), "", query, args, err)
+}
+
+var errBatchAsRelations = errors.New("barm: a batch loads relations through One and Slice, not OneAs and SliceAs")
+
+// asQuery is a query whose SQL depends on what its rows are read into: a select
+// narrows its columns to the result, a write returns them.
+type asQuery interface {
+	batchAs(m *model, err error, one bool) (string, []any, error)
+}
+
+func buildAs[U any](q Query, one bool) (string, []any, error) {
+	a, ok := q.(asQuery)
+	if !ok {
+		return q.Build()
+	}
+	m, err := modelOf[U]()
+	return a.batchAs(m, err, one)
+}
+
+// OneAs queues any query and reads its first row into U, or ErrNoRows. It is
+// the batch's form of the builders' OneAs: a select narrows to U's columns and
+// runs with LIMIT 1, a write returns U's columns, and a raw query is read as
+// written.
+//
+//	b.OneAs[User](db.Insert[CreateUser]().Table("users").Values(&in))
+//
+// A select's relations load through One, so they are an error here.
+func (b *Batch) OneAs[U any](q Query) *BatchResult[U] {
+	query, args, err := buildAs[U](q, true)
+	return queueRow[U](b, targetOf(q), stmtName(q), query, args, err)
+}
+
+// SliceAs queues any query and collects its rows as U, rendered as OneAs
+// renders it, without the LIMIT.
+func (b *Batch) SliceAs[U any](q Query) *BatchResult[[]U] {
+	query, args, err := buildAs[U](q, false)
+	return queueSlice[U](b, targetOf(q), stmtName(q), query, args, err, 0)
+}
+
+// queueSlice queues a query read as all its rows, hint being how many to expect.
+func queueSlice[U any](b *Batch, t target, name, query string, args []any, err error, hint int64) *BatchResult[[]U] {
+	r := newResult[[]U]()
+	b.queue(t, name, query, args, err, item{
+		fail: func(err error) { r.err = err },
+		read: func(br BatchReader) (sql.Result, int64, error) {
+			rows, err := br.Rows()
+			if err != nil {
+				r.err = err
+				return nil, 0, err
+			}
+			defer rows.Close()
+
+			v, err := scanSlice[U](rows, hint)
+			r.set(v, err)
+			return nil, int64(len(v)), err
+		},
+	})
+	return r
 }
 
 // queueRow queues a query read as a single row, its first.

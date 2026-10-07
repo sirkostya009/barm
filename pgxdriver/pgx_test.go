@@ -1710,6 +1710,84 @@ func TestRawInBatch(t *testing.T) {
 	}
 }
 
+type newUser struct {
+	Name      string    `barm:"name"`
+	Email     string    `barm:"email"`
+	Age       int       `barm:"age"`
+	CreatedAt time.Time `barm:"created_at"`
+}
+
+type userName struct {
+	Name string `barm:"name"`
+}
+
+// The As calls read any query's rows into a type of the caller's choosing: an
+// insert of a sub-model returns the whole row, a select reads what it narrows to.
+func TestBatchAs(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+
+	b := db.Batch()
+	dee := b.OneAs[User](db.Insert[newUser]().
+		Table("batch_users").
+		Values(&newUser{Name: "dee", Email: "d@x.io", Age: 50, CreatedAt: time.Now()}))
+	names := b.SliceAs[userName](db.Select[User]().OrderBy("age"))
+	oldest := b.OneAs[int](db.NewRaw("SELECT max(age) FROM batch_users"))
+	gone := b.SliceAs[User](db.Delete[User]().Where("age < ?", 25))
+	if err := b.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if u := dee.Value(); u.ID == 0 || u.Name != "dee" || u.Age != 50 {
+		t.Errorf("inserted = %+v", u)
+	}
+	if got := names.Value(); len(got) != 4 || got[0].Name != "ann" || got[3].Name != "dee" {
+		t.Errorf("names = %+v", got)
+	}
+	if oldest.Value() != 50 {
+		t.Errorf("oldest = %d, want 50", oldest.Value())
+	}
+	if got := gone.Value(); len(got) != 1 || got[0].ID == 0 || got[0].Name != "ann" {
+		t.Errorf("deleted = %+v", got)
+	}
+
+	b = db.Batch()
+	none := b.OneAs[User](db.Delete[User]().Where("age > ?", 100))
+	if err := b.Run(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("Run = %v, want ErrNoRows", err)
+	}
+	if !errors.Is(none.Err(), sql.ErrNoRows) {
+		t.Errorf("result = %v, want ErrNoRows", none.Err())
+	}
+}
+
+// A Handle batches on whatever it wraps, so a batch on a transaction's handle
+// sees what the transaction wrote.
+func TestHandleBatchRunsWhereItIs(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Insert[User]().Values(&User{Name: "eve", Email: "e@x.io", Age: 1, CreatedAt: time.Now()}).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	h := barm.Handle{IDB: tx}
+	b := h.Batch()
+	n := b.Count(h.Select[User]())
+	if err := b.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n.Value() != 1 {
+		t.Errorf("count = %d, want the transaction's own row", n.Value())
+	}
+}
+
 // Begin, Commit and Rollback work out what to send from what the batch runs on:
 // BEGIN on the pool, SAVEPOINT inside a transaction. Nothing on the batch
 // remembers which — it is read from the batcher each time.

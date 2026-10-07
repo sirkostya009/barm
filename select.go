@@ -63,25 +63,44 @@ func newSelect[T any](r runner) *SelectQuery[T] {
 // instantiation shares one underlying struct.
 func (q *SelectQuery[T]) retype[U any]() SelectQuery[U] {
 	c := SelectQuery[U](*q)
-	m, err := modelOf[U]()
-	if err != nil && c.err == nil {
-		c.err = err
+	c.readAs(modelOf[U]())
+	return c
+}
+
+// readAs is retype for a result model already looked up, which is how a batch
+// reading into a type of its own gets here without the type parameter.
+func (q *SelectQuery[T]) readAs(m *model, err error) {
+	if err != nil {
+		q.fail(err)
 	}
-	if len(c.model.fields) == 0 {
-		c.model = m
+	if len(q.model.fields) == 0 {
+		q.model = m
 	}
-	if len(c.cols) == 0 && len(m.fields) > 0 {
-		err = c.model.covers(m)
-		if err != nil && c.err == nil {
-			c.err = err
+	if len(q.cols) == 0 && len(m.fields) > 0 {
+		err = q.model.covers(m)
+		if err != nil {
+			q.fail(err)
 		}
 		// A union's branches have to match its columns, so it keeps them, and U
 		// takes what it maps of the row.
-		if len(c.unions) == 0 || len(c.proj.fields) == 0 {
-			c.proj = m
+		if len(q.unions) == 0 || len(q.proj.fields) == 0 {
+			q.proj = m
 		}
 	}
-	return c
+}
+
+// batchAs renders the query as BuildAs does for the model m, with LIMIT 1 when
+// a batch reads one row of it.
+func (q *SelectQuery[T]) batchAs(m *model, err error, one bool) (string, []any, error) {
+	if len(q.rels) > 0 {
+		return "", nil, errBatchAsRelations
+	}
+	c := *q
+	c.readAs(m, err)
+	if one {
+		c.limit = 1
+	}
+	return c.build()
 }
 
 // fail records the first error; the rest of the builder keeps going so that a

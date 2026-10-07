@@ -118,6 +118,9 @@ type IDB interface {
 	// connection for it, a Conn lends its own, and a Tx opens a savepoint.
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error)
 	Begin() (*Tx, error)
+	// Batch starts a batch sent where the handle runs: on the pool, on the
+	// held connection, or inside the transaction.
+	Batch() *Batch
 	runner() runner
 	sess() *session
 	executor() Executor

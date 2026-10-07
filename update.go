@@ -381,12 +381,24 @@ func (q *UpdateQuery[T]) BuildAs[U any]() (string, []any, error) {
 // struct. It is returned by value so the copy stays on the caller's stack.
 func (q *UpdateQuery[T]) retype[U any]() UpdateQuery[U] {
 	c := UpdateQuery[U](*q)
-	ret, err := modelOf[U]()
-	c.ret = ret
-	if err != nil && c.err == nil {
-		c.err = err
-	}
+	c.returnAs(modelOf[U]())
 	return c
+}
+
+// returnAs is retype for a result model already looked up.
+func (q *UpdateQuery[T]) returnAs(m *model, err error) {
+	q.ret = m
+	if err != nil && q.err == nil {
+		q.err = err
+	}
+}
+
+// batchAs renders the query as BuildAs does for the model m.
+func (q *UpdateQuery[T]) batchAs(m *model, err error, _ bool) (string, []any, error) {
+	c := *q
+	c.returnAs(m, err)
+	c.expandReturning()
+	return c.Build()
 }
 
 // expandReturning settles the RETURNING clause: the result type's columns

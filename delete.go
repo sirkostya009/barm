@@ -321,12 +321,24 @@ func (q *DeleteQuery[T]) BuildAs[U any]() (string, []any, error) {
 // stack.
 func (q *DeleteQuery[T]) retype[U any]() DeleteQuery[U] {
 	c := DeleteQuery[U](*q)
-	ret, err := modelOf[U]()
-	c.ret = ret
-	if err != nil && c.err == nil {
-		c.err = err
-	}
+	c.returnAs(modelOf[U]())
 	return c
+}
+
+// returnAs is retype for a result model already looked up.
+func (q *DeleteQuery[T]) returnAs(m *model, err error) {
+	q.ret = m
+	if err != nil && q.err == nil {
+		q.err = err
+	}
+}
+
+// batchAs renders the query as BuildAs does for the model m.
+func (q *DeleteQuery[T]) batchAs(m *model, err error, _ bool) (string, []any, error) {
+	c := *q
+	c.returnAs(m, err)
+	c.expandReturning()
+	return c.Build()
 }
 
 // expandReturning settles the RETURNING clause: the result type's columns

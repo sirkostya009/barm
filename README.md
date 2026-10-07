@@ -1107,6 +1107,18 @@ of row types, and a loop can queue as many as it likes.
 - **Inserts queued with `Exec`** scan their `RETURNING` columns back into their values, the
   same as their own `Exec`.
 - **`b.One` adds `LIMIT 1`**, like `One`.
+- **`OneAs` and `SliceAs`** take any query and read its rows into a type of your choosing,
+  the way the builders' `OneAs` and `SliceAs` do. A select narrows to that type's columns,
+  and an insert, update or delete returns them. A raw query is read as written:
+
+  ```go
+  created := b.OneAs[User](db.Insert[CreateUser]().Table("users").Values(&in)) // *BatchResult[User]
+  names   := b.SliceAs[UserName](db.Select[User]().OrderBy("name"))           // *BatchResult[[]UserName]
+  newest  := b.OneAs[time.Time](db.NewRaw("SELECT max(created_at) FROM users")) // *BatchResult[time.Time]
+  ```
+
+  Relations load only through `One` and `Slice`, so a select that asks for them is an
+  error here.
 - **Relations** on queued selects load after the batch, breadth-first across all its
   queries.
 - **Queries render when queued,** so later changes to a struct do not affect the batch.
@@ -1346,7 +1358,8 @@ func adults(ctx context.Context, h barm.IDB) ([]User, error) {
 ```
 
 One function then serves a pool, a transaction and a held connection alike. `IDB` also
-has `Exec` and `Query` for raw SQL, and `Begin` and `BeginTx`, which do the right thing for whatever it holds: a `DB` starts a
+has `Exec` and `Query` for raw SQL, `Batch`, which sends the batch wherever the handle runs,
+and `Begin` and `BeginTx`, which do the right thing for whatever it holds: a `DB` starts a
 transaction on a connection of its own, a `Conn` lends its connection, and a `Tx` opens a
 savepoint. So a transaction helper written once over `IDB` nests correctly:
 
