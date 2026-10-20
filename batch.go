@@ -7,6 +7,7 @@
 package barm
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -33,6 +34,11 @@ type ExecResult struct {
 // each advance to the next result. A reader may also have a Described() bool
 // method, saying whether the statement whose result it handed over last had
 // its parameter types asked of the database first.
+//
+// The rows it hands over report through Err only what the database or the
+// connection failed, never a Scan that failed, as database/sql's rows do: a
+// batch ends on the first, since the database skipped what followed, and reads
+// on past the second.
 type BatchReader interface {
 	Rows() (Rows, error)
 	Exec() (ExecResult, error)
@@ -42,7 +48,8 @@ type BatchReader interface {
 var ErrNoBatcher = errors.New("barm: batching needs a driver that pipelines — pgxdriver, or barm.SQL with SequentialBatches")
 
 // ErrNotRun is the error on a result whose query did not execute: the batch has
-// not been run yet, or an earlier query in it failed and the rest never went.
+// not been run yet, or the database failed an earlier query in it and skipped
+// the rest.
 var ErrNotRun = errors.New("barm: batch query did not run")
 
 // BatchResult carries one query's outcome. Until Run fills it, it holds the zero
@@ -53,11 +60,9 @@ type BatchResult[T any] struct {
 	err error
 }
 
-// newResult starts out not-run, which is what an unread result honestly is.
-func newResult[T any]() *BatchResult[T] { return &BatchResult[T]{err: ErrNotRun} }
-
 // Value returns the result, or the zero value if the query failed or never ran.
-// Check Run's error first and this is total.
+// A batch that ran can still hold a query that failed on its own, a One that
+// found no row among them, which Err tells apart.
 func (r *BatchResult[T]) Value() T { return r.v }
 
 // Err returns this query's error, if it had one.
@@ -67,6 +72,8 @@ func (r *BatchResult[T]) Err() error { return r.err }
 func (r *BatchResult[T]) Get() (T, error) { return r.v, r.err }
 
 func (r *BatchResult[T]) set(v T, err error) { r.v, r.err = v, err }
+
+func (r *BatchResult[T]) fail(err error) { r.err = err }
 
 // Batch sends queries together, in one round trip. Each queued query hands back
 // a BatchResult typed to what that query returns, so one batch mixes as many row
@@ -97,7 +104,7 @@ type Batch struct {
 	watch    watch // as the handle it was started on watches its calls
 	names    *names
 	qs       []BatchQuery
-	items    []item
+	sinks    []sink
 	// rels renders the relations of the queries that asked for them, which
 	// hang off rows the batch hands over only once it is done with its
 	// connection. They load then, a depth at a time across every query.
@@ -158,11 +165,17 @@ func (h *batchHooks) unsent(ctx context.Context, i int, q BatchQuery, err error)
 	}
 }
 
-type item struct {
-	// read returns the exec result when there is one, for the hooks, and how
-	// many rows it read when there is none.
-	read func(BatchReader) (sql.Result, int64, error)
-	fail func(error)
+// sink is where a queued query's result lands. It is the result itself, so a
+// queued query holds its SQL, its arguments and that, and nothing of the
+// builder it came from.
+type sink interface {
+	// take reads the result off the batch, returning the exec result when there
+	// is one, for the hooks, and how many rows it read when there is none. Its
+	// error is the database's, which ends the batch; one barm met reading a
+	// result that came whole is the sink's Err alone.
+	take(context.Context, BatchReader) (sql.Result, int64, error)
+	fail(error)
+	Err() error
 }
 
 func newBatch(e Executor, s *session, inTx, held bool) *Batch {
@@ -174,14 +187,14 @@ func newBatch(e Executor, s *session, inTx, held bool) *Batch {
 }
 
 // Len returns the number of queued queries.
-func (b *Batch) Len() int { return len(b.items) }
+func (b *Batch) Len() int { return len(b.sinks) }
 
 // Err returns the first queueing error, if any. Run reports it too.
 func (b *Batch) Err() error { return b.err }
 
 // queue renders a query and records how to read its result. A named one is
 // bound to its SQL as any named query is.
-func (b *Batch) queue(t target, name, query string, args []any, err error, it item) {
+func (b *Batch) queue(t target, name, query string, args []any, err error, s sink) {
 	if err == nil && b.err != nil {
 		err = b.err // a batch with nothing to run on fails every query
 	}
@@ -192,18 +205,34 @@ func (b *Batch) queue(t target, name, query string, args []any, err error, it it
 		if b.err == nil {
 			b.err = err
 		}
-		it.fail(err)
+		s.fail(err)
 		return
 	}
-	b.qs = append(b.qs, BatchQuery{Query: query, Args: args, Name: name})
+	b.qs = append(b.qs, BatchQuery{Query: b.shared(query), Args: args, Name: name})
 	if b.hooks != nil {
 		b.hooks.ts = append(b.hooks.ts, t)
 		if b.watch&watchCaller != 0 {
 			b.hooks.callers = append(b.hooks.callers, callerFrame())
 		}
 	}
-	b.items = append(b.items, it)
+	b.sinks = append(b.sinks, s)
 }
+
+// shared returns the text of a query queued just before that reads the same,
+// so a loop queueing one statement keeps one copy of it rather than one per
+// query: in a long batch that copy is most of what each query holds.
+func (b *Batch) shared(query string) string {
+	for i := len(b.qs) - 1; i >= max(0, len(b.qs)-sharedLookback); i-- {
+		if b.qs[i].Query == query {
+			return b.qs[i].Query
+		}
+	}
+	return query
+}
+
+// sharedLookback is how many queries back shared looks: enough for a loop
+// queueing a few statements per element.
+const sharedLookback = 4
 
 // relLoad is one query's relations in a batch: how to render them over the rows
 // it read, and where to record the outcome.
@@ -300,48 +329,61 @@ func (b *Batch) SliceAs[U any](q Query) *BatchResult[[]U] {
 
 // queueSlice queues a query read as all its rows, hint being how many to expect.
 func queueSlice[U any](b *Batch, t target, name, query string, args []any, err error, hint int64) *BatchResult[[]U] {
-	r := newResult[[]U]()
-	b.queue(t, name, query, args, err, item{
-		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, int64, error) {
-			rows, err := br.Rows()
-			if err != nil {
-				r.err = err
-				return nil, 0, err
-			}
-			defer rows.Close()
+	r := &sliceSink[U]{err: ErrNotRun, hint: hint}
+	b.queue(t, name, query, args, err, r)
+	return &r.BatchResult
+}
 
-			v, err := scanSlice[U](rows, hint)
-			r.set(v, err)
-			return nil, int64(len(v)), err
-		},
-	})
-	return r
+type sliceSink[U any] struct {
+	BatchResult[[]U]
+	hint int64
+}
+
+func (r *sliceSink[U]) take(_ context.Context, br BatchReader) (sql.Result, int64, error) {
+	rows, err := br.Rows()
+	if err != nil {
+		r.err = err
+		return nil, 0, err
+	}
+	v, err := scanSlice[U](rows, r.hint)
+	dbErr := ended(rows)
+	r.set(v, cmp.Or(err, dbErr))
+	return nil, int64(len(v)), dbErr
 }
 
 // queueRow queues a query read as a single row, its first.
 func queueRow[U any](b *Batch, t target, name, query string, args []any, err error) *BatchResult[U] {
-	r := newResult[U]()
-	b.queue(t, name, query, args, err, item{
-		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, int64, error) {
-			rows, err := br.Rows()
-			if err != nil {
-				r.err = err
-				return nil, 0, err
-			}
-			defer rows.Close()
+	r := &rowSink[U]{BatchResult[U]{err: ErrNotRun}}
+	b.queue(t, name, query, args, err, r)
+	return &r.BatchResult
+}
 
-			var v U
-			err = scanRow(rows, &v)
-			r.set(v, err)
-			if err != nil {
-				return nil, 0, err
-			}
-			return nil, 1, nil
-		},
-	})
-	return r
+type rowSink[U any] struct{ BatchResult[U] }
+
+func (r *rowSink[U]) take(_ context.Context, br BatchReader) (sql.Result, int64, error) {
+	rows, err := br.Rows()
+	if err != nil {
+		r.err = err
+		return nil, 0, err
+	}
+	var v U
+	err = scanRow(rows, &v)
+	dbErr := ended(rows)
+	r.set(v, cmp.Or(err, dbErr))
+	if r.err != nil {
+		return nil, 0, dbErr
+	}
+	return nil, 1, nil
+}
+
+// ended closes rows read in a batch and returns what the database reported on
+// them, which leaves out what barm met reading them.
+func ended(rows Rows) error {
+	err := rows.Close()
+	if err == nil {
+		err = rows.Err()
+	}
+	return err
 }
 
 // BatchSavepoint is the savepoint a batch opens inside a transaction. It is a
@@ -449,49 +491,60 @@ type returningWrite interface {
 // queueReturning queues a write that reads its RETURNING rows back, counting
 // them as what it affected.
 func (b *Batch) queueReturning(q Query, w returningWrite) *BatchResult[ExecResult] {
-	r := newResult[ExecResult]()
+	r := &returningSink{err: ErrNotRun, w: w}
 	query, args, err := q.Build()
-	b.queue(targetOf(q), stmtName(q), query, args, err, item{
-		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, int64, error) {
-			rows, err := br.Rows()
-			if err != nil {
-				r.err = err
-				return nil, 0, err
-			}
-			defer rows.Close()
-			n, err := w.scanReturning(rows)
-			r.set(ExecResult{RowsAffected: n}, err)
-			return rowsAffected(n), n, err
-		},
-	})
-	return r
+	b.queue(targetOf(q), stmtName(q), query, args, err, r)
+	return &r.BatchResult
+}
+
+// returningSink keeps the write it came from, since its rows go back into
+// that write's values.
+type returningSink struct {
+	BatchResult[ExecResult]
+	w returningWrite
+}
+
+func (r *returningSink) take(_ context.Context, br BatchReader) (sql.Result, int64, error) {
+	rows, err := br.Rows()
+	if err != nil {
+		r.err = err
+		return nil, 0, err
+	}
+	n, err := r.w.scanReturning(rows)
+	dbErr := ended(rows)
+	r.set(ExecResult{RowsAffected: n}, cmp.Or(err, dbErr))
+	return rowsAffected(n), n, dbErr
 }
 
 // queueExec queues a statement whose result is a row count. A write and a
 // transaction-control statement report the same shape, so they read the same
 // way; only where the SQL comes from differs.
 func (b *Batch) queueExec(t target, name, query string, args []any, err error) *BatchResult[ExecResult] {
-	r := newResult[ExecResult]()
-	b.queue(t, name, query, args, err, item{
-		fail: func(err error) { r.err = err },
-		read: func(br BatchReader) (sql.Result, int64, error) {
-			res, err := br.Exec()
-			r.set(res, err)
-			return rowsAffected(res.RowsAffected), 0, err
-		},
-	})
-	return r
+	r := &execSink{BatchResult[ExecResult]{err: ErrNotRun}}
+	b.queue(t, name, query, args, err, r)
+	return &r.BatchResult
 }
 
-// Run sends the batch and fills every result. It reports the first failure,
-// naming the query that broke; the results after it report ErrNotRun.
+type execSink struct{ BatchResult[ExecResult] }
+
+func (r *execSink) take(_ context.Context, br BatchReader) (sql.Result, int64, error) {
+	res, err := br.Exec()
+	r.set(res, err)
+	return rowsAffected(res.RowsAffected), 0, err
+}
+
+// Run sends the batch and fills every result. A query the database fails ends
+// the batch: Run reports it, naming the query, and the results after it report
+// ErrNotRun, as the database skipped them. A result the database sent whole
+// but barm could not read as asked — ErrNoRows, or a row that does not scan —
+// fails that query alone, and is its result's Err rather than Run's, since
+// every statement ran.
 //
 // Whether a failure rolls the batch back is the driver's business: pgx runs one
 // in an implicit transaction unless it is already inside one.
 func (b *Batch) Run(ctx context.Context) error {
-	items, qs, rels, err := b.items, b.qs, b.rels, b.err
-	b.items, b.qs, b.rels, b.err = nil, nil, nil, nil // a batch runs once
+	sinks, qs, rels, err := b.sinks, b.qs, b.rels, b.err
+	b.sinks, b.qs, b.rels, b.err = nil, nil, nil, nil // a batch runs once
 	hooks := b.hooks
 	b.hooks = newBatchHooks(hooks.list())
 	if err != nil {
@@ -500,7 +553,7 @@ func (b *Batch) Run(ctx context.Context) error {
 		}
 		return err
 	}
-	if len(items) == 0 {
+	if len(sinks) == 0 {
 		return nil
 	}
 
@@ -526,9 +579,9 @@ func (b *Batch) Run(ctx context.Context) error {
 			rr = &respondedReader{BatchReader: br}
 			br = rr
 		}
-		for i, it := range items {
+		for i, s := range sinks {
 			if runErr != nil {
-				it.fail(ErrNotRun)
+				s.fail(ErrNotRun)
 				hooks.unsent(ctx, i, qs[i], ErrNotRun)
 				continue
 			}
@@ -536,7 +589,7 @@ func (b *Batch) Run(ctx context.Context) error {
 			if rr != nil {
 				rr.ev = ev
 			}
-			res, n, err := it.read(br)
+			res, n, err := s.take(ctx, br)
 			if ev != nil {
 				// The wait was for the batch's connection, before any query of
 				// it, so it goes on the first.
@@ -546,7 +599,7 @@ func (b *Batch) Run(ctx context.Context) error {
 				}
 				ev.Described = described != nil && described.Described()
 			}
-			finishQuery(c, hooks.list(), ev, res, n, err)
+			finishQuery(c, hooks.list(), ev, res, n, s.Err())
 			if err != nil {
 				runErr = fmt.Errorf("barm: batch query %d: %w", i, err)
 			}
@@ -557,8 +610,8 @@ func (b *Batch) Run(ctx context.Context) error {
 		return runErr
 	}
 	if sendErr != nil {
-		for _, it := range items {
-			it.fail(sendErr)
+		for _, s := range sinks {
+			s.fail(sendErr)
 		}
 		if !reached && (!b.fallback || !errors.Is(sendErr, ErrNoBatcher)) {
 			for i, q := range qs {

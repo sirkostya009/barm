@@ -3,6 +3,7 @@ package barm
 import (
 	"reflect"
 	"testing"
+	"unsafe"
 )
 
 func mustModel[T any](t *testing.T) *model {
@@ -89,5 +90,32 @@ func TestColumnsComeFromTags(t *testing.T) {
 	cols := mustModel[Row](t).names
 	if len(cols) != 1 || cols[0] != "kept" {
 		t.Errorf("columns = %v, want [kept] — an untagged field is not a column", cols)
+	}
+}
+
+// Every write returning a model's columns shares one list per dialect, and a
+// query adding to its own copy leaves that list alone.
+func TestReturningColsShared(t *testing.T) {
+	t.Parallel()
+	type row struct {
+		BaseModel `barm:"table:rows"`
+		ID        int64  `barm:"id,pk"`
+		Name      string `barm:"name"`
+	}
+	m := mustModel[row](t)
+	first, err := m.returningCols(Postgres, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = append(first, frag{sql: "extra"})
+	again, err := m.returningCols(Postgres, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unsafe.SliceData(first) != unsafe.SliceData(again) {
+		t.Error("the list was built again")
+	}
+	if len(again) != 2 || cap(again) != 2 {
+		t.Errorf("the shared list changed: %v", again)
 	}
 }

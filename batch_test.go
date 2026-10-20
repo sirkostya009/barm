@@ -369,3 +369,60 @@ func TestBatchAsRefusesRelations(t *testing.T) {
 		t.Error("the result carries no error")
 	}
 }
+
+// emptyReader answers every query with no rows, the rows ending in err.
+type emptyReader struct{ err error }
+
+func (r emptyReader) Rows() (barm.Rows, error)     { return emptyRows(r), nil }
+func (emptyReader) Exec() (barm.ExecResult, error) { return barm.ExecResult{RowsAffected: 1}, nil }
+
+type emptyRows struct{ err error }
+
+func (emptyRows) Columns() ([]string, error) { return []string{"id"}, nil }
+func (emptyRows) Next() bool                 { return false }
+func (emptyRows) Scan(...any) error          { return nil }
+func (r emptyRows) Err() error               { return r.err }
+func (r emptyRows) Close() error             { return r.err }
+
+// A result that arrived whole but holds no row fails its own query, and the
+// ones behind it ran all the same.
+func TestBatchNoRowsFailsOnlyItsQuery(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	b := db.Batch()
+	missing := b.One(db.Select[batchUser]())
+	written := b.Exec(db.Insert[batchUser]().Values(&batchUser{Name: "x"}))
+
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run = %v, want nil: every statement ran", err)
+	}
+	if !errors.Is(missing.Err(), barm.ErrNoRows) {
+		t.Errorf("missing.Err() = %v, want ErrNoRows", missing.Err())
+	}
+	if written.Err() != nil || written.Value().RowsAffected != 1 {
+		t.Errorf("written = %v, %v; want it run", written.Value(), written.Err())
+	}
+}
+
+// An error the rows report as they end is the database's, which skipped what
+// followed, so it still ends the batch.
+func TestBatchRowsErrorEndsIt(t *testing.T) {
+	t.Parallel()
+	failed := errors.New("division by zero")
+	db := stubbed(&stubBatcher{reader: emptyReader{err: failed}})
+	b := db.Batch()
+	broken := b.Slice(db.Select[batchUser]())
+	after := b.Exec(db.Insert[batchUser]().Values(&batchUser{Name: "x"}))
+
+	err := b.Run(t.Context())
+	if !errors.Is(err, failed) {
+		t.Fatalf("Run = %v, want %v", err, failed)
+	}
+	if !errors.Is(broken.Err(), failed) {
+		t.Errorf("broken.Err() = %v, want %v", broken.Err(), failed)
+	}
+	if !errors.Is(after.Err(), barm.ErrNotRun) {
+		t.Errorf("after.Err() = %v, want ErrNotRun", after.Err())
+	}
+}

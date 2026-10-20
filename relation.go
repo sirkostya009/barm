@@ -430,6 +430,7 @@ type pending struct {
 	set   setter
 	next  func() ([]*pending, error) // renders the rows' own relations, if they have any
 	apply func()                     // hands the rows to the parents
+	err   error                      // its batch read's, which fails only it
 }
 
 // loadRelations fetches every relation asked for, and theirs, and hands the
@@ -682,19 +683,33 @@ func batchRelations(ctx context.Context, batch *Batch, level []*pending) error {
 		if w.read == nil {
 			continue
 		}
-		batch.queue(w.t.get(), "", w.query, w.args, nil, item{
-			fail: func(error) {},
-			read: func(br BatchReader) (sql.Result, int64, error) {
-				rows, err := br.Rows()
-				if err != nil {
-					return nil, 0, err
-				}
-				defer rows.Close()
-				var n int64
-				w.set, w.next, n, err = w.read(ctx, rows)
-				return nil, n, err
-			},
-		})
+		batch.queue(w.t.get(), "", w.query, w.args, nil, w)
 	}
-	return batch.Run(ctx)
+	err := batch.Run(ctx)
+	if err != nil {
+		return err
+	}
+	for _, w := range level {
+		if w.err != nil {
+			return w.err
+		}
+	}
+	return nil
 }
+
+func (w *pending) take(ctx context.Context, br BatchReader) (sql.Result, int64, error) {
+	rows, err := br.Rows()
+	if err != nil {
+		w.err = err
+		return nil, 0, err
+	}
+	var n int64
+	w.set, w.next, n, err = w.read(ctx, rows)
+	dbErr := ended(rows)
+	w.err = cmp.Or(err, dbErr)
+	return nil, n, dbErr
+}
+
+func (w *pending) fail(err error) { w.err = err }
+
+func (w *pending) Err() error { return w.err }

@@ -44,6 +44,18 @@ func BenchmarkBuildInsert(b *testing.B) {
 	}
 }
 
+func BenchmarkBuildInsertReturning(b *testing.B) {
+	db := barm.NewBuilder(barm.Postgres)
+	row := &User{Name: "n", Email: "e", Age: 1, CreatedAt: time.Now()}
+	b.ReportAllocs()
+	for b.Loop() {
+		q, args, err := db.Insert[User]().Values(row).BuildAs[User]()
+		if err != nil || q == "" || args == nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkExistsQuery(b *testing.B) {
 	db := barm.NewBuilder(barm.Postgres)
 	b.ReportAllocs()

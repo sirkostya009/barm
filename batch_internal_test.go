@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // nopExec is an Executor that runs nothing, for batches that are only queued.
@@ -71,5 +72,27 @@ func TestBatchRollbackNeedsAHeldConnection(t *testing.T) {
 	// and it queued nothing: Begin is the only statement in the batch
 	if len(b.qs) != 1 {
 		t.Errorf("Rollback queued a statement: %v", b.qs)
+	}
+}
+
+// A loop queueing one statement keeps one copy of its text, which is most of
+// what a long batch holds per query.
+func TestBatchSharesRepeatedQueryText(t *testing.T) {
+	type row struct {
+		BaseModel `barm:"table:rows"`
+		ID        int64  `barm:"id,pk"`
+		Name      string `barm:"name"`
+	}
+	t.Parallel()
+	db := NewBuilder(Postgres)
+	b := newBatch(nopExec{}, &db.session, false, false)
+	for i := range 3 {
+		b.Exec(db.Update[row]().Set("name = ?", "x").Where("id = ?", i))
+		b.Exec(db.Delete[row]().Where("id = ?", i))
+	}
+	for i := 2; i < len(b.qs); i++ {
+		if unsafe.StringData(b.qs[i].Query) != unsafe.StringData(b.qs[i-2].Query) {
+			t.Errorf("query %d holds its own copy of %q", i, b.qs[i].Query)
+		}
 	}
 }

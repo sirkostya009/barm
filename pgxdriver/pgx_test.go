@@ -274,6 +274,8 @@ func TestBatchError(t *testing.T) {
 	}
 }
 
+// A query barm cannot read as asked fails on its own: the database ran it, and
+// everything behind it, so the batch reads on.
 func TestBatchNoRows(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
@@ -281,12 +283,28 @@ func TestBatchNoRows(t *testing.T) {
 
 	b := db.Batch()
 	missing := b.One(db.Select[User]().Where("age = ?", 999))
+	unscannable := b.OneAs[int64](db.NewRaw("SELECT 'x'"))
+	inserted := b.Exec(db.Insert[User]().Values(&User{Name: "z", Email: "z@x.io", Age: 3, CreatedAt: time.Now()}))
+	after := b.Count(db.Select[User]())
 
-	if err := b.Run(ctx); err == nil {
-		t.Fatal("expected an error")
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want nil: every statement ran", err)
 	}
 	if !errors.Is(missing.Err(), barm.ErrNoRows) {
-		t.Errorf("err = %v, want ErrNoRows", missing.Err())
+		t.Errorf("missing.Err() = %v, want ErrNoRows", missing.Err())
+	}
+	if unscannable.Err() == nil || errors.Is(unscannable.Err(), barm.ErrNotRun) {
+		t.Errorf("unscannable.Err() = %v, want a scan error", unscannable.Err())
+	}
+	if inserted.Err() != nil || inserted.Value().RowsAffected != 1 {
+		t.Errorf("inserted = %v, %v", inserted.Value(), inserted.Err())
+	}
+	n, err := after.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := db.Select[User]().Count(ctx); n != want {
+		t.Errorf("count = %d, want %d", n, want)
 	}
 }
 
@@ -1798,8 +1816,8 @@ func TestBatchAs(t *testing.T) {
 
 	b = db.Batch()
 	none := b.OneAs[User](db.Delete[User]().Where("age > ?", 100))
-	if err := b.Run(ctx); !errors.Is(err, sql.ErrNoRows) {
-		t.Errorf("Run = %v, want ErrNoRows", err)
+	if err := b.Run(ctx); err != nil {
+		t.Errorf("Run = %v, want nil: the delete ran", err)
 	}
 	if !errors.Is(none.Err(), sql.ErrNoRows) {
 		t.Errorf("result = %v, want ErrNoRows", none.Err())

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // BaseModel carries the table metadata, and is how a struct names its table:
@@ -89,6 +90,10 @@ type model struct {
 	byName map[string]*field
 	names  []string
 	rels   []relField
+	// returning is the RETURNING list of every column, built the first time a
+	// write asks. It is quoted for that write's dialect, which is every
+	// write's: a model is not used against two databases at once.
+	returning atomic.Pointer[[]frag]
 }
 
 // rel returns the relation a Go field name declares.
@@ -128,10 +133,16 @@ func (m *model) returningCols(d Dialect, given []frag) ([]frag, error) {
 	if len(m.fields) == 0 {
 		return nil, fmt.Errorf("barm: %s names no columns to return — add Returning", m.typ)
 	}
+	if out := m.returning.Load(); out != nil {
+		return *out, nil
+	}
+	// A query appending to the list it is handed gets a copy, the length
+	// being its capacity, so sharing it is safe.
 	out := make([]frag, len(m.fields))
 	for i := range m.fields {
 		out[i] = frag{sql: string(d.AppendIdent(nil, m.fields[i].name))}
 	}
+	m.returning.Store(&out)
 	return out, nil
 }
 

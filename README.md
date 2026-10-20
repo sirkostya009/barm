@@ -1100,8 +1100,12 @@ of row types, and a loop can queue as many as it likes.
 - **Reading results:** `Value()` returns the result, `Err()` its error, and `Get()` both.
   Until `Run` fills a result, it holds the zero value and `barm.ErrNotRun`, so reading too
   early is obvious. Queries behind a failure never run, and keep `ErrNotRun`.
-- **When a query fails,** `Run` returns the first failure, naming the query. It then empties
-  the batch, so it cannot run twice.
+- **When the database fails a query,** `Run` returns that failure, naming the query. Postgres
+  skips everything queued behind it, so those results keep `ErrNotRun`. `Run` empties the
+  batch either way, so it cannot run twice.
+- **When barm cannot read a result as asked** (`One` finding no row, a row that does not
+  scan), only that query fails. The database ran it and the rest, so the error is on that
+  result's `Err`, and `Run` returns nil.
 - **Implicit transaction:** a batch runs in one unless it is already inside a transaction,
   so a failure rolls the whole batch back.
 - **Inserts queued with `Exec`** scan their `RETURNING` columns back into their values, the
@@ -1200,11 +1204,11 @@ if err := b.Run(ctx); err != nil {
 err := tx.Commit()                          // the audit entry lands either way
 ```
 
-**Why `Rollback` runs immediately instead of being queued.** When a query fails, Postgres
-discards everything queued behind it and refuses further commands with "current transaction
-is aborted". A queued rollback would be skipped exactly when it is needed. That is also what
-`ErrNotRun` on the `Commit` result means. `ROLLBACK TO SAVEPOINT` is one of the few
-statements Postgres accepts in that state, so `Rollback` sends it as a second round trip.
+**Why `Rollback` runs immediately instead of being queued.** When Postgres fails a query,
+it discards everything queued behind it and refuses further commands with "current
+transaction is aborted". A queued rollback would be skipped exactly when it is needed. That
+is also what `ErrNotRun` on the `Commit` result means. `ROLLBACK TO SAVEPOINT` is one of the
+few statements Postgres accepts in that state, so `Rollback` sends it as a second round trip.
 
 - **`Rollback` needs a held connection.** It goes to the connection the batch ran on, so the
   batch must be on a transaction or a held connection. A batch on the pool has already

@@ -806,6 +806,7 @@ type reader struct {
 	t     *types
 	steps []step
 	i     int
+	rows  batchRows // the result being read, its rows closed before the next
 }
 
 func (r *reader) next() (*pgconn.ResultReader, error) {
@@ -829,7 +830,8 @@ func (r *reader) Rows() (barm.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pgxRows{pgx.RowsFromResultReader(r.m, rr)}, nil
+	r.rows = batchRows{pgxRows: pgxRows{pgx.RowsFromResultReader(r.m, rr)}}
+	return &r.rows, nil
 }
 
 func (r *reader) Exec() (barm.ExecResult, error) {
@@ -862,6 +864,34 @@ func (r *pooledRows) Close() error {
 		r.c.Release()
 		r.c = nil
 	}
+	return r.Err()
+}
+
+// batchRows are one batch result's rows. pgx keeps a failed Scan's error as
+// the rows' own, where barm would take it for the database's and end the
+// batch, so they leave reporting it to Scan, as database/sql's rows do.
+type batchRows struct {
+	pgxRows
+	scanFailed bool
+}
+
+func (r *batchRows) Scan(dest ...any) error {
+	err := r.Rows.Scan(dest...)
+	if err != nil {
+		r.scanFailed = true
+	}
+	return err
+}
+
+func (r *batchRows) Err() error {
+	if r.scanFailed {
+		return nil
+	}
+	return r.Rows.Err()
+}
+
+func (r *batchRows) Close() error {
+	r.Rows.Close()
 	return r.Err()
 }
 
