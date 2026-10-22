@@ -308,6 +308,113 @@ func TestBatchNoRows(t *testing.T) {
 	}
 }
 
+// A template binds new arguments into the statement it built once, typed as
+// the server reports them like any other batch query's.
+func TestBatchTemplate(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+
+	copyOf := db.Insert[User]().Select(db.Select[User]().
+		ColumnExpr("?, ?, u.age + 1, u.created_at", barm.Named("name", nil), barm.Named("email", nil)).
+		Where("u.name = ?", barm.Named("of", nil))).TemplateAs[User]()
+	b := db.Batch()
+	ann := b.OneAs[User](copyOf.With(barm.Named("name", "ann2"), barm.Named("email", "a2@x.io"), barm.Named("of", "ann")))
+	nobody := b.OneAs[User](copyOf.With(barm.Named("name", "zed2"), barm.Named("email", "z2@x.io"), barm.Named("of", "zed")))
+	cy := b.OneAs[User](copyOf.With(barm.Named("name", "cy2"), barm.Named("email", "c2@x.io"), barm.Named("of", "cy")))
+	if err := b.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if u := ann.Value(); u.ID == 0 || u.Name != "ann2" || u.Age != 21 {
+		t.Errorf("ann's copy = %+v", u)
+	}
+	if !errors.Is(nobody.Err(), barm.ErrNoRows) {
+		t.Errorf("nobody.Err() = %v, want ErrNoRows", nobody.Err())
+	}
+	if u := cy.Value(); u.Name != "cy2" || u.Email != "c2@x.io" || u.Age != 41 {
+		t.Errorf("cy's copy = %+v", u)
+	}
+	if n, _ := db.Select[User]().Count(ctx); n != 5 {
+		t.Errorf("count = %d, want 5", n)
+	}
+}
+
+// A template built with no connection, as at package level, runs on whatever
+// handle Via names: the pool, or a transaction, which it is part of.
+func TestTemplateVia(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+
+	qb := barm.NewBuilder(barm.Postgres)
+	copyOf := qb.Insert[User]().Select(qb.Select[User]().
+		ColumnExpr("?, ?, u.age + 1, u.created_at", barm.Named("name", nil), barm.Named("email", nil)).
+		Where("u.name = ?", barm.Named("of", nil))).TemplateAs[User]()
+	olderThan := qb.Select[User]().Where("age > ?", barm.Named("age", nil)).OrderBy("age").Template()
+	of := func(name, email, of string) *barm.Bound[User] {
+		return copyOf.With(barm.Named("name", name), barm.Named("email", email), barm.Named("of", of))
+	}
+
+	if _, err := of("x", "x@x.io", "ann").One(ctx); !errors.Is(err, barm.ErrNoConn) {
+		t.Errorf("without Via: %v, want ErrNoConn", err)
+	}
+	u, err := of("ann2", "a2@x.io", "ann").Via(db).One(ctx)
+	if err != nil || u.ID == 0 || u.Name != "ann2" || u.Age != 21 {
+		t.Fatalf("One = %+v, %v", u, err)
+	}
+	if _, err := of("zed2", "z2@x.io", "zed").Via(db).One(ctx); !errors.Is(err, barm.ErrNoRows) {
+		t.Errorf("no such user: %v, want ErrNoRows", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := of("bo2", "b2@x.io", "bo").Via(tx).Exec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Errorf("rows affected = %d", n)
+	}
+	inTx, err := olderThan.With(barm.Named("age", 30)).Via(tx).Slice(ctx)
+	if err != nil || len(inTx) != 2 || inTx[0].Name != "bo2" {
+		t.Errorf("inside the transaction: %+v, %v", inTx, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	names, err := olderThan.With(barm.Named("age", 20)).Via(db).SliceAs[struct {
+		Name string `barm:"name"`
+	}](ctx)
+	if err != nil || len(names) != 3 || names[0].Name != "ann2" {
+		t.Errorf("after rolling back: %+v, %v", names, err)
+	}
+}
+
+// An insert template from a builder-only DB writes rows encoded for where they
+// run: pgx takes arrays as they are, whether run through Via or in a batch.
+func TestInsertTemplateArrays(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	createArrays(t, db)
+
+	ins := barm.NewBuilder(barm.Postgres).Insert[pgArrayRow]().TemplateAs[pgArrayRow]()
+	row := &pgArrayRow{Ints: []int64{1, 2}, Texts: []string{"a", "b,c"}, Grid: [][]int32{{1, 2}, {3, 4}}}
+	got, err := ins.Values(row).Via(db).One(ctx)
+	if err != nil || got.ID == 0 || len(got.Grid) != 2 || got.Texts[1] != "b,c" {
+		t.Fatalf("Via: %+v, %v", got, err)
+	}
+	b := db.Batch()
+	batched := b.OneAs[pgArrayRow](ins.Values(row))
+	if err := b.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := batched.Get(); err != nil || v.ID == got.ID || v.Grid[1][1] != 4 {
+		t.Errorf("batch: %+v, %v", v, err)
+	}
+}
+
 // A write batch reports per query, and lands.
 func TestBatchExec(t *testing.T) {
 	ctx := t.Context()

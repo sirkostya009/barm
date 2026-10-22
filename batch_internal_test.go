@@ -3,6 +3,7 @@ package barm
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 	"testing"
 	"unsafe"
@@ -94,5 +95,21 @@ func TestBatchSharesRepeatedQueryText(t *testing.T) {
 		if unsafe.StringData(b.qs[i].Query) != unsafe.StringData(b.qs[i-2].Query) {
 			t.Errorf("query %d holds its own copy of %q", i, b.qs[i].Query)
 		}
+	}
+}
+
+// A batch grown for n queries queues them without moving what it holds.
+func TestBatchGrow(t *testing.T) {
+	t.Parallel()
+	b := newBatch(nopExec{}, &session{hooks: []QueryHook{{}}, watch: watchCaller}, false, false)
+	const n = 100
+	b.Grow(n)
+	qs, sinks, ts, callers := unsafe.SliceData(b.qs), unsafe.SliceData(b.sinks), unsafe.SliceData(b.hooks.ts), unsafe.SliceData(b.hooks.callers)
+	for i := range n {
+		b.queueExec(target{op: "SELECT"}, "", "SELECT "+strconv.Itoa(i), nil, nil)
+	}
+	if unsafe.SliceData(b.qs) != qs || unsafe.SliceData(b.sinks) != sinks ||
+		unsafe.SliceData(b.hooks.ts) != ts || unsafe.SliceData(b.hooks.callers) != callers {
+		t.Error("the batch grew again while queueing what it was grown for")
 	}
 }

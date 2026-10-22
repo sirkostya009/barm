@@ -7,6 +7,7 @@
 package barm
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,9 @@ type builder struct {
 	// one; done reports it.
 	err   error
 	dedup bool
+	// named says an argument is a sql.NamedArg, which binds only through a
+	// Template: done reports it, with the query, for a template to take.
+	named bool
 	// Leave json, or array, values to the driver.
 	nativeJSON, nativeArrays bool
 }
@@ -95,7 +99,7 @@ func (r *runner) builder() *builder {
 	d := r.Dialect()
 	b.d, b.b, b.args = d, b.b[:0], nil
 	s := r.h.sess()
-	b.dedup, b.bound, b.index, b.err = s.dedup && r.name == "" && d.NumberedArgs(), b.bound[:0], nil, nil
+	b.dedup, b.bound, b.index, b.err, b.named = s.dedup && r.name == "" && d.NumberedArgs(), b.bound[:0], nil, nil, false
 	b.nativeJSON, b.nativeArrays = s.nativeJSON, s.nativeArrays
 	return b
 }
@@ -115,8 +119,11 @@ func (b *builder) done() (string, []any, error) {
 		return "", nil, err
 	}
 	query, args := string(b.b), b.args
+	if b.named {
+		err = errNamedArg
+	}
 	b.release()
-	return query, args, nil
+	return query, args, err
 }
 
 // release returns the builder to the pool without rendering. Safe to call on an
@@ -159,6 +166,9 @@ func (b *builder) placeholder(v any) *builder { //nolint:unparam // kept for cha
 	if b.dedup {
 		return b.placeholderDedup(v)
 	}
+	if _, ok := v.(sql.NamedArg); ok {
+		b.named = true
+	}
 	b.args = append(b.args, v)
 	b.b = b.d.AppendPlaceholder(b.b, len(b.args))
 	return b
@@ -172,6 +182,9 @@ func (b *builder) placeholderDedup(v any) *builder {
 		if n := b.findBound(k); n != 0 {
 			return b.placeholderAt(n)
 		}
+	}
+	if _, ok := v.(sql.NamedArg); ok {
+		b.named = true
 	}
 	b.args = append(b.args, v)
 	n := len(b.args)
@@ -393,20 +406,30 @@ func (b *builder) sub(q Query) {
 // array field. A nil pointer, map or slice there is NULL too, rather than the
 // JSON literal null or an empty array.
 func (b *builder) value(f *field, v reflect.Value) any {
+	arg, err := fieldArg(f, v, b.nativeJSON, b.nativeArrays)
+	if err != nil {
+		b.fail(err)
+	}
+	return arg
+}
+
+// fieldArg is a field's value as it binds: NULL for a nullzero zero, and a
+// json or array field encoded unless the pool takes it as it is.
+func fieldArg(f *field, v reflect.Value, nativeJSON, nativeArrays bool) (any, error) {
 	if f.nullzero && v.IsZero() {
-		return nil
+		return nil, nil //nolint:nilnil // nil binds NULL
 	}
 	if !f.json && !f.array {
-		return v.Interface()
+		return v.Interface(), nil
 	}
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface:
 		if v.IsNil() {
-			return nil
+			return nil, nil //nolint:nilnil // nil binds NULL
 		}
 	}
-	if f.json && b.nativeJSON || f.array && b.nativeArrays {
-		return v.Interface()
+	if f.json && nativeJSON || f.array && nativeArrays {
+		return v.Interface(), nil
 	}
 	var data []byte
 	var err error
@@ -416,10 +439,9 @@ func (b *builder) value(f *field, v reflect.Value) any {
 		data, err = json.Marshal(v.Interface())
 	}
 	if err != nil {
-		b.fail(fmt.Errorf("barm: column %q: %w", f.name, err))
-		return nil
+		return nil, fmt.Errorf("barm: column %q: %w", f.name, err)
 	}
-	return unsafe.String(unsafe.SliceData(data), len(data)) // the encoding is ours alone, so no copy
+	return unsafe.String(unsafe.SliceData(data), len(data)), nil // the encoding is ours alone, so no copy
 }
 
 // fail records the first error a fragment runs into, for done to report.

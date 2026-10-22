@@ -4193,3 +4193,40 @@ func TestCompositeRelationSQLite(t *testing.T) {
 		t.Errorf("child query = %s, want row values", child)
 	}
 }
+
+// A template from a builder-only DB runs on database/sql through Via, and a
+// named argument outside one never reaches the driver.
+func TestTemplateOnSQL(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+
+	qb := barm.NewBuilder(barm.SQLite)
+	add := qb.Insert[User]().TemplateAs[User]()
+	byAge := qb.Select[User]().Where("age = ?", barm.Named("age", nil)).Template()
+	for i, name := range []string{"ann", "bo"} {
+		u, err := add.Values(&User{Name: name, Email: name + "@x.io", Age: 20 + i, CreatedAt: time.Now()}).Via(db).One(ctx)
+		if err != nil || u.ID == 0 || u.Name != name {
+			t.Fatalf("inserted %+v, %v", u, err)
+		}
+	}
+	u, err := byAge.With(barm.Named("age", 21)).Via(db).One(ctx)
+	if err != nil || u.Name != "bo" {
+		t.Errorf("One = %+v, %v", u, err)
+	}
+	_, err = db.Select[User]().Where("age = ?", barm.Named("age", 21)).Slice(ctx)
+	if err == nil {
+		t.Error("a named argument ran outside a template")
+	}
+}
+
+// A template keeps the query's SQL, not the query, so a select asking for
+// relations cannot become one.
+func TestTemplateRefusesRelations(t *testing.T) {
+	ctx := t.Context()
+	db := openAuthors(t)
+	_, err := db.Select[Author]().Relation[Book]("Books").Where("id = ?", barm.Named("id", nil)).Template().
+		With(barm.Named("id", 1)).One(ctx)
+	if err == nil {
+		t.Error("a template ran a select with relations")
+	}
+}

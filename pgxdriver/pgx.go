@@ -407,6 +407,7 @@ type stmtKey struct{ name, query string }
 type stmt struct {
 	pgconn.StatementDescription
 	formats []int16       // the result formats, nil until the columns are known
+	names   []string      // the result's column names, which every read shares
 	typed   bool          // ParamOIDs are known, and the arguments encode for them
 	pending bool          // not parsed on the connection yet
 	lru     *list.Element // holds s; nil for a named one, which is never evicted
@@ -438,8 +439,10 @@ func newStmt(m *pgtype.Map, t *types, name, query string) *stmt {
 func (s *stmt) setTypes(m *pgtype.Map, d *pgconn.StatementDescription) {
 	s.ParamOIDs, s.Fields, s.typed = d.ParamOIDs, d.Fields, true
 	s.formats = make([]int16, len(d.Fields))
+	s.names = make([]string, len(d.Fields))
 	for i, f := range d.Fields {
 		s.formats[i] = m.FormatCodeForOID(f.DataTypeOID)
+		s.names[i] = f.Name
 	}
 }
 
@@ -599,6 +602,7 @@ func queryNamed(ctx context.Context, c *pgx.Conn, t *types, name, query string, 
 	r := &namedRows{st: st, key: key}
 	if !s.pending {
 		r.Rows = pgx.RowsFromResultReader(m, pc.ExecStatement(ctx, &s.StatementDescription, st.eqb.ParamValues, st.eqb.ParamFormats, s.formats))
+		r.cols = s.names
 		return r, nil
 	}
 	p := pc.StartPipeline(ctx)
@@ -618,7 +622,7 @@ func queryNamed(ctx context.Context, c *pgx.Conn, t *types, name, query string, 
 		return nil, err
 	}
 	st.stmts[key] = s
-	r.Rows, r.pipe = pgx.RowsFromResultReader(m, rr), p
+	r.Rows, r.pipe, r.cols = pgx.RowsFromResultReader(m, rr), p, s.names
 	return r, nil
 }
 
@@ -642,8 +646,16 @@ type namedRows struct {
 	key     stmtKey
 	pipe    *pgconn.Pipeline
 	release *pgxpool.Conn
+	cols    []string // the statement's column names
 	closed  bool
 	err     error
+}
+
+func (r *namedRows) Columns() ([]string, error) {
+	if r.cols != nil {
+		return r.cols, nil
+	}
+	return r.pgxRows.Columns()
 }
 
 func (r *namedRows) Next() bool {
@@ -831,6 +843,9 @@ func (r *reader) Rows() (barm.Rows, error) {
 		return nil, err
 	}
 	r.rows = batchRows{pgxRows: pgxRows{pgx.RowsFromResultReader(r.m, rr)}}
+	if s := r.steps[r.i-1].s; s != nil {
+		r.rows.cols = s.names
+	}
 	return &r.rows, nil
 }
 
@@ -872,7 +887,15 @@ func (r *pooledRows) Close() error {
 // batch, so they leave reporting it to Scan, as database/sql's rows do.
 type batchRows struct {
 	pgxRows
+	cols       []string // the statement's, when the connection keeps it
 	scanFailed bool
+}
+
+func (r *batchRows) Columns() ([]string, error) {
+	if r.cols != nil {
+		return r.cols, nil
+	}
+	return r.pgxRows.Columns()
 }
 
 func (r *batchRows) Scan(dest ...any) error {

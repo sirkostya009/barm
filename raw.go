@@ -45,13 +45,21 @@ func (q *RawQuery) Build() (string, []any, error) {
 	return b.done()
 }
 
-func (q *RawQuery) render(b *builder) error { //nolint:unparam // render's error is part of the Query interface
+func (q *RawQuery) render(b *builder) error {
 	b.hint(len(q.f.args))
 	b.frag(q.f)
 	return nil
 }
 
 func (q *RawQuery) argCount() int { return len(q.f.args) }
+
+// Template renders the query once, to run again with new values for its named
+// arguments. A raw query has no row type of its own, so it reads through OneAs
+// and SliceAs. See Template.
+func (q *RawQuery) Template() *Template[any] {
+	query, args, err := q.Build()
+	return newTemplate[any](q.runner, targetOf(q), query, args, err)
+}
 
 // Exec runs the statement.
 func (q *RawQuery) Exec(ctx context.Context) (sql.Result, error) {

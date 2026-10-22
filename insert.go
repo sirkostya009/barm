@@ -85,6 +85,33 @@ func (q *InsertQuery[T]) Prepare(name string) *InsertQuery[T] {
 	return q
 }
 
+// Template renders the query once, to run again with new values: a row given
+// to Values when the query has none of its own, and its named arguments. See
+// Template.
+func (q *InsertQuery[T]) Template() *InsertTemplate[T, T] {
+	query, args, err := q.templated().Build()
+	return &InsertTemplate[T, T]{newTemplate[T](q.runner, q.target(), query, args, err)}
+}
+
+// TemplateAs is Template rendered as BuildAs does, returning U's columns.
+func (q *InsertQuery[T]) TemplateAs[U any]() *InsertTemplate[T, U] {
+	query, args, err := q.templated().BuildAs[U]()
+	return &InsertTemplate[T, U]{newTemplate[U](q.runner, q.target(), query, args, err)}
+}
+
+// templated is the query a template renders: one row to be given, unless it
+// writes values or a select of its own. The row is an invalid value, which
+// render writes as a placeholder per column. A column with a default is in it
+// only when Column names it, as no row sets it yet.
+func (q *InsertQuery[T]) templated() *InsertQuery[T] {
+	if len(q.rows) > 0 || q.source() != nil {
+		return q
+	}
+	c := *q
+	c.rows = []reflect.Value{{}}
+	return &c
+}
+
 // Values adds rows to write, named for the VALUES clause it renders. Pointers,
 // because RETURNING and LastInsertId scan back into them; a slice goes in
 // spread, Values(rows...).
@@ -221,7 +248,7 @@ func (q *InsertQuery[T]) insertFields() []*field {
 
 func (q *InsertQuery[T]) allZero(f *field) bool {
 	for _, row := range q.rows {
-		if !fieldValue(row, f.index).IsZero() {
+		if row.IsValid() && !fieldValue(row, f.index).IsZero() {
 			return false
 		}
 	}
@@ -369,6 +396,17 @@ func (q *InsertQuery[T]) render(b *builder) error {
 			b.str(", ")
 		}
 		b.byte('(')
+		if !row.IsValid() {
+			// a template's row, its values bound with Values
+			for j, f := range fields {
+				if j > 0 {
+					b.str(", ")
+				}
+				b.placeholder(rowField{f})
+			}
+			b.byte(')')
+			continue
+		}
 		snap := snapshot(row) // one copy, however many columns come off it
 		for j, f := range fields {
 			if j > 0 {

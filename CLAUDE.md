@@ -39,6 +39,7 @@ allocations are — that reasoning has been wrong here before.
 | `schema.go`                                     | model cache, struct tag parsing                                   |
 | `relation.go`                                   | `Relation[U]`, key predicates, grouping                           |
 | `batch.go`                                      | `Batch`, its results, and the statements a batch transaction uses |
+| `template.go`                                   | `Template` — a query built once and bound to new arguments        |
 | `hook.go`                                       | `QueryHook`, `TxHook`                                             |
 | `dialect.go`                                    | `Dialect` and the three built-ins                                 |
 | `array.go`                                      | Postgres array literals, for the `array` tag                      |

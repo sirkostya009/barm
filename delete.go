@@ -96,6 +96,20 @@ func (q *DeleteQuery[T]) Prepare(name string) *DeleteQuery[T] {
 	return q
 }
 
+// Template renders the query once, to run again with new values for its named
+// arguments. See Template.
+func (q *DeleteQuery[T]) Template() *Template[T] {
+	query, args, err := q.Build()
+	return newTemplate[T](q.runner, q.target(), query, args, err)
+}
+
+// TemplateAs renders the query once as BuildAs does, to run again with new
+// values for its named arguments, its rows read as U. See Template.
+func (q *DeleteQuery[T]) TemplateAs[U any]() *Template[U] {
+	query, args, err := q.BuildAs[U]()
+	return newTemplate[U](q.runner, q.target(), query, args, err)
+}
+
 // Value binds the struct whose primary key WherePK matches. On its own it picks
 // no rows.
 func (q *DeleteQuery[T]) Value(v *T) *DeleteQuery[T] {

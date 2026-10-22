@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -424,5 +426,303 @@ func TestBatchRowsErrorEndsIt(t *testing.T) {
 	}
 	if !errors.Is(after.Err(), barm.ErrNotRun) {
 		t.Errorf("after.Err() = %v, want ErrNotRun", after.Err())
+	}
+}
+
+type batchPost struct {
+	barm.BaseModel `barm:"table:batch_posts"`
+
+	AuthorID int64  `barm:"author_id"`
+	Title    string `barm:"title"`
+	Body     string `barm:"body"`
+}
+
+type batchPostRow struct {
+	barm.BaseModel `barm:"table:batch_posts"`
+
+	ID       int64  `barm:"id,pk"`
+	AuthorID int64  `barm:"author_id"`
+	Title    string `barm:"title"`
+}
+
+func insertIfAuthor(db *barm.DB, author, title, body any) *barm.InsertQuery[batchPost] {
+	return db.Insert[batchPost]().Select(db.Select[batchUser]().
+		ColumnExpr("u.id, ?, ?", title, body).
+		Where("u.id = ?", author).
+		For("KEY SHARE"))
+}
+
+func postTemplate(db *barm.DB) *barm.InsertTemplate[batchPost, batchPostRow] {
+	return insertIfAuthor(db, barm.Named("author", nil), barm.Named("title", nil), barm.Named("body", nil)).TemplateAs[batchPostRow]()
+}
+
+// A template runs as the query it was built from would, its arguments bound by
+// name in place of the named ones, in any order.
+func TestTemplateQueuesAsBuilt(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	ins := postTemplate(db)
+
+	b := db.Batch()
+	b.OneAs[batchPostRow](insertIfAuthor(db, int64(7), "t", "b"))
+	b.OneAs[batchPostRow](ins.With(barm.Named("title", "t"), barm.Named("body", "b"), barm.Named("author", int64(7))))
+	b.OneAs[batchPostRow](ins.With(barm.Named("author", int64(8)), sql.Named("body", "c"), sql.Named("title", "u")))
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, first, second := stub.sent[0], stub.sent[1], stub.sent[2]
+	if first.Query != built.Query {
+		t.Errorf("template renders\n%s\nwant\n%s", first.Query, built.Query)
+	}
+	if !reflect.DeepEqual(first.Args, built.Args) {
+		t.Errorf("args = %v, want %v", first.Args, built.Args)
+	}
+	if !reflect.DeepEqual(second.Args, []any{"u", "c", int64(8)}) {
+		t.Errorf("second args = %v", second.Args)
+	}
+}
+
+// Binding a template costs the bound query and its arguments, which the
+// builders alone exceed.
+//
+//nolint:paralleltest // AllocsPerRun refuses a parallel test
+func TestTemplateBindCost(t *testing.T) {
+	ins := postTemplate(barm.NewBuilder(barm.Postgres))
+	n := testing.AllocsPerRun(100, func() {
+		_, _, _ = ins.With(barm.Named("title", "t"), barm.Named("body", "b"), barm.Named("author", int64(7))).Build()
+	})
+	if n > 3 {
+		t.Errorf("binding takes %v allocs", n)
+	}
+}
+
+// A name bound twice takes the value in both places, around arguments the
+// query fixed.
+func TestTemplateNames(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	sel := db.Select[batchUser]().
+		Where("age > ? AND name = ? AND email = ?", barm.Named("age", nil), "fixed", barm.Named("email", nil)).
+		Where("id <> ?", barm.Named("age", nil)).Template()
+
+	b := db.Batch()
+	b.SliceAs[batchUser](sel.With(barm.Named("email", "e"), barm.Named("age", 30)))
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.sent[0].Args; !reflect.DeepEqual(got, []any{30, "fixed", "e", 30}) {
+		t.Errorf("args = %v", got)
+	}
+}
+
+// TemplateAs renders the query in its one shape up front, and whatever reads
+// it later reads that SQL as it is.
+func TestTemplateAsShape(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	names := db.Select[batchUser]().Where("age > ?", barm.Named("age", nil)).TemplateAs[batchUserName]()
+	want, _, err := db.Select[batchUser]().Where("age > ?", 1).BuildAs[batchUserName]()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := db.Batch()
+	b.OneAs[batchUserName](names.With(barm.Named("age", 1)))
+	b.SliceAs[batchUser](names.With(barm.Named("age", 2)))
+	err = b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, q := range stub.sent {
+		if q.Query != want {
+			t.Errorf("query %d = %s, want %s", i, q.Query, want)
+		}
+	}
+}
+
+// An insert template writes the row Values gives as the builder writes one,
+// and binds named arguments around it.
+func TestInsertTemplateValues(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	u := &batchUser{Name: "ann", Email: "a@x.io", Age: 30, CreatedAt: at}
+	ins := db.Insert[batchUser]().TemplateAs[batchUser]()
+	upsert := db.Insert[batchUser]().On("CONFLICT (email) DO UPDATE").Set("name = ?", barm.Named("name", nil)).Template()
+
+	wantSQL, wantArgs, err := db.Insert[batchUser]().Values(u).BuildAs[batchUser]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := db.Batch()
+	b.OneAs[batchUser](ins.Values(u))
+	b.Exec(upsert.Values(u, barm.Named("name", "bo")))
+	err = b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.sent[0]; got.Query != wantSQL || !reflect.DeepEqual(got.Args, wantArgs) {
+		t.Errorf("template: %s %v\nbuilder: %s %v", got.Query, got.Args, wantSQL, wantArgs)
+	}
+	if got := stub.sent[1].Args; !reflect.DeepEqual(got, []any{"ann", "a@x.io", 30, at, "bo"}) {
+		t.Errorf("upsert args = %v", got)
+	}
+
+	for _, tc := range []struct {
+		what string
+		q    barm.Query
+	}{
+		{"no row", ins.Values(nil)},
+		{"no row, through With", ins.With()},
+		{"a row for an insert with values of its own", db.Insert[batchUser]().Values(u).Template().Values(u)},
+	} {
+		_, _, err := tc.q.Build()
+		if err == nil {
+			t.Errorf("%s: built", tc.what)
+		}
+	}
+}
+
+// nativeStubPool is a stubPool whose driver takes JSON as it is.
+type nativeStubPool struct{ stubPool }
+
+func (nativeStubPool) NativeJSON() bool { return true }
+
+type batchDoc struct {
+	barm.BaseModel `barm:"table:docs"`
+
+	Meta map[string]any `barm:"meta,json"`
+}
+
+// A template's row encodes for where it runs, not where it was built: a
+// builder-only DB encodes JSON, and a pool taking it as it is gets the map.
+func TestInsertTemplateEncodesForItsSession(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := barm.New(nativeStubPool{stubPool{stub}})
+	ins := barm.NewBuilder(barm.Postgres).Insert[batchDoc]().Template()
+	doc := &batchDoc{Meta: map[string]any{"k": "v"}}
+
+	_, built, err := ins.Values(doc).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := built[0].(string); !ok {
+		t.Errorf("on the builder: %T, want encoded JSON", built[0])
+	}
+	b := db.Batch()
+	b.Exec(ins.Values(doc))
+	err = b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stub.sent[0].Args[0].(map[string]any); !ok {
+		t.Errorf("in the batch: %T, want the map", stub.sent[0].Args[0])
+	}
+}
+
+// One template binds and queues from many goroutines at once, each getting
+// its own arguments.
+func TestTemplateConcurrent(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	ins := postTemplate(db)
+	var wg sync.WaitGroup
+	for g := range 16 {
+		wg.Go(func() {
+			for i := range 100 {
+				author := int64(g*1000 + i)
+				with := ins.With(barm.Named("title", "t"), barm.Named("body", "b"), barm.Named("author", author))
+				b := db.Batch()
+				b.OneAs[batchPostRow](with)
+				b.SliceAs[batchUser](with)
+				b.Exec(with)
+				_, args, err := with.Build()
+				if err != nil || b.Err() != nil || args[2] != author {
+					t.Errorf("goroutine %d: args %v, err %v, %v", g, args, err, b.Err())
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// Arguments that do not match the template's names fail the query they are
+// bound into, and so does a named argument anywhere but a template.
+func TestTemplateMisuse(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	two := db.Select[batchUser]().Where("age > ? AND name = ?", barm.Named("age", nil), barm.Named("name", nil)).Template()
+
+	for _, tc := range []struct {
+		what string
+		q    barm.Query
+	}{
+		{"too few", two.With(barm.Named("age", 1))},
+		{"a name it does not have", two.With(barm.Named("age", 1), barm.Named("email", "x"))},
+		{"a name twice", two.With(barm.Named("age", 1), barm.Named("age", 2))},
+		{"a valued placeholder", db.Select[batchUser]().Where("age > ?", barm.Named("age", 1)).Template().With(barm.Named("age", 1))},
+		{"an unnamed placeholder", db.Select[batchUser]().Where("age > ?", barm.Named("", nil)).Template().With(barm.Named("", 1))},
+		{"no template", db.NewRaw("SELECT 1 WHERE ? > 0", barm.Named("n", 1))},
+	} {
+		r := db.Batch().SliceAs[batchUser](tc.q)
+		if r.Err() == nil || errors.Is(r.Err(), barm.ErrNotRun) {
+			t.Errorf("%s: %v", tc.what, r.Err())
+		}
+	}
+	_, _, err := db.Select[batchUser]().Where("id IN (?)", two.With(barm.Named("age", 1), barm.Named("name", "x"))).Build()
+	if err == nil {
+		t.Error("a template nested in a query built")
+	}
+	_, _, err = db.Select[batchUser]().Where("age > ?", barm.Named("age", nil)).Build()
+	if !strings.Contains(fmt.Sprint(err), "Template") {
+		t.Errorf("a named argument outside a template built: %v", err)
+	}
+}
+
+func BenchmarkBatchQueueBuilt(b *testing.B) {
+	db := stubbed(&stubBatcher{})
+	b.ReportAllocs()
+	bt := db.Batch()
+	for i := 0; b.Loop(); i++ {
+		if bt.Len() == 10000 {
+			bt = db.Batch()
+		}
+		bt.SliceAs[batchPostRow](insertIfAuthor(db, int64(i), "a title", "a body"))
+	}
+}
+
+func BenchmarkBatchQueueTemplate(b *testing.B) {
+	db := stubbed(&stubBatcher{})
+	ins := postTemplate(db)
+	b.ReportAllocs()
+	bt := db.Batch()
+	for i := 0; b.Loop(); i++ {
+		if bt.Len() == 10000 {
+			bt = db.Batch()
+		}
+		bt.SliceAs[batchPostRow](ins.With(barm.Named("title", "a title"), barm.Named("body", "a body"), barm.Named("author", int64(i))))
+	}
+}
+
+func BenchmarkBatchQueueTemplateGrown(b *testing.B) {
+	db := stubbed(&stubBatcher{})
+	ins := postTemplate(db)
+	b.ReportAllocs()
+	bt := db.Batch()
+	bt.Grow(10000)
+	for i := 0; b.Loop(); i++ {
+		if bt.Len() == 10000 {
+			bt = db.Batch()
+			bt.Grow(10000)
+		}
+		bt.SliceAs[batchPostRow](ins.With(barm.Named("title", "a title"), barm.Named("body", "a body"), barm.Named("author", int64(i))))
 	}
 }

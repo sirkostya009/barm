@@ -167,6 +167,26 @@ func (q *SelectQuery[T]) Prepare(name string) *SelectQuery[T] {
 	return q
 }
 
+// Template renders the query once, to run again with new values for its named
+// arguments. See Template.
+func (q *SelectQuery[T]) Template() *Template[T] {
+	query, args, err := q.Build()
+	if len(q.rels) > 0 {
+		err = errTemplateRelations
+	}
+	return newTemplate[T](q.runner, q.target(), query, args, err)
+}
+
+// TemplateAs renders the query once as BuildAs does, to run again with new
+// values for its named arguments, its rows read as U. See Template.
+func (q *SelectQuery[T]) TemplateAs[U any]() *Template[U] {
+	query, args, err := q.BuildAs[U]()
+	if len(q.rels) > 0 {
+		err = errTemplateRelations
+	}
+	return newTemplate[U](q.runner, q.target(), query, args, err)
+}
+
 // Table overrides the table expression, e.g. Table("users AS u").
 func (q *SelectQuery[T]) Table(expr string, args ...any) *SelectQuery[T] {
 	q.table = &frag{sql: expr, args: args}

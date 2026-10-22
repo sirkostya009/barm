@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"time"
 )
 
@@ -102,6 +103,7 @@ type Batch struct {
 	// time instead, which reports them, so the batch must not.
 	fallback bool
 	watch    watch // as the handle it was started on watches its calls
+	s        *session
 	names    *names
 	qs       []BatchQuery
 	sinks    []sink
@@ -179,7 +181,7 @@ type sink interface {
 }
 
 func newBatch(e Executor, s *session, inTx, held bool) *Batch {
-	out := &Batch{e: e, hooks: newBatchHooks(s.hooks), names: s.names, inTx: inTx, held: held, watch: s.watch}
+	out := &Batch{e: e, hooks: newBatchHooks(s.hooks), s: s, names: s.names, inTx: inTx, held: held, watch: s.watch}
 	if e == nil {
 		out.err = ErrNoConn
 	}
@@ -188,6 +190,20 @@ func newBatch(e Executor, s *session, inTx, held bool) *Batch {
 
 // Len returns the number of queued queries.
 func (b *Batch) Len() int { return len(b.sinks) }
+
+// Grow makes room for n more queries, so a loop that knows how many it queues
+// does not regrow the batch on the way, nor leave it holding the slack of the
+// last doubling until Run.
+func (b *Batch) Grow(n int) {
+	b.qs = slices.Grow(b.qs, n)
+	b.sinks = slices.Grow(b.sinks, n)
+	if b.hooks != nil {
+		b.hooks.ts = slices.Grow(b.hooks.ts, n)
+		if b.watch&watchCaller != 0 {
+			b.hooks.callers = slices.Grow(b.hooks.callers, n)
+		}
+	}
+}
 
 // Err returns the first queueing error, if any. Run reports it too.
 func (b *Batch) Err() error { return b.err }
@@ -298,10 +314,10 @@ type asQuery interface {
 	batchAs(m *model, err error, one bool) (string, []any, error)
 }
 
-func buildAs[U any](q Query, one bool) (string, []any, error) {
+func buildAs[U any](s *session, q Query, one bool) (string, []any, error) {
 	a, ok := q.(asQuery)
 	if !ok {
-		return q.Build()
+		return buildIn(s, q)
 	}
 	m, err := modelOf[U]()
 	return a.batchAs(m, err, one)
@@ -316,14 +332,14 @@ func buildAs[U any](q Query, one bool) (string, []any, error) {
 //
 // A select's relations load through One, so they are an error here.
 func (b *Batch) OneAs[U any](q Query) *BatchResult[U] {
-	query, args, err := buildAs[U](q, true)
+	query, args, err := buildAs[U](b.s, q, true)
 	return queueRow[U](b, targetOf(q), stmtName(q), query, args, err)
 }
 
 // SliceAs queues any query and collects its rows as U, rendered as OneAs
 // renders it, without the LIMIT.
 func (b *Batch) SliceAs[U any](q Query) *BatchResult[[]U] {
-	query, args, err := buildAs[U](q, false)
+	query, args, err := buildAs[U](b.s, q, false)
 	return queueSlice[U](b, targetOf(q), stmtName(q), query, args, err, 0)
 }
 
@@ -470,8 +486,19 @@ func (b *Batch) Exec(q Query) *BatchResult[ExecResult] {
 	if w, ok := q.(returningWrite); ok && w.hasReturning() {
 		return b.queueReturning(q, w)
 	}
-	query, args, err := q.Build()
+	query, args, err := buildIn(b.s, q)
 	return b.queueExec(targetOf(q), stmtName(q), query, args, err)
+}
+
+// buildIn builds q for a batch in session s, which a template's arguments are
+// encoded for.
+func buildIn(s *session, q Query) (string, []any, error) {
+	if t, ok := q.(interface {
+		buildIn(*session) (string, []any, error)
+	}); ok {
+		return t.buildIn(s)
+	}
+	return q.Build()
 }
 
 // stmtName is the name q was given to Prepare, if any.
@@ -641,7 +668,7 @@ func (b *Batch) loadRelations(ctx context.Context, rels []relLoad) error {
 	}
 	if err == nil {
 		err = loadLevels(ctx, level, func(ctx context.Context, level []*pending) error {
-			return batchRelations(ctx, &Batch{e: b.e, hooks: newBatchHooks(b.hooks.list()), names: b.names, inTx: b.inTx, held: b.held, watch: b.watch}, level)
+			return batchRelations(ctx, &Batch{e: b.e, hooks: newBatchHooks(b.hooks.list()), s: b.s, names: b.names, inTx: b.inTx, held: b.held, watch: b.watch}, level)
 		})
 	}
 	for _, l := range rels {

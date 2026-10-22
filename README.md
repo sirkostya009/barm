@@ -1126,6 +1126,9 @@ of row types, and a loop can queue as many as it likes.
 - **Relations** on queued selects load after the batch, breadth-first across all its
   queries.
 - **Queries render when queued,** so later changes to a struct do not affect the batch.
+- **`Grow(n)`** makes room for n more queries up front. A loop that knows its count skips
+  the batch regrowing as it fills, and the slack the last doubling would leave held until
+  `Run`.
 
 `database/sql` cannot send statements together, so a batch on `barm.SQL` fails with
 `ErrNoBatcher` rather than quietly running one query at a time. To run it one statement at a
@@ -1142,6 +1145,87 @@ grows with latency:
 batched      171 µs/op
 sequential   547 µs/op     3.2× slower
 ```
+
+### Templates: one statement, many arguments
+
+A query that runs again and again with different values gets built each time: two builders
+and the SQL text, per call, only to throw them away. A template renders it once and keeps
+only the SQL, with where each value goes. A named argument with no value (`sql.Named`, or
+`barm.Named` to skip importing `database/sql`) stands for each, and `With` binds them by
+name. Built on a `NewBuilder` DB, a template needs no connection, so it can live at package
+level and run on whatever handle `Via` names:
+
+```go
+var qb = barm.NewBuilder(barm.Postgres)
+
+var insertPost = qb.Insert[CreatePost]().Table("posts").Select(
+	qb.Select[User]().ColumnExpr("u.id, ?, ?", barm.Named("title", nil), barm.Named("body", nil)).
+		Where("u.id = ?", barm.Named("author", nil))).TemplateAs[Post]()
+
+func (r *posts) Insert(ctx context.Context, p CreatePost) (Post, error) {
+	return insertPost.With(barm.Named("title", p.Title), barm.Named("body", p.Body),
+		barm.Named("author", p.AuthorID)).Via(r.handle(ctx)).One(ctx)
+}
+```
+
+In a batch, a bound template queues as any query does, so a loop pays for its arguments
+alone:
+
+```go
+b := db.Batch()
+for _, p := range posts {
+	rows = append(rows, b.OneAs[Post](insertPost.With(
+		barm.Named("title", p.Title), barm.Named("body", p.Body), barm.Named("author", p.AuthorID))))
+}
+```
+
+- **The shape is fixed when it renders.** `Template` renders the query as written, and
+  `TemplateAs[U]` as `BuildAs[U]` does: a select narrowed to U's columns, a write returning
+  them. Reading it later maps whatever columns that SQL returns, by name. `One` adds no
+  `LIMIT`. For two result types, make two templates:
+
+  ```go
+  func base() *barm.SelectQuery[User] { return qb.Select[User]().Where("age > ?", barm.Named("age", nil)) }
+
+  var namesOver = base().TemplateAs[UserName]()
+  var usersOver = base().TemplateAs[User]()
+  ```
+
+  A template keeps nothing of its builder, so a builder made only to be templated is
+  garbage once it is.
+- **An insert with no values of its own writes the row `Values` gives.** Its template is an
+  `InsertTemplate[T, U]`: rows go in as `T`, and what it returns reads as `U`. It encodes
+  the row's `json`, `array` and `nullzero` fields for the handle it runs on, as the builder
+  does:
+
+  ```go
+  var insertUser = qb.Insert[User]().TemplateAs[User]()
+
+  u, err := insertUser.Values(&User{Name: "ann", Email: "a@x.io"}).Via(db).One(ctx)
+
+  var upsertUser = qb.Insert[User]().On("CONFLICT (email) DO UPDATE").
+  	Set("name = ?", barm.Named("name", nil)).Template()
+
+  _, err = upsertUser.Values(&u, barm.Named("name", "bo")).Via(db).Exec(ctx)
+  ```
+
+  It writes one row per call: a batch queueing it per row writes many. Its columns are
+  those the builder would write for a row setting every one, so a column with a default is
+  written only when `Column` names it, and then written as given, zero or not.
+- **A bound template has `One`, `Slice`, `OneAs`, `SliceAs` and `Exec`.** A raw query's
+  template is a `Template[any]`: it has no row type of its own, so it reads through `OneAs`
+  and `SliceAs`.
+- **It runs where its query was started,** unless `Via` says otherwise. On a `NewBuilder`
+  DB that is nowhere, and it reports `ErrNoConn`. The handle should speak the dialect the
+  template was built for.
+- **`With` takes every name once,** in any order. A name used twice in the query takes its
+  value in both places. A missing, unknown or repeated name fails that query.
+- **Relations do not load through a template,** so a select asking for them fails to
+  become one, and `Exec` scans no `RETURNING` rows back, since the template has no values
+  of its own to scan them into.
+- **A template runs on its own.** One nested in another query is an error, and so is a
+  query with a named argument built any way but through a template.
+- **A template never changes,** so it is safe for any number of goroutines at once.
 
 ### Batches in transactions
 
