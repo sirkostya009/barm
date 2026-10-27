@@ -77,12 +77,12 @@ type rowSlot struct {
 type rowField struct{ f *field }
 
 // newTemplate keeps a rendered query and finds its named arguments.
-func newTemplate[T any](r runner, t target, query string, args []any, err error) *Template[T] {
+func newTemplate[T any](r runner, t target, query string, args []any, err error) Template[T] {
 	var idents identSlotsError
 	if errors.As(err, &idents) || errors.Is(err, errNamedArg) {
 		err = nil
 	}
-	tp := &Template[T]{h: r.h, name: r.name, t: t, query: query, args: args, err: err}
+	tp := Template[T]{h: r.h, name: r.name, t: t, query: query, args: args, err: err}
 	if err == nil {
 		tp.index(idents)
 	}
@@ -166,18 +166,20 @@ func (t *Template[T]) Prepare(name string) *Template[T] {
 // Its columns are those the insert would write for a row setting every one: a
 // column with a default only when Column names it, and then written as given,
 // zero or not.
-type InsertTemplate[T, U any] struct{ *Template[U] }
+type InsertTemplate[T, U any] struct{ Template[U] }
 
 // Prepare is Template.Prepare for an insert's template.
 func (t *InsertTemplate[T, U]) Prepare(name string) *InsertTemplate[T, U] {
-	return &InsertTemplate[T, U]{t.Template.Prepare(name)}
+	c := *t
+	c.name = name
+	return &c
 }
 
 // Values returns the query writing row, with each named argument bound to the
 // value args gives its name. The row is read as it binds, so a change to it
 // after that is not written.
 func (t *InsertTemplate[T, U]) Values(row *T, args ...sql.NamedArg) *Bound[U] {
-	return &Bound[U]{t: t.Template, h: t.h, args: args, row: row}
+	return &Bound[U]{t: &t.Template, h: t.h, args: args, row: row}
 }
 
 // bind fills the named arguments in with args, and the row's columns with

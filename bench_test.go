@@ -198,3 +198,29 @@ func (r *fakeDriverRows) Next(dest []driver.Value) error {
 	dest[0], dest[1], dest[2], dest[3], dest[4] = int64(r.i), "name", "e@x", int64(30), fakeAt
 	return nil
 }
+
+// A template run straight off With, which needs nothing of the bound query
+// once it returns.
+func BenchmarkTemplateOne(b *testing.B) {
+	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres))
+	tp := db.Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	ctx := b.Context()
+	b.ReportAllocs()
+	for b.Loop() {
+		_, err := tp.With(barm.Named("id", 7)).One(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTemplateBuild(b *testing.B) {
+	tp := barm.NewBuilder(barm.Postgres).Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _, err := tp.With(barm.Named("id", 7)).Build()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

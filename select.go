@@ -174,7 +174,8 @@ func (q *SelectQuery[T]) Template() *Template[T] {
 	if len(q.rels) > 0 {
 		err = errTemplateRelations
 	}
-	return newTemplate[T](q.runner, q.target(), query, args, err)
+	tp := newTemplate[T](q.runner, q.target(), query, args, err)
+	return &tp
 }
 
 // TemplateAs renders the query once as BuildAs does, to run again with new
@@ -184,7 +185,8 @@ func (q *SelectQuery[T]) TemplateAs[U any]() *Template[U] {
 	if len(q.rels) > 0 {
 		err = errTemplateRelations
 	}
-	return newTemplate[U](q.runner, q.target(), query, args, err)
+	tp := newTemplate[U](q.runner, q.target(), query, args, err)
+	return &tp
 }
 
 // Table overrides the table expression, e.g. Table("users AS u").

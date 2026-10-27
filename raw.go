@@ -58,7 +58,8 @@ func (q *RawQuery) argCount() int { return len(q.f.args) }
 // and SliceAs. See Template.
 func (q *RawQuery) Template() *Template[any] {
 	query, args, err := q.Build()
-	return newTemplate[any](q.runner, targetOf(q), query, args, err)
+	tp := newTemplate[any](q.runner, targetOf(q), query, args, err)
+	return &tp
 }
 
 // Exec runs the statement.
