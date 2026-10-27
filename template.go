@@ -141,7 +141,7 @@ func (t *Template[T]) nameIndex(name string) int {
 // With returns the query with each named argument bound to the value args
 // gives its name. Every name takes one.
 func (t *Template[T]) With(args ...sql.NamedArg) *Bound[T] {
-	return &Bound[T]{t: t, h: t.h, args: args}
+	return &Bound[T]{t: t, args: args}
 }
 
 // Prepare returns the template running as the prepared statement name, or
@@ -179,7 +179,7 @@ func (t *InsertTemplate[T, U]) Prepare(name string) *InsertTemplate[T, U] {
 // value args gives its name. The row is read as it binds, so a change to it
 // after that is not written.
 func (t *InsertTemplate[T, U]) Values(row *T, args ...sql.NamedArg) *Bound[U] {
-	return &Bound[U]{t: &t.Template, h: t.h, args: args, row: row}
+	return &Bound[U]{t: &t.Template, args: args, row: row}
 }
 
 // bind fills the named arguments in with args, and the row's columns with
@@ -294,14 +294,15 @@ func identValue(a sql.NamedArg) (string, error) {
 // Bound is a Template's query with its arguments, see Template.
 type Bound[T any] struct {
 	t    *Template[T]
-	h    IDB // the template's, unless Via changed it
+	h    IDB // Via's, if it was called
 	args []sql.NamedArg
 	row  any // the *T an InsertTemplate writes, nil for any other
 }
 
-// Via runs the query on h rather than where the template's was started, which
-// for a template built on a NewBuilder DB is the only place it can run. Unlike
-// a builder's Via it changes q, which With made for this one call.
+// Via runs the query on h. Without it the query runs on the handle in the ctx
+// its terminal is given, see WithIDB, or else where the template was started,
+// which for one built on a NewBuilder DB is nowhere. Unlike a builder's Via it
+// changes q, which With made for this one call.
 func (q *Bound[T]) Via(h IDB) *Bound[T] {
 	q.h = h
 	return q
@@ -319,45 +320,67 @@ func (q *Bound[T]) Seq(ctx context.Context) iter.Seq2[T, error] { return q.SeqAs
 // OneAs reads the first row as U, mapping the columns the query returns by
 // name, or ErrNoRows.
 func (q *Bound[T]) OneAs[U any](ctx context.Context) (U, error) {
-	query, args, err := q.t.bind(q.h.sess(), q.args, q.row)
+	h := q.on(ctx)
+	query, args, err := q.t.bind(h.sess(), q.args, q.row)
 	if err != nil {
 		var zero U
 		return zero, err
 	}
-	rn := runner{q.h, q.t.name}
+	rn := runner{h, q.t.name}
 	return rn.one[U](ctx, q.t.t, query, args)
 }
 
 // SliceAs reads every row as U, mapping the columns the query returns by name.
 func (q *Bound[T]) SliceAs[U any](ctx context.Context) ([]U, error) {
-	query, args, err := q.t.bind(q.h.sess(), q.args, q.row)
+	h := q.on(ctx)
+	query, args, err := q.t.bind(h.sess(), q.args, q.row)
 	if err != nil {
 		return nil, err
 	}
-	rn := runner{q.h, q.t.name}
+	rn := runner{h, q.t.name}
 	return rn.slice[U](ctx, q.t.t, query, args, 0)
 }
 
 // SeqAs streams every row as U, mapping the columns the query returns by name.
 func (q *Bound[T]) SeqAs[U any](ctx context.Context) iter.Seq2[U, error] {
-	query, args, err := q.t.bind(q.h.sess(), q.args, q.row)
-	rn := runner{q.h, q.t.name}
+	h := q.on(ctx)
+	query, args, err := q.t.bind(h.sess(), q.args, q.row)
+	rn := runner{h, q.t.name}
 	return rn.seq[U](ctx, q.t.t, query, args, err)
 }
 
 // Exec runs the query for its row count.
 func (q *Bound[T]) Exec(ctx context.Context) (sql.Result, error) {
-	query, args, err := q.t.bind(q.h.sess(), q.args, q.row)
+	h := q.on(ctx)
+	query, args, err := q.t.bind(h.sess(), q.args, q.row)
 	if err != nil {
 		return nil, err
 	}
-	rn := runner{q.h, q.t.name}
+	rn := runner{h, q.t.name}
 	return rn.exec(ctx, q.t.t, query, args)
 }
 
-// Build returns the template's SQL with the arguments bound, encoded for the
-// handle it runs on.
-func (q *Bound[T]) Build() (string, []any, error) { return q.buildIn(q.h.sess()) }
+// on is the handle the query runs on: Via's, else the one in ctx, else the
+// template's.
+func (q *Bound[T]) on(ctx context.Context) IDB {
+	if q.h != nil {
+		return q.h
+	}
+	if h := IDBFrom(ctx); h != nil {
+		return h
+	}
+	return q.t.h
+}
+
+// Build returns the template's SQL with the arguments bound, encoded for Via's
+// handle, or else the template's: it takes no ctx to find one in.
+func (q *Bound[T]) Build() (string, []any, error) {
+	h := q.h
+	if h == nil {
+		h = q.t.h
+	}
+	return q.buildIn(h.sess())
+}
 
 // buildIn is Build for a batch, whose session the arguments are encoded for.
 func (q *Bound[T]) buildIn(s *session) (string, []any, error) {

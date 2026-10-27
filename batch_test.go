@@ -873,3 +873,74 @@ func BenchmarkTemplateIdentSlot(b *testing.B) {
 		}
 	})
 }
+
+// ranOn is a DB answering every query with one User row, which records its
+// name in ran when it runs one.
+func ranOn(name string, ran *[]string) *barm.DB {
+	return barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres), barm.WithHook(barm.QueryHook{
+		AfterQuery: func(context.Context, *barm.QueryEvent) { *ran = append(*ran, name) },
+	}))
+}
+
+// A bound template runs on Via's handle, else the one in ctx, else its own;
+// Build, with no ctx, never looks for one.
+func TestTemplateHandleFromContext(t *testing.T) {
+	t.Parallel()
+	var ran []string
+	own, inCtx, via := ranOn("own", &ran), ranOn("ctx", &ran), ranOn("via", &ran)
+	tp := own.Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	ctx := barm.WithIDB(t.Context(), inCtx)
+
+	run := func(ctx context.Context, q *barm.Bound[User]) {
+		t.Helper()
+		_, err := q.One(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t.Context(), tp.With(barm.Named("id", 1)))
+	run(ctx, tp.With(barm.Named("id", 1)))
+	run(ctx, tp.With(barm.Named("id", 1)).Via(via))
+	_, err := tp.With(barm.Named("id", 1)).Slice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, err := range tp.With(barm.Named("id", 1)).Seq(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"own", "ctx", "via", "ctx", "ctx"}; !slices.Equal(ran, want) {
+		t.Errorf("ran on %v, want %v", ran, want)
+	}
+
+	qb := barm.NewBuilder(barm.Postgres).Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	_, err = qb.With(barm.Named("id", 1)).One(t.Context())
+	if !errors.Is(err, barm.ErrNoConn) {
+		t.Errorf("a builder's template with nothing in ctx: %v, want ErrNoConn", err)
+	}
+	_, err = qb.With(barm.Named("id", 1)).One(ctx)
+	if err != nil {
+		t.Errorf("a builder's template with a DB in ctx: %v", err)
+	}
+}
+
+// HandleFrom is the handle in ctx, or the fallback; a ctx carrying another
+// replaces it.
+func TestHandleFrom(t *testing.T) {
+	t.Parallel()
+	a, b := barm.NewBuilder(barm.Postgres), barm.NewBuilder(barm.Postgres)
+	if h := barm.HandleFrom(t.Context(), a); h.IDB != a {
+		t.Error("empty ctx: not the fallback")
+	}
+	if barm.IDBFrom(t.Context()) != nil {
+		t.Error("empty ctx: IDBFrom is not nil")
+	}
+	ctx := barm.WithIDB(t.Context(), b)
+	if h := barm.HandleFrom(ctx, a); h.IDB != b {
+		t.Error("ctx with b: not b")
+	}
+	if h := barm.HandleFrom(barm.WithIDB(ctx, a), b); h.IDB != a {
+		t.Error("ctx with b, then a: not a")
+	}
+}

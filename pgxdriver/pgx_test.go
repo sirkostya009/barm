@@ -402,6 +402,40 @@ func TestTemplateVia(t *testing.T) {
 	}
 }
 
+// A template from a builder-only DB runs inside the transaction its ctx
+// carries, seeing what it wrote, and its writes go when that rolls back.
+func TestTemplateInContextTx(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	seed(t, db)
+
+	qb := barm.NewBuilder(barm.Postgres)
+	rename := qb.Update[User]().Set("name = ?", barm.Named("to", nil)).Where("name = ?", barm.Named("from", nil)).Template()
+	named := qb.Select[User]().Where("name = ?", barm.Named("name", nil)).Template()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txCtx := barm.WithIDB(ctx, tx)
+	_, err = rename.With(barm.Named("to", "ann2"), barm.Named("from", "ann")).Exec(txCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, err := named.With(barm.Named("name", "ann2")).One(txCtx); err != nil || u.Name != "ann2" {
+		t.Errorf("inside: %+v, %v", u, err)
+	}
+	if u, err := barm.HandleFrom(txCtx, db).Select[User]().Where("name = ?", "ann2").One(ctx); err != nil || u.Name != "ann2" {
+		t.Errorf("HandleFrom inside: %+v, %v", u, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := named.With(barm.Named("name", "ann2")).One(barm.WithIDB(ctx, db)); !errors.Is(err, barm.ErrNoRows) {
+		t.Errorf("after rolling back: %v, want ErrNoRows", err)
+	}
+}
+
 type tenantNote struct {
 	barm.BaseModel `barm:"table:notes,alias:n"`
 

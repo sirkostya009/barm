@@ -1219,9 +1219,10 @@ for _, p := range posts {
 - **A bound template has `One`, `Slice`, `Seq`, their `As` forms, and `Exec`.** A raw
   query's template is a `Template[any]`: it has no row type of its own, so it reads through
   `OneAs`, `SliceAs` and `SeqAs`.
-- **It runs where its query was started,** unless `Via` says otherwise. On a `NewBuilder`
-  DB that is nowhere, and it reports `ErrNoConn`. The handle should speak the dialect the
-  template was built for.
+- **It runs on `Via`'s handle, else the one its ctx carries, else where its query was
+  started.** See [the handle in ctx](#the-handle-in-ctx). On a `NewBuilder` DB that last is
+  nowhere, and it reports `ErrNoConn`. The handle should speak the dialect the template was
+  built for. `Build` takes no ctx, so it encodes for `Via`'s handle or the template's.
 - **`barm.IdentSlot` leaves an identifier to `With`,** a schema say, which it writes quoted
   as `Ident` would, binding nothing:
 
@@ -1520,6 +1521,38 @@ func inTx(ctx context.Context, h barm.IDB, fn func(*barm.Tx) error) error {
 `Handle` is a stopgap, and `IDB` takes over its methods once Go allows generic methods in
 interfaces. A query that is already built runs on any handle through
 [`Via`](#reusing-and-composing-queries).
+
+### The handle in ctx
+
+A transaction opened in a service has to reach every query the service calls, through
+layers that only pass a ctx along. `WithIDB` puts any handle in a ctx, and `IDBFrom` reads
+it back, nil when there is none:
+
+```go
+tx, err := db.BeginTx(ctx, nil)
+if err != nil {
+	return err
+}
+defer tx.Rollback()
+ctx = barm.WithIDB(ctx, tx)
+```
+
+Two things read it, and nothing else:
+
+- **A bound template with no `Via`** runs on it, so a package-level template joins the
+  caller's transaction: `insertPost.With(...).One(ctx)`.
+- **`HandleFrom(ctx, fallback)`** returns it as a `Handle`, or the fallback when ctx carries
+  none, for starting a builder:
+
+  ```go
+  func (r *posts) ByID(ctx context.Context, id int64) (Post, error) {
+  	return barm.HandleFrom(ctx, r.db).Select[Post]().Where("id = ?", id).One(ctx)
+  }
+  ```
+
+A query started on a DB, Tx or Conn runs there, whatever its ctx carries. Nesting is the
+caller's: to open a savepoint inside the transaction in ctx, begin on what `IDBFrom` returns.
+The lookup walks ctx's values, about 5 ns plus 1 ns for each one wrapped around the handle.
 
 **`Query`** is any built query: every builder, and `NewRaw`. Only barm's own types can
 implement it, because a nested query renders into the enclosing query to share its argument

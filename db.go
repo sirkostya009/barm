@@ -163,6 +163,37 @@ func (h Handle) NewRaw(query string, args ...any) *RawQuery { return newRaw(h.ru
 // [ValuesQuery].
 func (h Handle) Values[T any](rows []T) *ValuesQuery[T] { return newValues(h.runner(), rows) }
 
+type idbKey struct{}
+
+// WithIDB returns ctx carrying h, for a call that should run on it without
+// being handed it: a transaction opened further up, say.
+//
+//	tx, err := db.BeginTx(ctx, nil)
+//	ctx = barm.WithIDB(ctx, tx)
+//
+// A bound template with no Via runs on it, and HandleFrom returns it. Builders
+// never read it: a query started on a DB runs on that DB.
+func WithIDB(ctx context.Context, h IDB) context.Context {
+	return context.WithValue(ctx, idbKey{}, h)
+}
+
+// IDBFrom returns the handle WithIDB put in ctx, or nil.
+func IDBFrom(ctx context.Context) IDB {
+	h, _ := ctx.Value(idbKey{}).(IDB)
+	return h
+}
+
+// HandleFrom returns the handle in ctx, or fallback when there is none, for
+// starting a query that joins the caller's transaction if it has one:
+//
+//	barm.HandleFrom(ctx, r.db).Select[Post]().Where("id = ?", id).One(ctx)
+func HandleFrom(ctx context.Context, fallback IDB) Handle {
+	if h := IDBFrom(ctx); h != nil {
+		return Handle{h}
+	}
+	return Handle{fallback}
+}
+
 // Option configures a DB.
 type Option func(*DB)
 

@@ -103,6 +103,11 @@ field tagged `pk` (a column named `id` is not one), and `UPDATE`/`DELETE` pick
 rows only through `Where` or `WherePK`. Prefer an explicit call or tag over a
 convention barm would have to guess at.
 
+A handle put in ctx with `WithIDB` is read in two places only: a bound template
+with no `Via`, which has no handle of its own worth running on, and
+`HandleFrom`, which the caller asks. A query started on a handle runs on that
+handle whatever its ctx carries.
+
 A slice is one bind argument, which pgx sends as a Postgres array — match it
 with `= ANY(?)`. `In(slice)` is the opt-in that spells it out inside the
 parentheses the SQL wrote. A `Query` passed as an argument renders in place and
