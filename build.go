@@ -54,8 +54,10 @@ type builder struct {
 
 	// err is what went wrong writing a fragment, which has no way to return
 	// one; done reports it.
-	err   error
-	dedup bool
+	err error
+	// idents is where each IdentSlot sits in the SQL, reported the same way.
+	idents []identAt
+	dedup  bool
 	// named says an argument is a sql.NamedArg, which binds only through a
 	// Template: done reports it, with the query, for a template to take.
 	named bool
@@ -100,6 +102,7 @@ func (r *runner) builder() *builder {
 	b.d, b.b, b.args = d, b.b[:0], nil
 	s := r.h.sess()
 	b.dedup, b.bound, b.index, b.err, b.named = s.dedup && r.name == "" && d.NumberedArgs(), b.bound[:0], nil, nil, false
+	b.idents = b.idents[:0]
 	b.nativeJSON, b.nativeArrays = s.nativeJSON, s.nativeArrays
 	return b
 }
@@ -119,7 +122,10 @@ func (b *builder) done() (string, []any, error) {
 		return "", nil, err
 	}
 	query, args := string(b.b), b.args
-	if b.named {
+	switch {
+	case len(b.idents) > 0:
+		err = identSlotsError(slices.Clone(b.idents))
+	case b.named:
 		err = errNamedArg
 	}
 	b.release()
@@ -312,6 +318,12 @@ func (b *builder) frag(f frag) *builder {
 		case ident:
 			b.ident(string(v))
 			continue
+		case identSlot:
+			b.idents = append(b.idents, identAt{len(b.b), string(v)})
+			continue
+		case tuple:
+			b.tuple(v.v)
+			continue
 		case safe:
 			b.str(string(v))
 			continue
@@ -358,10 +370,90 @@ func Ident(name string) any { return ident(name) }
 // argument instead, or in Ident.
 func Safe(sql string) any { return safe(sql) }
 
+// IdentSlot stands where an identifier goes in a Template, a schema say, which
+// With fills by name as Ident would:
+//
+//	var byAuthor = qb.Select[Post]().Table("?.posts AS p", barm.IdentSlot("schema")).
+//		Where("p.author_id = ?", barm.Named("author", nil)).Template()
+//
+//	byAuthor.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
+//
+// It binds no argument. The identifier is spliced into the template's SQL on
+// every call.
+func IdentSlot(name string) any { return identSlot(name) }
+
+// Tuple writes a slice as a parenthesized list of placeholders, one per
+// element, and an element that is itself a slice as a tuple of its own, for
+// matching several columns at once:
+//
+//	Where("(org_id, id) IN ?", barm.Tuple(keys)) // (org_id, id) IN (($1, $2), ($3, $4))
+//
+// A []byte is one value, not a tuple. An empty slice is a build error, as with
+// In.
+func Tuple(slice any) any { return tuple{slice} }
+
 type (
-	ident string
-	safe  string
+	ident     string
+	identSlot string
+	safe      string
 )
+
+type identAt struct {
+	at   int // byte offset in the SQL
+	name string
+}
+
+// identSlotsError is what a query with an IdentSlot builds with: an error to any
+// caller but a template, which takes the slots from it.
+type identSlotsError []identAt
+
+func (identSlotsError) Error() string {
+	return "barm: an IdentSlot is filled only through a Template's With"
+}
+
+type tuple struct{ v any }
+
+func (b *builder) tuple(v any) {
+	b.byte('(')
+	if vs, ok := v.([]any); ok {
+		if len(vs) == 0 {
+			b.fail(errEmptyList)
+		}
+		for i, e := range vs {
+			if i > 0 {
+				b.str(", ")
+			}
+			b.tupleElem(e)
+		}
+		b.byte(')')
+		return
+	}
+	rv := reflect.ValueOf(v)
+	if k := rv.Kind(); k != reflect.Slice && k != reflect.Array {
+		b.fail(fmt.Errorf("barm: Tuple takes a slice, got %T", v))
+		return
+	}
+	if rv.Len() == 0 {
+		b.fail(errEmptyList)
+	}
+	for i := range rv.Len() {
+		if i > 0 {
+			b.str(", ")
+		}
+		b.tupleElem(rv.Index(i).Interface())
+	}
+	b.byte(')')
+}
+
+func (b *builder) tupleElem(e any) {
+	if _, ok := e.([]byte); !ok {
+		if k := reflect.TypeOf(e); k != nil && (k.Kind() == reflect.Slice || k.Kind() == reflect.Array) && k.Elem().Kind() != reflect.Uint8 {
+			b.tuple(e)
+			return
+		}
+	}
+	b.placeholder(e)
+}
 
 type inList struct{ v any }
 
@@ -700,7 +792,7 @@ func (b *builder) with(w withClause) error {
 // errEmptyList is what an empty In reports: `IN ()` is a syntax error on
 // Postgres and MySQL, and `IN (NULL)` would match nothing under NOT too, so what
 // an empty filter means is the caller's to decide before the query.
-var errEmptyList = errors.New("barm: empty slice passed to In — decide what an empty filter means before querying")
+var errEmptyList = errors.New("barm: empty slice passed to In or Tuple — decide what an empty filter means before querying")
 
 // errNoTable is what a query with nothing to name in its FROM or INTO reports.
 var errNoTable = errors.New("barm: no table — embed barm.BaseModel with a table tag, or name one with Table")

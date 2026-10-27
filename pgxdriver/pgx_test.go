@@ -390,6 +390,77 @@ func TestTemplateVia(t *testing.T) {
 	if err != nil || len(names) != 3 || names[0].Name != "ann2" {
 		t.Errorf("after rolling back: %+v, %v", names, err)
 	}
+	var seen []string
+	for u, err := range olderThan.With(barm.Named("age", 20)).Via(db).Seq(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen = append(seen, u.Name)
+	}
+	if len(seen) != 3 {
+		t.Errorf("Seq = %v", seen)
+	}
+}
+
+type tenantNote struct {
+	barm.BaseModel `barm:"table:notes,alias:n"`
+
+	ID   int64  `barm:"id,pk,autoincrement"`
+	Body string `barm:"body"`
+}
+
+// An IdentSlot picks the schema a template's query reads, per call: each
+// schema's rows come back from its own table, unprepared or prepared under a
+// name per schema, alone or batched.
+func TestTemplateIdentSlot(t *testing.T) {
+	ctx := t.Context()
+	db := open(t)
+	for _, q := range []string{
+		`DROP SCHEMA IF EXISTS barm_t1 CASCADE`, `DROP SCHEMA IF EXISTS "barm t2" CASCADE`,
+		`CREATE SCHEMA barm_t1`, `CREATE SCHEMA "barm t2"`,
+		`CREATE TABLE barm_t1.notes (id bigserial PRIMARY KEY, body text)`,
+		`CREATE TABLE "barm t2".notes (id bigserial PRIMARY KEY, body text)`,
+		`INSERT INTO barm_t1.notes (body) VALUES ('one'), ('two')`,
+		`INSERT INTO "barm t2".notes (body) VALUES ('three')`,
+	} {
+		if _, err := db.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		db.Exec(context.Background(), `DROP SCHEMA IF EXISTS barm_t1 CASCADE`)
+		db.Exec(context.Background(), `DROP SCHEMA IF EXISTS "barm t2" CASCADE`)
+	})
+
+	after := barm.NewBuilder(barm.Postgres).Select[tenantNote]().Table("?.notes AS n", barm.IdentSlot("schema")).
+		Where("n.id > ?", barm.Named("after", nil)).OrderBy("n.id").Template()
+	for _, name := range []string{"", "notes_after"} {
+		in := func(schema string) *barm.Bound[tenantNote] {
+			tp := after
+			if name != "" {
+				tp = after.Prepare(name + "_" + schema)
+			}
+			return tp.With(barm.Named("schema", schema), barm.Named("after", 0))
+		}
+		for range 2 { // the second time, on a statement already prepared
+			one, err := in("barm_t1").Via(db).Slice(ctx)
+			if err != nil || len(one) != 2 || one[1].Body != "two" {
+				t.Errorf("%q, barm_t1: %+v, %v", name, one, err)
+			}
+			two, err := in("barm t2").Via(db).Slice(ctx)
+			if err != nil || len(two) != 1 || two[0].Body != "three" {
+				t.Errorf("%q, barm t2: %+v, %v", name, two, err)
+			}
+		}
+		b := db.Batch()
+		r1, r2 := b.SliceAs[tenantNote](in("barm_t1")), b.SliceAs[tenantNote](in("barm t2"))
+		if err := b.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(r1.Value()) != 2 || len(r2.Value()) != 1 {
+			t.Errorf("%q, batched: %+v, %+v", name, r1.Value(), r2.Value())
+		}
+	}
 }
 
 // An insert template from a builder-only DB writes rows encoded for where they

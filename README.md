@@ -438,6 +438,7 @@ Where("age >= ?", 18)                  // postgres: age >= $1      mysql, sqlite
 Where("name = ?1 OR email = ?1", v)    // postgres: one argument, referenced twice
 Where("id = ANY(?)", ids)              // id = ANY($1), a slice is one argument: an array
 Where("id IN (?)", barm.In(ids))       // id IN ($1, $2, $3), spelled out
+Where("(a, b) IN ?", barm.Tuple(keys)) // (a, b) IN (($1, $2), ($3, $4)), parenthesized
 Where("data ?? 'key'")                 // ?? is a literal question mark
 ```
 
@@ -454,6 +455,9 @@ Where("data ?? 'key'")                 // ?? is a literal question mark
   write: `IN (?)`. It is how to filter by a list on MySQL and SQLite, which have no arrays.
   An empty `In` is a build error, since `IN ()` is not SQL, so decide what an empty filter
   means before building. Reused through `?N`, the list is spelled out again.
+- **`barm.Tuple` is `In` with its own parentheses,** and an element that is itself a slice
+  becomes a tuple of its own, which is how to match several columns at once. A `[]byte`
+  element stays one value. An empty one is a build error, as with `In`.
 - **`barm.Ident` writes an identifier** where its `?` is, quoted for the dialect, for a
   table or column known only at run time: `Join("JOIN ? AS tv ON tv.id = t.id",
   barm.Ident(tempTable))`. A dotted name is quoted per part, `"schema"."table"`, and a
@@ -1212,12 +1216,32 @@ for _, p := range posts {
   It writes one row per call: a batch queueing it per row writes many. Its columns are
   those the builder would write for a row setting every one, so a column with a default is
   written only when `Column` names it, and then written as given, zero or not.
-- **A bound template has `One`, `Slice`, `OneAs`, `SliceAs` and `Exec`.** A raw query's
-  template is a `Template[any]`: it has no row type of its own, so it reads through `OneAs`
-  and `SliceAs`.
+- **A bound template has `One`, `Slice`, `Seq`, their `As` forms, and `Exec`.** A raw
+  query's template is a `Template[any]`: it has no row type of its own, so it reads through
+  `OneAs`, `SliceAs` and `SeqAs`.
 - **It runs where its query was started,** unless `Via` says otherwise. On a `NewBuilder`
   DB that is nowhere, and it reports `ErrNoConn`. The handle should speak the dialect the
   template was built for.
+- **`barm.IdentSlot` leaves an identifier to `With`,** a schema say, which it writes quoted
+  as `Ident` would, binding nothing:
+
+  ```go
+  var postsBy = qb.Select[Post]().Table("?.posts AS p", barm.IdentSlot("schema")).
+  	Where("p.author_id = ?", barm.Named("author", nil)).Template()
+
+  posts, err := postsBy.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
+  ```
+
+  The identifier is spliced into the SQL on every call, which costs one allocation the
+  size of the query. Each value is SQL of its own, and a `Prepare` name binds to one SQL
+  text, so a prepared template with a slot needs a name per value. `Prepare` on the
+  template returns a copy under another name, leaving the template as it was:
+
+  ```go
+  postsBy.Prepare("posts_by_" + tenant).With(barm.Named("schema", tenant), ...)
+  ``` pgx keeps 512 statements per connection by default, so
+  schemas × templates past that evict each other. A database with that many schemas is
+  better served by `SET LOCAL search_path` in each transaction.
 - **`With` takes every name once,** in any order. A name used twice in the query takes its
   value in both places. A missing, unknown or repeated name fails that query.
 - **Relations do not load through a template,** so a select asking for them fails to

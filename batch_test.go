@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -498,6 +499,125 @@ func TestTemplateBindCost(t *testing.T) {
 	}
 }
 
+func schemaTemplate(db *barm.DB) *barm.Template[batchUser] {
+	return db.Select[batchUser]().Table("?.batch_users AS u", barm.IdentSlot("schema")).
+		Where("u.age > ?", barm.Named("age", nil)).Template()
+}
+
+// An IdentSlot renders the identifier With gives it, quoted, binding nothing.
+func TestTemplateIdentSlot(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	tp := schemaTemplate(db)
+
+	b := db.Batch()
+	for _, schema := range []any{"t1", barm.Ident(`t"2`), "t1"} {
+		b.SliceAs[batchUser](tp.With(barm.Named("age", 30), barm.Named("schema", schema)))
+	}
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, two, again := stub.sent[0], stub.sent[1], stub.sent[2]
+	if want := `FROM "t1".batch_users AS u WHERE u.age > $1`; !strings.Contains(one.Query, want) {
+		t.Errorf("t1: %s\nwant it to read %s", one.Query, want)
+	}
+	if want := `FROM "t""2".batch_users AS u`; !strings.Contains(two.Query, want) {
+		t.Errorf(`t"2: %s`, two.Query)
+	}
+	if !reflect.DeepEqual(one.Args, []any{30}) {
+		t.Errorf("args = %v", one.Args)
+	}
+	if again.Query != one.Query {
+		t.Errorf("t1 again: %s", again.Query)
+	}
+}
+
+// A Prepare name is used as given: one name over two schemas binds it to two
+// SQL texts, which fails, and Prepare gives each schema a name of its own
+// without touching the template it was called on.
+func TestTemplateIdentSlotPrepare(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	tp := schemaTemplate(db)
+	in := func(tp *barm.Template[batchUser], schema string) *barm.Bound[batchUser] {
+		return tp.With(barm.Named("age", 30), barm.Named("schema", schema))
+	}
+
+	over := tp.Prepare("over")
+	b := db.Batch()
+	b.SliceAs[batchUser](in(over, "t1"))
+	if r := b.SliceAs[batchUser](in(over, "t2")); r.Err() == nil {
+		t.Error("one name took two schemas")
+	}
+
+	b = db.Batch()
+	for _, schema := range []string{"t3", "t4"} {
+		b.SliceAs[batchUser](in(tp.Prepare("over_"+schema), schema))
+	}
+	b.SliceAs[batchUser](in(tp, "t3"))
+	err := b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{stub.sent[0].Name, stub.sent[1].Name, stub.sent[2].Name}; !slices.Equal(got, []string{"over_t3", "over_t4", ""}) {
+		t.Errorf("names = %q", got)
+	}
+
+	ins := db.Insert[batchUser]().Template().Prepare("ins")
+	b = db.Batch()
+	b.Exec(ins.Values(&batchUser{Name: "a"}))
+	err = b.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stub.sent[0].Name != "ins" {
+		t.Errorf("insert template name = %q", stub.sent[0].Name)
+	}
+}
+
+// Splicing an IdentSlot costs the SQL it writes, and nothing else.
+//
+//nolint:paralleltest // AllocsPerRun refuses a parallel test
+func TestTemplateIdentSlotCost(t *testing.T) {
+	tp := schemaTemplate(barm.NewBuilder(barm.Postgres))
+	with := []sql.NamedArg{barm.Named("schema", "t1"), barm.Named("age", 30)}
+	n := testing.AllocsPerRun(100, func() {
+		_, _, _ = tp.With(with...).Build()
+	})
+	if n > 2 {
+		t.Errorf("binding takes %v allocs", n)
+	}
+}
+
+// An IdentSlot is filled by a template alone, with a name that is a string,
+// once per call.
+func TestTemplateIdentSlotMisuse(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	tp := schemaTemplate(db)
+	for _, tc := range []struct {
+		what string
+		q    barm.Query
+	}{
+		{"no template", db.Select[batchUser]().Table("?.batch_users", barm.IdentSlot("schema"))},
+		{"no value", tp.With(barm.Named("age", 1), barm.Named("other", "x"))},
+		{"not a string", tp.With(barm.Named("age", 1), barm.Named("schema", 7))},
+		{"empty", tp.With(barm.Named("age", 1), barm.Named("schema", ""))},
+		{"twice", tp.With(barm.Named("schema", "a"), barm.Named("schema", "b"))},
+		{"unnamed", db.Select[batchUser]().Table("?.batch_users", barm.IdentSlot("")).Template().With(barm.Named("", "x"))},
+		{"both kinds", db.Select[batchUser]().Table("?.batch_users", barm.IdentSlot("s")).
+			Where("name = ?", barm.Named("s", nil)).Template().With(barm.Named("s", "x"))},
+	} {
+		_, _, err := tc.q.Build()
+		if err == nil {
+			t.Errorf("%s: built", tc.what)
+		}
+	}
+}
+
 // A name bound twice takes the value in both places, around arguments the
 // query fixed.
 func TestTemplateNames(t *testing.T) {
@@ -725,4 +845,31 @@ func BenchmarkBatchQueueTemplateGrown(b *testing.B) {
 		}
 		bt.SliceAs[batchPostRow](ins.With(barm.Named("title", "a title"), barm.Named("body", "a body"), barm.Named("author", int64(i))))
 	}
+}
+
+func BenchmarkTemplateIdentSlot(b *testing.B) {
+	db := stubbed(&stubBatcher{})
+	slotted := schemaTemplate(db)
+	b.Run("slot", func(b *testing.B) {
+		with := []sql.NamedArg{barm.Named("schema", "tenant_42"), barm.Named("age", 30)}
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _, err := slotted.With(with...).Build()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	tp := db.Select[batchUser]().Table("tenant_42.batch_users AS u").
+		Where("u.age > ?", barm.Named("age", nil)).Template()
+	b.Run("no-slot", func(b *testing.B) {
+		with := []sql.NamedArg{barm.Named("age", 30)}
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _, err := tp.With(with...).Build()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

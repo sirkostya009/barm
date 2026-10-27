@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1006,6 +1007,38 @@ func TestIn(t *testing.T) {
 			if err == nil {
 				t.Errorf("%s: expected a build error", what)
 			}
+		}
+	}
+}
+
+// Tuple parenthesizes its list itself, nests a slice element as a tuple of its
+// own, keeps a []byte one value, and refuses what In refuses.
+func TestTuple(t *testing.T) {
+	t.Parallel()
+	pg := barm.NewBuilder(barm.Postgres)
+	blob := []byte("b")
+	for _, tc := range []struct {
+		expr string
+		arg  any
+		want string
+		args []any
+	}{
+		{"id IN ?", barm.Tuple([]int64{1, 2}), "id IN ($1, $2)", []any{int64(1), int64(2)}},
+		{"(a, b) IN ?", barm.Tuple([][]any{{1, "x"}, {2, "y"}}), "(a, b) IN (($1, $2), ($3, $4))", []any{1, "x", 2, "y"}},
+		{"(a, b) IN ?", barm.Tuple([][2]int{{1, 2}}), "(a, b) IN (($1, $2))", []any{1, 2}},
+		{"(a, b) IN ?", barm.Tuple([]any{[]any{1, blob}}), "(a, b) IN (($1, $2))", []any{1, blob}},
+	} {
+		q, args, err := pg.Select[User]().Where(tc.expr, tc.arg).Build()
+		if err != nil || !strings.HasSuffix(q, "WHERE "+tc.want) || !reflect.DeepEqual(args, tc.args) {
+			t.Errorf("%s: %s %v, %v — want %s %v", tc.expr, q, args, err, tc.want, tc.args)
+		}
+	}
+	for what, arg := range map[string]any{
+		"empty": barm.Tuple([]int64{}), "empty any": barm.Tuple([]any{}), "empty inner": barm.Tuple([][]int{{}}), "not a slice": barm.Tuple(7),
+	} {
+		_, _, err := pg.Select[User]().Where("id IN ?", arg).Build()
+		if err == nil {
+			t.Errorf("%s: expected a build error", what)
 		}
 	}
 }
