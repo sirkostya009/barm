@@ -318,7 +318,7 @@ func (b *builder) frag(f frag) *builder {
 		case ident:
 			b.ident(string(v))
 			continue
-		case identSlot:
+		case Slot:
 			b.idents = append(b.idents, identAt{len(b.b), string(v)})
 			continue
 		case tuple:
@@ -370,17 +370,21 @@ func Ident(name string) any { return ident(name) }
 // argument instead, or in Ident.
 func Safe(sql string) any { return safe(sql) }
 
-// IdentSlot stands where an identifier goes in a Template, a schema say, which
-// With fills by name as Ident would:
+// IdentSlot stands where an identifier goes in a Template, which With fills by
+// name as Ident would. It goes wherever an identifier does: in SQL as an
+// argument, or to a builder's Schema, or a write's Table:
 //
-//	var byAuthor = qb.Select[Post]().Table("?.posts AS p", barm.IdentSlot("schema")).
+//	var byAuthor = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
 //		Where("p.author_id = ?", barm.Named("author", nil)).Template()
 //
 //	byAuthor.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
 //
 // It binds no argument. The identifier is spliced into the template's SQL on
 // every call.
-func IdentSlot(name string) any { return identSlot(name) }
+func IdentSlot(name string) Slot { return Slot(name) }
+
+// Slot is an IdentSlot, see there.
+type Slot string
 
 // Tuple writes a slice as a parenthesized list of placeholders, one per
 // element, and an element that is itself a slice as a tuple of its own, for
@@ -393,9 +397,8 @@ func IdentSlot(name string) any { return identSlot(name) }
 func Tuple(slice any) any { return tuple{slice} }
 
 type (
-	ident     string
-	identSlot string
-	safe      string
+	ident string
+	safe  string
 )
 
 type identAt struct {
@@ -797,12 +800,27 @@ var errEmptyList = errors.New("barm: empty slice passed to In or Tuple — decid
 // errNoTable is what a query with nothing to name in its FROM or INTO reports.
 var errNoTable = errors.New("barm: no table — embed barm.BaseModel with a table tag, or name one with Table")
 
-// table writes a table name, under its schema when there is one.
+// table writes a table name, under its schema when there is one, either of
+// them an IdentSlot as identName keeps it.
 func (b *builder) table(schema, name string) *builder {
 	if schema != "" {
-		b.ident(schema).byte('.')
+		b.slotIdent(schema).byte('.')
+	}
+	return b.slotIdent(name)
+}
+
+// slotIdent writes name quoted, or records where an IdentSlot identName kept
+// goes.
+func (b *builder) slotIdent(name string) *builder {
+	if len(name) > 0 && name[0] == slotMark[0] {
+		return b.slot(name[1:])
 	}
 	return b.ident(name)
+}
+
+func (b *builder) slot(name string) *builder {
+	b.idents = append(b.idents, identAt{len(b.b), name})
+	return b
 }
 
 // tableRef writes `table AS alias` (or just the table when unaliased).
@@ -819,4 +837,26 @@ func (m *model) ref() string {
 		return m.alias
 	}
 	return m.table
+}
+
+// slotMark starts an identifier a builder keeps that is an IdentSlot's name,
+// a byte no identifier holds, so a builder keeps a string rather than box one.
+const slotMark = "\x00"
+
+// identName is the identifier a builder keeps for name: an IdentSlot's name
+// after slotMark, or the name.
+func identName[S ~string](name S) string {
+	if slot, ok := any(name).(Slot); ok {
+		return slotMark + string(slot)
+	}
+	return string(name)
+}
+
+// hookName is an identifier as hooks see it, unknown for an IdentSlot until
+// the template runs.
+func hookName(name string) string {
+	if strings.HasPrefix(name, slotMark) {
+		return ""
+	}
+	return name
 }

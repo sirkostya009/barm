@@ -37,16 +37,16 @@ func newInsert[T any](r runner) *InsertQuery[T] {
 }
 
 // Schema qualifies the table this writes to, as `schema.table`. It applies to
-// a name given with Table too.
-func (q *InsertQuery[T]) Schema(name string) *InsertQuery[T] {
-	q.schema = name
+// a name given with Table too. name is a string, or an IdentSlot.
+func (q *InsertQuery[T]) Schema[S ~string](name S) *InsertQuery[T] {
+	q.schema = identName(name)
 	return q
 }
 
 // Table overrides where this writes, for a T whose BaseModel names another
-// table or none at all.
-func (q *InsertQuery[T]) Table(name string) *InsertQuery[T] {
-	q.table = name
+// table or none at all. name is a string, or an IdentSlot.
+func (q *InsertQuery[T]) Table[S ~string](name S) *InsertQuery[T] {
+	q.table = identName(name)
 	return q
 }
 
@@ -435,7 +435,7 @@ func (q *InsertQuery[T]) render(b *builder) error {
 }
 
 func (q *InsertQuery[T]) target() target {
-	return target{op: "INSERT", table: q.tableName(), schema: q.schema}
+	return target{op: "INSERT", table: hookName(q.tableName()), schema: hookName(q.schema)}
 }
 
 // Exec runs the insert. With a RETURNING clause the returned columns are

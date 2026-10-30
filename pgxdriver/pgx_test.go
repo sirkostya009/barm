@@ -495,6 +495,24 @@ func TestTemplateIdentSlot(t *testing.T) {
 			t.Errorf("%q, batched: %+v, %+v", name, r1.Value(), r2.Value())
 		}
 	}
+
+	insert := barm.NewBuilder(barm.Postgres).Insert[tenantNote]().Schema(barm.IdentSlot("schema")).Template()
+	t2 := insert.Ident(barm.Named("schema", "barm t2"))
+	b := db.Batch()
+	for _, body := range []string{"four", "five"} {
+		b.OneAs[tenantNote](t2.Values(&tenantNote{Body: body}))
+	}
+	b.OneAs[tenantNote](insert.Values(&tenantNote{Body: "six"}, barm.Named("schema", "barm_t1")))
+	err := b.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for schema, want := range map[string]int{"barm_t1": 3, "barm t2": 3} {
+		rows, err := after.With(barm.Named("schema", schema), barm.Named("after", 0)).Via(db).Slice(ctx)
+		if err != nil || len(rows) != want {
+			t.Errorf("%s after inserts: %+v, %v", schema, rows, err)
+		}
+	}
 }
 
 // An insert template from a builder-only DB writes rows encoded for where they

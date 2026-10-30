@@ -197,9 +197,10 @@ func (q *SelectQuery[T]) Table(expr string, args ...any) *SelectQuery[T] {
 
 // Schema qualifies the model's table, as `schema.table`. A custom table
 // expression set with [SelectQuery.Table] overrides it, since that owns its own naming.
-// Relations loaded with Relation inherit it unless they set their own.
-func (q *SelectQuery[T]) Schema(name string) *SelectQuery[T] {
-	q.schema = name
+// Relations loaded with Relation inherit it unless they set their own. name is
+// a string, or an IdentSlot.
+func (q *SelectQuery[T]) Schema[S ~string](name S) *SelectQuery[T] {
+	q.schema = identName(name)
 	return q
 }
 
@@ -540,7 +541,7 @@ func (q *SelectQuery[T]) tableName() string {
 }
 
 func (q *SelectQuery[T]) target() target {
-	return target{op: "SELECT", table: q.tableName(), schema: q.schema}
+	return target{op: "SELECT", table: q.tableName(), schema: hookName(q.schema)}
 }
 
 // Rows runs the query and returns its rows, for the caller to read and close.

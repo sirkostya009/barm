@@ -618,6 +618,192 @@ func TestTemplateIdentSlotMisuse(t *testing.T) {
 	}
 }
 
+// Param and Ident, mixed in any order, leave a template binding the rest
+// exactly as With binding all of it would.
+func TestTemplateParam(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	tp := db.NewRaw("SELECT ?, ? FROM ?.a WHERE x = ? AND ?.a.y = ? AND z = ?",
+		barm.Named("p", nil), barm.Named("y", nil), barm.IdentSlot("s"), barm.Named("x", nil),
+		barm.IdentSlot("s"), barm.Named("y", nil), barm.Named("z", nil)).Template()
+	vals := map[string]any{"p": 1, "s": "ss", "x": 2, "y": nil, "z": 4}
+	all := func(names ...string) []sql.NamedArg {
+		out := make([]sql.NamedArg, 0, len(names))
+		for _, n := range names {
+			out = append(out, barm.Named(n, vals[n]))
+		}
+		return out
+	}
+	full, fargs, err := tp.With(all("p", "s", "x", "y", "z")...).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range [][]string{{"p", "s", "x", "y", "z"}, {"z", "y", "s", "x", "p"}, {"y", "x", "z", "p", "s"}} {
+		for fixed := 1; fixed <= len(order); fixed++ {
+			got := *tp
+			for _, n := range order[:fixed] {
+				if n == "s" {
+					got = got.Ident(barm.Named(n, "ss"))
+				} else {
+					got = got.Param(barm.Named(n, vals[n]))
+				}
+			}
+			query, args, err := got.With(all(order[fixed:]...)...).Build()
+			if err != nil || query != full || !reflect.DeepEqual(args, fargs) {
+				t.Errorf("%v fixed:\n%s %v %v\nwant\n%s %v", order[:fixed], query, args, err, full, fargs)
+			}
+			// the same arguments, fixed in one call each
+			var params []sql.NamedArg
+			got = *tp
+			for _, n := range order[:fixed] {
+				if n == "s" {
+					got = got.Ident(barm.Named(n, "ss"))
+				} else {
+					params = append(params, barm.Named(n, vals[n]))
+				}
+			}
+			got = got.Param(params...)
+			query, args, err = got.With(all(order[fixed:]...)...).Build()
+			if err != nil || query != full || !reflect.DeepEqual(args, fargs) {
+				t.Errorf("%v fixed at once:\n%s %v %v", order[:fixed], query, args, err)
+			}
+		}
+	}
+	_, _, err = tp.With(all("p", "s", "x", "y")...).Build()
+	if err == nil {
+		t.Error("a template took one name too few")
+	}
+	for _, got := range []barm.Template[any]{tp.Param(barm.Named("nope", 1)), tp.Param(barm.Named("s", "ss")), tp.Param(barm.Named("x", 1)).Param(barm.Named("x", 2)),
+		tp.Param(barm.Named("x", 1), barm.Named("x", 2)), tp.Param(barm.Named("x", 1), barm.Named("nope", 2))} {
+		_, _, err := got.With(all("p", "s", "y", "z")...).Build()
+		if err == nil {
+			t.Errorf("%v built", got)
+		}
+	}
+}
+
+// Ident splices an IdentSlot once, into every place it stands, and leaves a
+// template binding the rest exactly as With binding all of it would.
+func TestTemplateIdent(t *testing.T) {
+	t.Parallel()
+	db := stubbed(&stubBatcher{reader: emptyReader{}})
+	tp := db.NewRaw("SELECT ? FROM ?.a JOIN ?.b ON ? WHERE ?.b.x = ? AND y = ?",
+		barm.Named("p", nil), barm.IdentSlot("s"), barm.IdentSlot("t"), barm.IdentSlot("c"), barm.IdentSlot("s"),
+		barm.Named("x", nil), barm.Named("y", nil)).Template()
+	full, fargs, err := tp.With(barm.Named("p", 1), barm.Named("s", `we"ird`), barm.Named("t", "tt"),
+		barm.Named("c", "cc"), barm.Named("x", 2), barm.Named("y", 3)).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range [][3]string{{"s", "t", "c"}, {"c", "s", "t"}, {"t", "c", "s"}} {
+		vals := map[string]string{"s": `we"ird`, "t": "tt", "c": "cc"}
+		got := *tp
+		for _, name := range order[:2] {
+			got = got.Ident(barm.Named(name, vals[name]))
+		}
+		last := order[2]
+		query, args, err := got.With(barm.Named("y", 3), barm.Named(last, vals[last]), barm.Named("x", 2), barm.Named("p", 1)).Build()
+		if err != nil {
+			t.Fatalf("%v: %v", order, err)
+		}
+		if query != full || !reflect.DeepEqual(args, fargs) {
+			t.Errorf("%v:\n%s %v\nwant\n%s %v", order, query, args, full, fargs)
+		}
+		filled := got.Ident(barm.Named(last, vals[last]))
+		query, _, err = filled.With(barm.Named("y", 3), barm.Named("x", 2), barm.Named("p", 1)).Build()
+		if err != nil || query != full {
+			t.Errorf("%v, all filled: %s %v", order, query, err)
+		}
+		// the first two in one call, in its order, the last with an Ident value
+		once := tp.Ident(barm.Named(order[1], vals[order[1]]), barm.Named(order[0], vals[order[0]]))
+		query, args, err = once.With(barm.Named("x", 2), barm.Named(last, barm.Ident(vals[last])), barm.Named("y", 3), barm.Named("p", 1)).Build()
+		if err != nil || query != full || !reflect.DeepEqual(args, fargs) {
+			t.Errorf("%v, two at once:\n%s %v %v", order, query, args, err)
+		}
+		all := tp.Ident(barm.Named("c", "cc"), barm.Named("s", `we"ird`), barm.Named("t", "tt"))
+		query, _, err = all.With(barm.Named("y", 3), barm.Named("x", 2), barm.Named("p", 1)).Build()
+		if err != nil || query != full {
+			t.Errorf("all at once: %s %v", query, err)
+		}
+	}
+	_, _, err = tp.With(barm.Named("p", 1), barm.Named("x", 2), barm.Named("y", 3)).Build()
+	if err == nil {
+		t.Error("Ident changed the template it was called on")
+	}
+	for _, tc := range []struct{ what, name, value string }{
+		{"unknown", "nope", "x"},
+		{"an argument", "x", "x"},
+		{"empty", "s", ""},
+		{"twice", "s", "x"},
+		{"twice in one call", "s", "x"},
+		{"not a name", "t", ""},
+	} {
+		got := tp.Ident(barm.Named(tc.name, tc.value))
+		switch tc.what {
+		case "twice":
+			got = tp.Ident(barm.Named("s", "x")).Ident(barm.Named(tc.name, tc.value))
+		case "twice in one call":
+			got = tp.Ident(barm.Named("s", "x"), barm.Named(tc.name, tc.value))
+		case "not a name":
+			got = tp.Ident(barm.Named(tc.name, 7))
+		}
+		_, _, err := got.With().Build()
+		if err == nil || !strings.Contains(err.Error(), "IdentSlot") && !strings.Contains(err.Error(), "argument") && !strings.Contains(err.Error(), "already") {
+			t.Errorf("%s: %v", tc.what, err)
+		}
+	}
+}
+
+// Schema, and a write's Table, take an IdentSlot as they take a name, quoted
+// as With or Ident fills it.
+func TestSchemaIdentSlot(t *testing.T) {
+	t.Parallel()
+	stub := &stubBatcher{reader: emptyReader{}}
+	db := stubbed(stub)
+	ins := db.Insert[newBatchUser]().Table("batch_users").Schema(barm.IdentSlot("schema")).TemplateAs[batchUser]()
+	upd := db.Update[batchUser]().Schema(barm.IdentSlot("schema")).Set("age = ?", barm.Named("age", nil)).
+		Where("id = ?", barm.Named("id", nil)).Template()
+	del := db.Delete[batchUser]().Schema(barm.IdentSlot("schema")).Where("id = ?", barm.Named("id", nil)).Template()
+	tbl := db.Delete[batchUser]().Schema("fixed").Table(barm.IdentSlot("table")).Where("id = 1").Template()
+	sel := db.Select[batchUser]().Schema(barm.IdentSlot("schema")).Where("u.age > ?", barm.Named("age", nil)).Template()
+	insT1, delT4 := ins.Ident(barm.Named("schema", `t"1`)), del.Ident(barm.Named("schema", "t4"))
+	for _, tc := range []struct {
+		q    barm.Query
+		want string
+	}{
+		{insT1.Values(&newBatchUser{Name: "ann"}), `INSERT INTO "t""1"."batch_users" (`},
+		{ins.Values(&newBatchUser{Name: "ann"}, barm.Named("schema", "t2")), `INSERT INTO "t2"."batch_users" (`},
+		{upd.With(barm.Named("schema", "t3"), barm.Named("age", 1), barm.Named("id", 2)), `UPDATE "t3"."batch_users" SET`},
+		{delT4.With(barm.Named("id", 2)), `DELETE FROM "t4"."batch_users" WHERE`},
+		{tbl.With(barm.Named("table", "archive")), `DELETE FROM "fixed"."archive" WHERE`},
+		{sel.With(barm.Named("schema", "t5"), barm.Named("age", 1)), `SELECT "u"."id", `},
+	} {
+		query, _, err := tc.q.Build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(query, tc.want) {
+			t.Errorf("%s\nwant it to start %s", query, tc.want)
+		}
+	}
+	query, _, err := sel.With(barm.Named("schema", "t5"), barm.Named("age", 1)).Build()
+	if want := `FROM "t5"."batch_users" AS "u" WHERE`; err != nil || !strings.Contains(query, want) {
+		t.Errorf("select: %s %v\nwant it to read %s", query, err, want)
+	}
+	_, _, err = db.Insert[newBatchUser]().Table("batch_users").Schema(barm.IdentSlot("schema")).Values(&newBatchUser{}).Build()
+	if err == nil {
+		t.Error("an IdentSlot built outside a template")
+	}
+}
+
+// Schema keeps a name as it is, boxing nothing for taking an IdentSlot too.
+func TestSchemaAllocs(t *testing.T) { //nolint:paralleltest // AllocsPerRun refuses parallel tests
+	q, name := barm.NewBuilder(barm.Postgres).Delete[batchUser](), strings.Repeat("s", 3)
+	if n := testing.AllocsPerRun(100, func() { q.Schema(name) }); n != 0 {
+		t.Errorf("Schema allocates %v times", n)
+	}
+}
+
 // A name bound twice takes the value in both places, around arguments the
 // query fixed.
 func TestTemplateNames(t *testing.T) {
@@ -855,6 +1041,17 @@ func BenchmarkTemplateIdentSlot(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			_, _, err := slotted.With(with...).Build()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	filled := slotted.Ident(barm.Named("schema", "tenant_42"))
+	b.Run("ident", func(b *testing.B) {
+		with := []sql.NamedArg{barm.Named("age", 30)}
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _, err := filled.With(with...).Build()
 			if err != nil {
 				b.Fatal(err)
 			}

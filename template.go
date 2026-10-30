@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math/bits"
 	"reflect"
 	"slices"
 	"unsafe"
@@ -63,6 +64,7 @@ type Template[T any] struct {
 	idents []slot    // where in query each IdentSlot sits, by byte offset, and which of inames it takes
 	inames []int     // the names IdentSlots take, each once
 	row    []rowSlot // where in args each column of a row given to Values sits
+	filled uint64    // the names Ident or Param filled, by bit, which With no longer takes
 	err    error
 }
 
@@ -156,6 +158,143 @@ func (t *Template[T]) Prepare(name string) *Template[T] {
 	return &c
 }
 
+// Ident returns the template with the IdentSlots idents name filled with the
+// identifiers they give, spliced once rather than on every call, leaving t as
+// it was. A batch writing one tenant's rows fills its slots once and binds each
+// row's values alone:
+//
+//	posts := insertPost.Ident(barm.Named("schema", tenant), barm.Named("table", "posts_2026"))
+//	for _, p := range rows {
+//		b.OneAs[Post](posts.With(barm.Named("title", p.Title), ...))
+//	}
+//
+// Slots it leaves out are still With's. The copy costs more than a splice, so
+// a single call gives its slots to With.
+func (t Template[T]) Ident(idents ...sql.NamedArg) Template[T] {
+	t.ident(idents)
+	return t
+}
+
+// ident splices each of idents into every IdentSlot its name takes, and marks
+// the names filled, in one pass over the SQL.
+func (t *Template[T]) ident(idents []sql.NamedArg) {
+	if t.err != nil || len(idents) == 0 {
+		return
+	}
+	d := t.h.Dialect()
+	var buf [4]string
+	fill := buf[:0] // by inames index, "" for a slot left to With
+	if len(t.inames) > len(buf) {
+		fill = make([]string, 0, len(t.inames))
+	}
+	fill = fill[:len(t.inames)]
+	n := len(t.query)
+	for _, a := range idents {
+		i := t.fillable(a.Name)
+		if i < 0 {
+			return
+		}
+		k := slices.Index(t.inames, i)
+		if k < 0 {
+			t.err = fmt.Errorf("barm: the template's %q is an argument, not an IdentSlot", a.Name)
+			return
+		}
+		v, err := identValue(a)
+		if err != nil {
+			t.err = err
+			return
+		}
+		fill[k] = v
+		t.filled |= 1 << i
+	}
+	for _, id := range t.idents {
+		n += len(fill[id.name]) + 2 // quoted; a quote or dot inside grows it
+	}
+	b := make([]byte, 0, n)
+	left := make([]slot, 0, len(t.idents))
+	prev := 0
+	for _, id := range t.idents {
+		v := fill[id.name]
+		if v == "" {
+			left = append(left, slot{id.at + len(b) - prev, id.name})
+			continue
+		}
+		b = append(b, t.query[prev:id.at]...)
+		b = d.AppendIdent(b, v)
+		prev = id.at
+	}
+	b = append(b, t.query[prev:]...)
+	t.query = unsafe.String(unsafe.SliceData(b), len(b))
+	t.idents = left
+}
+
+// fillable is the index of the name Ident or Param fills, or -1 with t.err set
+// when there is none to fill.
+func (t *Template[T]) fillable(name string) int {
+	i := slices.Index(t.names, name)
+	switch {
+	case i < 0:
+		t.err = fmt.Errorf("barm: the template has no argument or IdentSlot named %q", name)
+	case i >= 64:
+		t.err = fmt.Errorf("barm: the template's %q comes after the 64 names Ident and Param can fill", name)
+	case t.filled&(1<<i) != 0:
+		t.err = fmt.Errorf("barm: the template's %q was filled already", name)
+	default:
+		return i
+	}
+	return -1
+}
+
+// Param returns the template with the arguments params name bound to the
+// values they give once, so With no longer takes them, leaving t as it was. A
+// value every call shares, a batch's author say, stops costing each call its
+// place in With's arguments:
+//
+//	byAuthor := insertPost.Param(barm.Named("author", author), barm.Named("status", "draft"))
+//
+// The copy costs far more than a place in With, so a value that changes per
+// call goes to With.
+func (t Template[T]) Param(params ...sql.NamedArg) Template[T] {
+	t.param(params)
+	return t
+}
+
+// param writes each of params wherever its name binds, and marks the names
+// filled, in one copy of the arguments.
+func (t *Template[T]) param(params []sql.NamedArg) {
+	if t.err != nil || len(params) == 0 {
+		return
+	}
+	var now uint64
+	for _, p := range params {
+		i := t.fillable(p.Name)
+		if i < 0 {
+			return
+		}
+		if slices.Contains(t.inames, i) {
+			t.err = fmt.Errorf("barm: the template's %q is an IdentSlot, which Ident fills", p.Name)
+			return
+		}
+		t.filled |= 1 << i
+		now |= 1 << i
+	}
+	t.args = slices.Clone(t.args)
+	slots := make([]slot, 0, len(t.slots))
+	for _, sl := range t.slots {
+		if now&(1<<sl.name) == 0 {
+			slots = append(slots, sl)
+			continue
+		}
+		for _, p := range params {
+			if p.Name == t.names[sl.name] {
+				t.args[sl.at] = p.Value
+				break
+			}
+		}
+	}
+	t.slots = slots
+}
+
 // InsertTemplate is an insert's Template, which takes the row it writes as T
 // and reads what it returns as U:
 //
@@ -173,6 +312,18 @@ func (t *InsertTemplate[T, U]) Prepare(name string) *InsertTemplate[T, U] {
 	c := *t
 	c.name = name
 	return &c
+}
+
+// Ident is Template.Ident for an insert's template.
+func (t InsertTemplate[T, U]) Ident(idents ...sql.NamedArg) InsertTemplate[T, U] {
+	t.ident(idents)
+	return t
+}
+
+// Param is Template.Param for an insert's template.
+func (t InsertTemplate[T, U]) Param(params ...sql.NamedArg) InsertTemplate[T, U] {
+	t.param(params)
+	return t
 }
 
 // Values returns the query writing row, with each named argument bound to the
@@ -196,8 +347,8 @@ func (t *Template[T]) bind(s *session, args []sql.NamedArg, row any) (string, []
 	case len(t.row) == 0 && row != nil:
 		return "", nil, errors.New("barm: the template writes no row of its own, so Values takes none")
 	}
-	if len(args) != len(t.names) {
-		return "", nil, fmt.Errorf("barm: the template takes %d named arguments, With was given %d", len(t.names), len(args))
+	if want := len(t.names) - bits.OnesCount64(t.filled); len(args) != want {
+		return "", nil, fmt.Errorf("barm: the template takes %d named arguments, With was given %d", want, len(args))
 	}
 	// which of args each name takes; with as many arguments as names, a name
 	// given once each means none is missing
@@ -217,6 +368,8 @@ func (t *Template[T]) bind(s *session, args []sql.NamedArg, row any) (string, []
 			return "", nil, fmt.Errorf("barm: the template has no argument named %q", arg.Name)
 		case given[i] >= 0:
 			return "", nil, fmt.Errorf("barm: With was given %q twice", arg.Name)
+		case i < 64 && t.filled&(1<<i) != 0:
+			return "", nil, fmt.Errorf("barm: the template's %q was filled already, so With takes it no more", arg.Name)
 		}
 		given[i] = k
 	}
@@ -251,6 +404,10 @@ func (t *Template[T]) splice(args []sql.NamedArg, given []int) (string, error) {
 	var vbuf [4]string
 	vals := vbuf[:0]
 	for _, i := range t.inames {
+		if given[i] < 0 { // filled by Ident, and in no slot left
+			vals = append(vals, "")
+			continue
+		}
 		v, err := identValue(args[given[i]])
 		if err != nil {
 			return "", err

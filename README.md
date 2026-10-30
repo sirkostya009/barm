@@ -1227,7 +1227,7 @@ for _, p := range posts {
   as `Ident` would, binding nothing:
 
   ```go
-  var postsBy = qb.Select[Post]().Table("?.posts AS p", barm.IdentSlot("schema")).
+  var postsBy = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
   	Where("p.author_id = ?", barm.Named("author", nil)).Template()
 
   posts, err := postsBy.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
@@ -1240,9 +1240,35 @@ for _, p := range posts {
 
   ```go
   postsBy.Prepare("posts_by_" + tenant).With(barm.Named("schema", tenant), ...)
-  ``` pgx keeps 512 statements per connection by default, so
-  schemas × templates past that evict each other. A database with that many schemas is
-  better served by `SET LOCAL search_path` in each transaction.
+  ```
+
+  pgx keeps 512 statements per connection by default, so schemas × templates past that
+  evict each other. A database with that many schemas is better served by
+  `SET LOCAL search_path` in each transaction.
+
+  A slot goes wherever an identifier does: `Schema` on any builder takes one as it takes
+  a name, and so does an insert's, update's or delete's `Table`, so the model's table and
+  alias need not be written out to qualify them. `Ident` fills a slot once and returns a
+  template with it spliced, leaving the template as it was, so a batch for one tenant
+  pays for each row's values alone:
+
+  ```go
+  var insertPost = qb.Insert[CreatePost]().Schema(barm.IdentSlot("schema")).TemplateAs[Post]()
+
+  posts := insertPost.Ident(barm.Named("schema", tenant))
+  for _, p := range rows {
+  	b.OneAs[Post](posts.Values(&p))
+  }
+  ```
+- **`Param` binds arguments once,** as `Ident` fills slots: it returns a template that
+  no longer takes those names, leaving the template as it was. A value every query in a
+  batch shares stops costing each one its place in `With`:
+
+  ```go
+  posts := insertIfAuthor.Ident(barm.Named("schema", tenant)).
+  	Param(barm.Named("author", author), barm.Named("status", "draft"))
+  ```
+
 - **`With` takes every name once,** in any order. A name used twice in the query takes its
   value in both places. A missing, unknown or repeated name fails that query.
 - **Relations do not load through a template,** so a select asking for them fails to

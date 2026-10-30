@@ -53,16 +53,16 @@ func (q *UpdateQuery[T]) tableName() string {
 }
 
 // Schema qualifies the table this writes to, as `schema.table`. It applies to
-// a name given with Table too.
-func (q *UpdateQuery[T]) Schema(name string) *UpdateQuery[T] {
-	q.schema = name
+// a name given with Table too. name is a string, or an IdentSlot.
+func (q *UpdateQuery[T]) Schema[S ~string](name S) *UpdateQuery[T] {
+	q.schema = identName(name)
 	return q
 }
 
 // Table overrides where this writes, for a T whose BaseModel names another
-// table or none at all.
-func (q *UpdateQuery[T]) Table(name string) *UpdateQuery[T] {
-	q.table = name
+// table or none at all. name is a string, or an IdentSlot.
+func (q *UpdateQuery[T]) Table[S ~string](name S) *UpdateQuery[T] {
+	q.table = identName(name)
 	return q
 }
 
@@ -321,7 +321,7 @@ func (b *builder) assign(f *field, v reflect.Value) {
 }
 
 func (q *UpdateQuery[T]) target() target {
-	return target{op: "UPDATE", table: q.tableName(), schema: q.schema}
+	return target{op: "UPDATE", table: hookName(q.tableName()), schema: hookName(q.schema)}
 }
 
 func (q *UpdateQuery[T]) Exec(ctx context.Context) (sql.Result, error) {

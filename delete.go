@@ -49,16 +49,16 @@ func (q *DeleteQuery[T]) tableName() string {
 }
 
 // Schema qualifies the table this writes to, as `schema.table`. It applies to
-// a name given with Table too.
-func (q *DeleteQuery[T]) Schema(name string) *DeleteQuery[T] {
-	q.schema = name
+// a name given with Table too. name is a string, or an IdentSlot.
+func (q *DeleteQuery[T]) Schema[S ~string](name S) *DeleteQuery[T] {
+	q.schema = identName(name)
 	return q
 }
 
 // Table overrides where this writes, for a T whose BaseModel names another
-// table or none at all.
-func (q *DeleteQuery[T]) Table(name string) *DeleteQuery[T] {
-	q.table = name
+// table or none at all. name is a string, or an IdentSlot.
+func (q *DeleteQuery[T]) Table[S ~string](name S) *DeleteQuery[T] {
+	q.table = identName(name)
 	return q
 }
 
@@ -258,7 +258,7 @@ func (q *DeleteQuery[T]) render(b *builder) error {
 }
 
 func (q *DeleteQuery[T]) target() target {
-	return target{op: "DELETE", table: q.tableName(), schema: q.schema}
+	return target{op: "DELETE", table: hookName(q.tableName()), schema: hookName(q.schema)}
 }
 
 func (q *DeleteQuery[T]) Exec(ctx context.Context) (sql.Result, error) {
