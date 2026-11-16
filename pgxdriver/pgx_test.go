@@ -308,6 +308,19 @@ func TestBatchNoRows(t *testing.T) {
 	}
 }
 
+type copyArgs struct {
+	Name  string `barm:"name"`
+	Email string `barm:"email"`
+	Of    string `barm:"of"`
+}
+
+func copyTemplate(qb barm.IDB) *barm.Template[copyArgs, User] {
+	h := barm.HandleFrom(context.Background(), qb)
+	return h.Insert[User]().Select(h.Select[User]().
+		ColumnExpr("?, ?, u.age + 1, u.created_at", barm.Param("name"), barm.Param("email")).
+		Where("u.name = ?", barm.Param("of"))).TemplateAs[copyArgs, User]()
+}
+
 // A template binds new arguments into the statement it built once, typed as
 // the server reports them like any other batch query's.
 func TestBatchTemplate(t *testing.T) {
@@ -315,13 +328,11 @@ func TestBatchTemplate(t *testing.T) {
 	db := open(t)
 	seed(t, db)
 
-	copyOf := db.Insert[User]().Select(db.Select[User]().
-		ColumnExpr("?, ?, u.age + 1, u.created_at", barm.Named("name", nil), barm.Named("email", nil)).
-		Where("u.name = ?", barm.Named("of", nil))).TemplateAs[User]()
+	copyOf := copyTemplate(db)
 	b := db.Batch()
-	ann := b.OneAs[User](copyOf.With(barm.Named("name", "ann2"), barm.Named("email", "a2@x.io"), barm.Named("of", "ann")))
-	nobody := b.OneAs[User](copyOf.With(barm.Named("name", "zed2"), barm.Named("email", "z2@x.io"), barm.Named("of", "zed")))
-	cy := b.OneAs[User](copyOf.With(barm.Named("name", "cy2"), barm.Named("email", "c2@x.io"), barm.Named("of", "cy")))
+	ann := copyOf.In(b).One(copyArgs{Name: "ann2", Email: "a2@x.io", Of: "ann"})
+	nobody := copyOf.In(b).One(copyArgs{Name: "zed2", Email: "z2@x.io", Of: "zed"})
+	cy := copyOf.In(b).One(copyArgs{Name: "cy2", Email: "c2@x.io", Of: "cy"})
 	if err := b.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +350,10 @@ func TestBatchTemplate(t *testing.T) {
 	}
 }
 
+type ageArgs struct {
+	Age int `barm:"age"`
+}
+
 // A template built with no connection, as at package level, runs on whatever
 // handle Via names: the pool, or a transaction, which it is part of.
 func TestTemplateVia(t *testing.T) {
@@ -347,22 +362,17 @@ func TestTemplateVia(t *testing.T) {
 	seed(t, db)
 
 	qb := barm.NewBuilder(barm.Postgres)
-	copyOf := qb.Insert[User]().Select(qb.Select[User]().
-		ColumnExpr("?, ?, u.age + 1, u.created_at", barm.Named("name", nil), barm.Named("email", nil)).
-		Where("u.name = ?", barm.Named("of", nil))).TemplateAs[User]()
-	olderThan := qb.Select[User]().Where("age > ?", barm.Named("age", nil)).OrderBy("age").Template()
-	of := func(name, email, of string) *barm.Bound[User] {
-		return copyOf.With(barm.Named("name", name), barm.Named("email", email), barm.Named("of", of))
-	}
+	copyOf := copyTemplate(qb)
+	olderThan := qb.Select[User]().Where("age > ?", barm.Param("age")).OrderBy("age").Template[ageArgs]()
 
-	if _, err := of("x", "x@x.io", "ann").One(ctx); !errors.Is(err, barm.ErrNoConn) {
+	if _, err := copyOf.One(ctx, copyArgs{"x", "x@x.io", "ann"}); !errors.Is(err, barm.ErrNoConn) {
 		t.Errorf("without Via: %v, want ErrNoConn", err)
 	}
-	u, err := of("ann2", "a2@x.io", "ann").Via(db).One(ctx)
+	u, err := copyOf.Via(db).One(ctx, copyArgs{"ann2", "a2@x.io", "ann"})
 	if err != nil || u.ID == 0 || u.Name != "ann2" || u.Age != 21 {
 		t.Fatalf("One = %+v, %v", u, err)
 	}
-	if _, err := of("zed2", "z2@x.io", "zed").Via(db).One(ctx); !errors.Is(err, barm.ErrNoRows) {
+	if _, err := copyOf.Via(db).One(ctx, copyArgs{"zed2", "z2@x.io", "zed"}); !errors.Is(err, barm.ErrNoRows) {
 		t.Errorf("no such user: %v, want ErrNoRows", err)
 	}
 
@@ -370,28 +380,28 @@ func TestTemplateVia(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := of("bo2", "b2@x.io", "bo").Via(tx).Exec(ctx)
+	res, err := copyOf.Via(tx).Exec(ctx, copyArgs{"bo2", "b2@x.io", "bo"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		t.Errorf("rows affected = %d", n)
 	}
-	inTx, err := olderThan.With(barm.Named("age", 30)).Via(tx).Slice(ctx)
+	inTx, err := olderThan.Via(tx).Slice(ctx, ageArgs{30})
 	if err != nil || len(inTx) != 2 || inTx[0].Name != "bo2" {
 		t.Errorf("inside the transaction: %+v, %v", inTx, err)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	names, err := olderThan.With(barm.Named("age", 20)).Via(db).SliceAs[struct {
+	names, err := olderThan.Via(db).SliceAs[struct {
 		Name string `barm:"name"`
-	}](ctx)
+	}](ctx, ageArgs{20})
 	if err != nil || len(names) != 3 || names[0].Name != "ann2" {
 		t.Errorf("after rolling back: %+v, %v", names, err)
 	}
 	var seen []string
-	for u, err := range olderThan.With(barm.Named("age", 20)).Via(db).Seq(ctx) {
+	for u, err := range olderThan.Via(db).Seq(ctx, ageArgs{20}) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,6 +412,15 @@ func TestTemplateVia(t *testing.T) {
 	}
 }
 
+type renameArgs struct {
+	To   string `barm:"to"`
+	From string `barm:"from"`
+}
+
+type nameArgs struct {
+	Name string `barm:"name"`
+}
+
 // A template from a builder-only DB runs inside the transaction its ctx
 // carries, seeing what it wrote, and its writes go when that rolls back.
 func TestTemplateInContextTx(t *testing.T) {
@@ -410,19 +429,19 @@ func TestTemplateInContextTx(t *testing.T) {
 	seed(t, db)
 
 	qb := barm.NewBuilder(barm.Postgres)
-	rename := qb.Update[User]().Set("name = ?", barm.Named("to", nil)).Where("name = ?", barm.Named("from", nil)).Template()
-	named := qb.Select[User]().Where("name = ?", barm.Named("name", nil)).Template()
+	rename := qb.Update[User]().Set("name = ?", barm.Param("to")).Where("name = ?", barm.Param("from")).Template[renameArgs]()
+	named := qb.Select[User]().Where("name = ?", barm.Param("name")).Template[nameArgs]()
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	txCtx := barm.WithIDB(ctx, tx)
-	_, err = rename.With(barm.Named("to", "ann2"), barm.Named("from", "ann")).Exec(txCtx)
+	_, err = rename.Exec(txCtx, renameArgs{To: "ann2", From: "ann"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u, err := named.With(barm.Named("name", "ann2")).One(txCtx); err != nil || u.Name != "ann2" {
+	if u, err := named.One(txCtx, nameArgs{"ann2"}); err != nil || u.Name != "ann2" {
 		t.Errorf("inside: %+v, %v", u, err)
 	}
 	if u, err := barm.HandleFrom(txCtx, db).Select[User]().Where("name = ?", "ann2").One(ctx); err != nil || u.Name != "ann2" {
@@ -431,7 +450,7 @@ func TestTemplateInContextTx(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := named.With(barm.Named("name", "ann2")).One(barm.WithIDB(ctx, db)); !errors.Is(err, barm.ErrNoRows) {
+	if _, err := named.One(barm.WithIDB(ctx, db), nameArgs{"ann2"}); !errors.Is(err, barm.ErrNoRows) {
 		t.Errorf("after rolling back: %v, want ErrNoRows", err)
 	}
 }
@@ -441,6 +460,18 @@ type tenantNote struct {
 
 	ID   int64  `barm:"id,pk,autoincrement"`
 	Body string `barm:"body"`
+}
+
+type TenantNote = tenantNote
+
+type afterArgs struct {
+	Schema string `barm:"schema"`
+	After  int64  `barm:"after"`
+}
+
+type noteArgs struct {
+	Schema string `barm:"schema"`
+	TenantNote
 }
 
 // An IdentSlot picks the schema a template's query reads, per call: each
@@ -466,28 +497,28 @@ func TestTemplateIdentSlot(t *testing.T) {
 		db.Exec(context.Background(), `DROP SCHEMA IF EXISTS "barm t2" CASCADE`)
 	})
 
-	after := barm.NewBuilder(barm.Postgres).Select[tenantNote]().Table("?.notes AS n", barm.IdentSlot("schema")).
-		Where("n.id > ?", barm.Named("after", nil)).OrderBy("n.id").Template()
+	after := barm.NewBuilder(barm.Postgres).Select[tenantNote]().Schema(barm.IdentSlot("schema")).
+		Where("n.id > ?", barm.Param("after")).OrderBy("n.id").Template[afterArgs]()
 	for _, name := range []string{"", "notes_after"} {
-		in := func(schema string) *barm.Bound[tenantNote] {
-			tp := after
-			if name != "" {
-				tp = after.Prepare(name + "_" + schema)
+		tp := func(schema string) *barm.Template[afterArgs, tenantNote] {
+			if name == "" {
+				return after
 			}
-			return tp.With(barm.Named("schema", schema), barm.Named("after", 0))
+			return after.Prepare(name + "_" + schema)
 		}
 		for range 2 { // the second time, on a statement already prepared
-			one, err := in("barm_t1").Via(db).Slice(ctx)
+			one, err := tp("barm_t1").Via(db).Slice(ctx, afterArgs{Schema: "barm_t1"})
 			if err != nil || len(one) != 2 || one[1].Body != "two" {
 				t.Errorf("%q, barm_t1: %+v, %v", name, one, err)
 			}
-			two, err := in("barm t2").Via(db).Slice(ctx)
+			two, err := tp("barm t2").Via(db).Slice(ctx, afterArgs{Schema: "barm t2"})
 			if err != nil || len(two) != 1 || two[0].Body != "three" {
 				t.Errorf("%q, barm t2: %+v, %v", name, two, err)
 			}
 		}
 		b := db.Batch()
-		r1, r2 := b.SliceAs[tenantNote](in("barm_t1")), b.SliceAs[tenantNote](in("barm t2"))
+		r1 := tp("barm_t1").In(b).Slice(afterArgs{Schema: "barm_t1"})
+		r2 := tp("barm t2").In(b).Slice(afterArgs{Schema: "barm t2"})
 		if err := b.Run(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -496,19 +527,18 @@ func TestTemplateIdentSlot(t *testing.T) {
 		}
 	}
 
-	insert := barm.NewBuilder(barm.Postgres).Insert[tenantNote]().Schema(barm.IdentSlot("schema")).Template()
-	t2 := insert.Ident(barm.Named("schema", "barm t2"))
+	insert := barm.NewBuilder(barm.Postgres).Insert[tenantNote]().Schema(barm.IdentSlot("schema")).TemplateAs[noteArgs, tenantNote]()
 	b := db.Batch()
 	for _, body := range []string{"four", "five"} {
-		b.OneAs[tenantNote](t2.Values(&tenantNote{Body: body}))
+		insert.In(b).One(noteArgs{Schema: "barm t2", TenantNote: TenantNote{Body: body}})
 	}
-	b.OneAs[tenantNote](insert.Values(&tenantNote{Body: "six"}, barm.Named("schema", "barm_t1")))
+	insert.In(b).One(noteArgs{Schema: "barm_t1", TenantNote: TenantNote{Body: "six"}})
 	err := b.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for schema, want := range map[string]int{"barm_t1": 3, "barm t2": 3} {
-		rows, err := after.With(barm.Named("schema", schema), barm.Named("after", 0)).Via(db).Slice(ctx)
+		rows, err := after.Via(db).Slice(ctx, afterArgs{Schema: schema})
 		if err != nil || len(rows) != want {
 			t.Errorf("%s after inserts: %+v, %v", schema, rows, err)
 		}
@@ -522,14 +552,14 @@ func TestInsertTemplateArrays(t *testing.T) {
 	db := open(t)
 	createArrays(t, db)
 
-	ins := barm.NewBuilder(barm.Postgres).Insert[pgArrayRow]().TemplateAs[pgArrayRow]()
-	row := &pgArrayRow{Ints: []int64{1, 2}, Texts: []string{"a", "b,c"}, Grid: [][]int32{{1, 2}, {3, 4}}}
-	got, err := ins.Values(row).Via(db).One(ctx)
+	ins := barm.NewBuilder(barm.Postgres).Insert[pgArrayRow]().TemplateAs[pgArrayRow, pgArrayRow]()
+	row := pgArrayRow{Ints: []int64{1, 2}, Texts: []string{"a", "b,c"}, Grid: [][]int32{{1, 2}, {3, 4}}}
+	got, err := ins.Via(db).One(ctx, row)
 	if err != nil || got.ID == 0 || len(got.Grid) != 2 || got.Texts[1] != "b,c" {
 		t.Fatalf("Via: %+v, %v", got, err)
 	}
 	b := db.Batch()
-	batched := b.OneAs[pgArrayRow](ins.Values(row))
+	batched := ins.In(b).One(row)
 	if err := b.Run(ctx); err != nil {
 		t.Fatal(err)
 	}

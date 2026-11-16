@@ -4196,27 +4196,35 @@ func TestCompositeRelationSQLite(t *testing.T) {
 
 // A template from a builder-only DB runs on database/sql through Via, and a
 // named argument outside one never reaches the driver.
+type ageArgs struct {
+	Age int `barm:"age"`
+}
+
 func TestTemplateOnSQL(t *testing.T) {
 	ctx := t.Context()
 	db := open(t)
 
 	qb := barm.NewBuilder(barm.SQLite)
-	add := qb.Insert[User]().TemplateAs[User]()
-	byAge := qb.Select[User]().Where("age = ?", barm.Named("age", nil)).Template()
+	add := qb.Insert[User]().TemplateAs[User, User]()
+	byAge := qb.Select[User]().Where("age = ?", barm.Param("age")).Template[ageArgs]()
 	for i, name := range []string{"ann", "bo"} {
-		u, err := add.Values(&User{Name: name, Email: name + "@x.io", Age: 20 + i, CreatedAt: time.Now()}).Via(db).One(ctx)
+		u, err := add.Via(db).One(ctx, User{Name: name, Email: name + "@x.io", Age: 20 + i, CreatedAt: time.Now()})
 		if err != nil || u.ID == 0 || u.Name != name {
 			t.Fatalf("inserted %+v, %v", u, err)
 		}
 	}
-	u, err := byAge.With(barm.Named("age", 21)).Via(db).One(ctx)
+	u, err := byAge.Via(db).One(ctx, ageArgs{21})
 	if err != nil || u.Name != "bo" {
 		t.Errorf("One = %+v, %v", u, err)
 	}
-	_, err = db.Select[User]().Where("age = ?", barm.Named("age", 21)).Slice(ctx)
+	_, err = db.Select[User]().Where("age = ?", barm.Param("age")).Slice(ctx)
 	if err == nil {
-		t.Error("a named argument ran outside a template")
+		t.Error("a Param ran outside a template")
 	}
+}
+
+type idArgs struct {
+	ID int64 `barm:"id"`
 }
 
 // A template keeps the query's SQL, not the query, so a select asking for
@@ -4224,8 +4232,7 @@ func TestTemplateOnSQL(t *testing.T) {
 func TestTemplateRefusesRelations(t *testing.T) {
 	ctx := t.Context()
 	db := openAuthors(t)
-	_, err := db.Select[Author]().Relation[Book]("Books").Where("id = ?", barm.Named("id", nil)).Template().
-		With(barm.Named("id", 1)).One(ctx)
+	_, err := db.Select[Author]().Relation[Book]("Books").Where("id = ?", barm.Param("id")).Template[idArgs]().One(ctx, idArgs{1})
 	if err == nil {
 		t.Error("a template ran a select with relations")
 	}

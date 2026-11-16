@@ -53,13 +53,18 @@ func (q *RawQuery) render(b *builder) error {
 
 func (q *RawQuery) argCount() int { return len(q.f.args) }
 
-// Template renders the query once, to run again with new values for its named
-// arguments. A raw query has no row type of its own, so it reads through OneAs
-// and SliceAs. See Template.
-func (q *RawQuery) Template() *Template[any] {
+// Template renders the query once, to run again with its Params and
+// IdentSlots filled from the fields of a P. A raw query has no row type of its
+// own, so it reads through OneAs and SliceAs, or TemplateAs. See Template.
+func (q *RawQuery) Template[P any]() *Template[P, any] {
 	query, args, err := q.Build()
-	tp := newTemplate[any](q.runner, targetOf(q), query, args, err)
-	return &tp
+	return newTemplate[P, any](q.runner, targetOf(q), query, args, err)
+}
+
+// TemplateAs is Template reading its rows as U.
+func (q *RawQuery) TemplateAs[P, U any]() *Template[P, U] {
+	query, args, err := q.Build()
+	return newTemplate[P, U](q.runner, targetOf(q), query, args, err)
 }
 
 // Exec runs the statement.

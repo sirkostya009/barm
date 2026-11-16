@@ -39,7 +39,7 @@ allocations are — that reasoning has been wrong here before.
 | `schema.go`                                     | model cache, struct tag parsing                                   |
 | `relation.go`                                   | `Relation[U]`, key predicates, grouping                           |
 | `batch.go`                                      | `Batch`, its results, and the statements a batch transaction uses |
-| `template.go`                                   | `Template` — a query built once and bound to new arguments        |
+| `template.go`                                   | `Template` — a query built once, run with a struct's fields       |
 | `hook.go`                                       | `QueryHook`, `TxHook`                                             |
 | `dialect.go`                                    | `Dialect` and the three built-ins                                 |
 | `array.go`                                      | Postgres array literals, for the `array` tag                      |
@@ -103,7 +103,7 @@ field tagged `pk` (a column named `id` is not one), and `UPDATE`/`DELETE` pick
 rows only through `Where` or `WherePK`. Prefer an explicit call or tag over a
 convention barm would have to guess at.
 
-A handle put in ctx with `WithIDB` is read in two places only: a bound template
+A handle put in ctx with `WithIDB` is read in two places only: a template run
 with no `Via`, which has no handle of its own worth running on, and
 `HandleFrom`, which the caller asks. A query started on a handle runs on that
 handle whatever its ctx carries.

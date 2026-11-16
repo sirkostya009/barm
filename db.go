@@ -171,7 +171,7 @@ type idbKey struct{}
 //	tx, err := db.BeginTx(ctx, nil)
 //	ctx = barm.WithIDB(ctx, tx)
 //
-// A bound template with no Via runs on it, and HandleFrom returns it. Builders
+// A template run with no Via runs on it, and HandleFrom returns it. Builders
 // never read it: a query started on a DB runs on that DB.
 func WithIDB(ctx context.Context, h IDB) context.Context {
 	return context.WithValue(ctx, idbKey{}, h)

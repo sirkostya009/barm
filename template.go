@@ -6,144 +6,204 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"math/bits"
 	"reflect"
 	"slices"
+	"time"
 	"unsafe"
 )
 
-// Named is sql.Named, for a Template's arguments without importing
-// database/sql.
-func Named(name string, value any) sql.NamedArg { return sql.NamedArg{Name: name, Value: value} }
-
 var (
-	errNamedArg          = errors.New("barm: a named argument binds only through a Template's With")
-	errTemplateNested    = errors.New("barm: a Template's query runs on its own, not inside another")
+	errNamedArg          = errors.New("barm: a Param binds only through a Template")
 	errTemplateRelations = errors.New("barm: relations do not load through a Template")
 )
 
-// Template is a query rendered once, its SQL kept with where each named
-// argument sits, and run again with new values for them. A named argument with
-// no value stands for each, and With binds them by name:
+// Param stands where a Template's argument goes, bound on every call to the
+// field of the template's P its tag names. See Template.
+func Param(name string) any { return param(name) }
+
+type param string
+
+// Template is a query rendered once, its SQL kept with where each of its
+// Params and IdentSlots sits, and run again with each filled from the fields
+// of a P, by the names their tags give:
 //
-//	var qb = barm.NewBuilder(barm.Postgres)
+//	type ByAuthor struct {
+//		Schema string `barm:"schema"`
+//		Author int64  `barm:"author"`
+//	}
 //
-//	var insertPost = qb.Insert[CreatePost]().Table("posts").Select(
-//		qb.Select[User]().ColumnExpr("u.id, ?, ?", barm.Named("title", nil), barm.Named("body", nil)).
-//			Where("u.id = ?", barm.Named("author", nil))).TemplateAs[Post]()
+//	var postsBy = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
+//		Where("p.author_id = ?", barm.Param("author")).Template[ByAuthor]()
 //
-//	p, err := insertPost.With(barm.Named("title", t), barm.Named("body", b), barm.Named("author", a)).
-//		Via(tx).One(ctx)
+//	posts, err := postsBy.Slice(ctx, ByAuthor{Schema: tenant, Author: id})
+//
+// A field binds as a model's column does, its json, array and nullzero tags
+// included, and fields no name takes are left alone. A name P has no field
+// for, or an IdentSlot whose field is not a string, fails every call. An
+// insert's template writes P as its row: each column it writes binds from the
+// field of P that column names, so a P that is the insert's own T works, as
+// does one embedding it beside the fields its Params and IdentSlots take.
 //
 // Nothing of the builder is kept, so a builder made only to be templated is
-// garbage once Template returns. A bound template queues in a batch as any
-// query does, and a loop queueing it per element pays for its arguments alone.
+// garbage once Template returns. P is read only while a call binds it, and
+// stays on the caller's stack.
 //
 // Template renders the query as written, and TemplateAs as BuildAs does: a
 // select narrowed to U's columns, a write returning them. That is the only
 // shape it runs in: its OneAs reads U off whatever columns the SQL returns,
-// and its One adds no LIMIT. A query with a named argument fails to build any
-// way but these.
+// and its One adds no LIMIT. A query with a Param fails to build any way but
+// these.
 //
-// An IdentSlot is filled by name too, with an identifier rather than a bound
-// value, spliced into the SQL on every call. Each value is SQL of its own, so
-// a prepared template runs one, and Prepare gives each another name.
+// An IdentSlot's identifier is spliced into the SQL on every call. Each value
+// is SQL of its own, so a prepared template runs one, and Prepare gives each
+// another name. A batch takes the SQL its last query from the same template
+// spliced again while the identifiers repeat.
 //
 // Relations do not load through a template, which keeps the query's SQL and
 // not the query, and Exec scans no RETURNING rows back, since there are no
 // values of the query's own to scan them into. A template never changes, so
 // it is safe for any number of goroutines at once.
-type Template[T any] struct {
+type Template[P, R any] struct {
 	h      IDB
 	name   string
 	t      target
 	query  string
-	args   []any     // as rendered, a named argument wherever With's values go
-	names  []string  // each name once, in the order the query first binds it
-	slots  []slot    // where in args each named argument sits
-	idents []slot    // where in query each IdentSlot sits, by byte offset, and which of inames it takes
-	inames []int     // the names IdentSlots take, each once
-	row    []rowSlot // where in args each column of a row given to Values sits
-	filled uint64    // the names Ident or Param filled, by bit, which With no longer takes
+	args   []any       // as rendered, nil wherever a field of P goes
+	binds  []fieldBind // where in args each field of P goes
+	idents []fieldBind // where in query each IdentSlot sits, by byte offset, and the field filling it
+	ptyp   reflect.Type
 	err    error
 }
 
-type slot struct{ at, name int }
-
-type rowSlot struct {
-	at int
-	f  *field
+// fieldBind is where a field of P goes. A field read through an offset is one
+// of the predeclared types boxed as they are; anything else goes through
+// reflect, as a model's column does.
+type fieldBind struct {
+	at   int
+	off  uintptr
+	kind bindKind
+	f    *field
 }
 
-// rowField marks where a column of a template's row binds.
+type bindKind uint8
+
+const (
+	bindReflect bindKind = iota
+	bindString
+	bindInt64
+	bindInt
+	bindInt32
+	bindBool
+	bindFloat64
+	bindTime
+	bindBytes
+)
+
+var bindKinds = map[reflect.Type]bindKind{
+	reflect.TypeFor[string]():    bindString,
+	reflect.TypeFor[int64]():     bindInt64,
+	reflect.TypeFor[int]():       bindInt,
+	reflect.TypeFor[int32]():     bindInt32,
+	reflect.TypeFor[bool]():      bindBool,
+	reflect.TypeFor[float64]():   bindFloat64,
+	reflect.TypeFor[time.Time](): bindTime,
+	reflect.TypeFor[[]byte]():    bindBytes,
+}
+
+// rowField marks where a column of an insert template's row binds.
 type rowField struct{ f *field }
 
-// newTemplate keeps a rendered query and finds its named arguments.
-func newTemplate[T any](r runner, t target, query string, args []any, err error) Template[T] {
+// newTemplate keeps a rendered query and maps its Params, IdentSlots and row
+// columns to the fields of P.
+func newTemplate[P, R any](r runner, t target, query string, args []any, err error) *Template[P, R] {
 	var idents identSlotsError
 	if errors.As(err, &idents) || errors.Is(err, errNamedArg) {
 		err = nil
 	}
-	tp := Template[T]{h: r.h, name: r.name, t: t, query: query, args: args, err: err}
+	tp := &Template[P, R]{h: r.h, name: r.name, t: t, query: query, args: args, ptyp: reflect.TypeFor[P](), err: err}
 	if err == nil {
-		tp.index(idents)
+		tp.err = tp.index(idents)
 	}
 	return tp
 }
 
-func (t *Template[T]) index(idents identSlotsError) {
-	for at, v := range t.args {
-		if r, ok := v.(rowField); ok {
-			t.row = append(t.row, rowSlot{at, r.f})
-			continue
+func (t *Template[P, R]) index(idents identSlotsError) error {
+	var m *model
+	fieldOf := func(name, what string) (*field, error) {
+		if name == "" {
+			return nil, fmt.Errorf("barm: a template's %s has no name", what)
 		}
-		n, ok := v.(sql.NamedArg)
+		if m == nil {
+			var err error
+			m, err = modelOfType(t.ptyp)
+			if err != nil {
+				return nil, err
+			}
+		}
+		f, ok := m.field(name)
 		if !ok {
+			return nil, fmt.Errorf("barm: %s has no field for the template's %s %q", t.ptyp, what, name)
+		}
+		return f, nil
+	}
+	var params []string
+	for at, v := range t.args {
+		var f *field
+		var err error
+		switch a := v.(type) {
+		case param:
+			f, err = fieldOf(string(a), "Param")
+			params = append(params, string(a))
+		case rowField:
+			f, err = fieldOf(a.f.name, "column")
+		default:
 			continue
 		}
-		switch {
-		case n.Name == "":
-			t.err = errors.New("barm: a template's named argument has no name")
-			return
-		case n.Value != nil:
-			t.err = fmt.Errorf("barm: the template's argument %q has a value, which With gives instead", n.Name)
-			return
+		if err != nil {
+			return err
 		}
-		t.slots = append(t.slots, slot{at, t.nameIndex(n.Name)})
+		t.args[at] = nil
+		t.binds = append(t.binds, t.bindOf(f, at))
 	}
-	bound := len(t.names)
 	for _, id := range idents {
-		if id.name == "" {
-			t.err = errors.New("barm: a template's IdentSlot has no name")
-			return
+		f, err := fieldOf(id.name, "IdentSlot")
+		switch {
+		case err != nil:
+			return err
+		case slices.Contains(params, id.name):
+			return fmt.Errorf("barm: the template's %q is both a Param and an IdentSlot", id.name)
+		case t.ptyp.FieldByIndex(f.index).Type.Kind() != reflect.String:
+			return fmt.Errorf("barm: the template's IdentSlot %q takes a string, and %s's field is not one", id.name, t.ptyp)
 		}
-		i := t.nameIndex(id.name)
-		if i < bound {
-			t.err = fmt.Errorf("barm: the template's %q is both an argument and an IdentSlot", id.name)
-			return
+		b := t.bindOf(f, id.at)
+		if b.off != unreachable {
+			b.kind = bindString // any string kind reads as a string
 		}
-		k := slices.Index(t.inames, i)
-		if k < 0 {
-			k = len(t.inames)
-			t.inames = append(t.inames, i)
-		}
-		t.idents = append(t.idents, slot{id.at, k})
+		t.idents = append(t.idents, b)
 	}
+	return nil
 }
 
-func (t *Template[T]) nameIndex(name string) int {
-	i := slices.Index(t.names, name)
-	if i < 0 {
-		i = len(t.names)
-		t.names = append(t.names, name)
-	}
-	return i
-}
+// unreachable is the offset of a field behind an embedded pointer.
+const unreachable = ^uintptr(0)
 
-// With returns the query with each named argument bound to the value args
-// gives its name. Every name takes one.
-func (t *Template[T]) With(args ...sql.NamedArg) *Bound[T] {
-	return &Bound[T]{t: t, args: args}
+// bindOf is how the field f of P binds at at.
+func (t *Template[P, R]) bindOf(f *field, at int) fieldBind {
+	b := fieldBind{at: at, f: f}
+	ty := t.ptyp
+	for _, i := range f.index {
+		if ty.Kind() == reflect.Pointer {
+			b.off = unreachable
+			return b
+		}
+		sf := ty.Field(i)
+		b.off += sf.Offset
+		ty = sf.Type
+	}
+	if !f.json && !f.array && !f.nullzero {
+		b.kind = bindKinds[ty]
+	}
+	return b
 }
 
 // Prepare returns the template running as the prepared statement name, or
@@ -151,401 +211,277 @@ func (t *Template[T]) With(args ...sql.NamedArg) *Bound[T] {
 // template with an IdentSlot takes a name of its own for each value it runs
 // prepared:
 //
-//	byAuthor.Prepare("posts_by_" + tenant).With(barm.Named("schema", tenant), ...)
-func (t *Template[T]) Prepare(name string) *Template[T] {
+//	postsBy.Prepare("posts_by_" + tenant).Slice(ctx, ByAuthor{Schema: tenant, ...})
+func (t *Template[P, R]) Prepare(name string) *Template[P, R] {
 	c := *t
 	c.name = name
 	return &c
 }
 
-// Ident returns the template with the IdentSlots idents name filled with the
-// identifiers they give, spliced once rather than on every call, leaving t as
-// it was. A batch writing one tenant's rows fills its slots once and binds each
-// row's values alone:
-//
-//	posts := insertPost.Ident(barm.Named("schema", tenant), barm.Named("table", "posts_2026"))
-//	for _, p := range rows {
-//		b.OneAs[Post](posts.With(barm.Named("title", p.Title), ...))
-//	}
-//
-// Slots it leaves out are still With's. The copy costs more than a splice, so
-// a single call gives its slots to With.
-func (t Template[T]) Ident(idents ...sql.NamedArg) Template[T] {
-	t.ident(idents)
-	return t
+// Via returns the template running on h. Without it a call runs on the
+// handle in the ctx it is given, see WithIDB, or else where the template was
+// started, which for one built on a NewBuilder DB is nowhere.
+func (t *Template[P, R]) Via(h IDB) Run[P, R] { return Run[P, R]{t, h} }
+
+// One reads the first row as R, or ErrNoRows.
+func (t *Template[P, R]) One(ctx context.Context, args P) (R, error) {
+	return Run[P, R]{t: t}.OneAs[R](ctx, args)
 }
 
-// ident splices each of idents into every IdentSlot its name takes, and marks
-// the names filled, in one pass over the SQL.
-func (t *Template[T]) ident(idents []sql.NamedArg) {
-	if t.err != nil || len(idents) == 0 {
-		return
-	}
-	d := t.h.Dialect()
-	var buf [4]string
-	fill := buf[:0] // by inames index, "" for a slot left to With
-	if len(t.inames) > len(buf) {
-		fill = make([]string, 0, len(t.inames))
-	}
-	fill = fill[:len(t.inames)]
-	n := len(t.query)
-	for _, a := range idents {
-		i := t.fillable(a.Name)
-		if i < 0 {
-			return
-		}
-		k := slices.Index(t.inames, i)
-		if k < 0 {
-			t.err = fmt.Errorf("barm: the template's %q is an argument, not an IdentSlot", a.Name)
-			return
-		}
-		v, err := identValue(a)
-		if err != nil {
-			t.err = err
-			return
-		}
-		fill[k] = v
-		t.filled |= 1 << i
-	}
-	for _, id := range t.idents {
-		n += len(fill[id.name]) + 2 // quoted; a quote or dot inside grows it
-	}
-	b := make([]byte, 0, n)
-	left := make([]slot, 0, len(t.idents))
-	prev := 0
-	for _, id := range t.idents {
-		v := fill[id.name]
-		if v == "" {
-			left = append(left, slot{id.at + len(b) - prev, id.name})
-			continue
-		}
-		b = append(b, t.query[prev:id.at]...)
-		b = d.AppendIdent(b, v)
-		prev = id.at
-	}
-	b = append(b, t.query[prev:]...)
-	t.query = unsafe.String(unsafe.SliceData(b), len(b))
-	t.idents = left
+// Slice reads every row as R.
+func (t *Template[P, R]) Slice(ctx context.Context, args P) ([]R, error) {
+	return Run[P, R]{t: t}.SliceAs[R](ctx, args)
 }
 
-// fillable is the index of the name Ident or Param fills, or -1 with t.err set
-// when there is none to fill.
-func (t *Template[T]) fillable(name string) int {
-	i := slices.Index(t.names, name)
-	switch {
-	case i < 0:
-		t.err = fmt.Errorf("barm: the template has no argument or IdentSlot named %q", name)
-	case i >= 64:
-		t.err = fmt.Errorf("barm: the template's %q comes after the 64 names Ident and Param can fill", name)
-	case t.filled&(1<<i) != 0:
-		t.err = fmt.Errorf("barm: the template's %q was filled already", name)
-	default:
-		return i
-	}
-	return -1
+// Seq streams every row as R. See SelectQuery.Seq.
+func (t *Template[P, R]) Seq(ctx context.Context, args P) iter.Seq2[R, error] {
+	return Run[P, R]{t: t}.SeqAs[R](ctx, args)
 }
-
-// Param returns the template with the arguments params name bound to the
-// values they give once, so With no longer takes them, leaving t as it was. A
-// value every call shares, a batch's author say, stops costing each call its
-// place in With's arguments:
-//
-//	byAuthor := insertPost.Param(barm.Named("author", author), barm.Named("status", "draft"))
-//
-// The copy costs far more than a place in With, so a value that changes per
-// call goes to With.
-func (t Template[T]) Param(params ...sql.NamedArg) Template[T] {
-	t.param(params)
-	return t
-}
-
-// param writes each of params wherever its name binds, and marks the names
-// filled, in one copy of the arguments.
-func (t *Template[T]) param(params []sql.NamedArg) {
-	if t.err != nil || len(params) == 0 {
-		return
-	}
-	var now uint64
-	for _, p := range params {
-		i := t.fillable(p.Name)
-		if i < 0 {
-			return
-		}
-		if slices.Contains(t.inames, i) {
-			t.err = fmt.Errorf("barm: the template's %q is an IdentSlot, which Ident fills", p.Name)
-			return
-		}
-		t.filled |= 1 << i
-		now |= 1 << i
-	}
-	t.args = slices.Clone(t.args)
-	slots := make([]slot, 0, len(t.slots))
-	for _, sl := range t.slots {
-		if now&(1<<sl.name) == 0 {
-			slots = append(slots, sl)
-			continue
-		}
-		for _, p := range params {
-			if p.Name == t.names[sl.name] {
-				t.args[sl.at] = p.Value
-				break
-			}
-		}
-	}
-	t.slots = slots
-}
-
-// InsertTemplate is an insert's Template, which takes the row it writes as T
-// and reads what it returns as U:
-//
-//	var insertUser = qb.Insert[User]().TemplateAs[User]()
-//
-//	u, err := insertUser.Values(&User{Name: "ann"}).Via(db).One(ctx)
-//
-// Its columns are those the insert would write for a row setting every one: a
-// column with a default only when Column names it, and then written as given,
-// zero or not.
-type InsertTemplate[T, U any] struct{ Template[U] }
-
-// Prepare is Template.Prepare for an insert's template.
-func (t *InsertTemplate[T, U]) Prepare(name string) *InsertTemplate[T, U] {
-	c := *t
-	c.name = name
-	return &c
-}
-
-// Ident is Template.Ident for an insert's template.
-func (t InsertTemplate[T, U]) Ident(idents ...sql.NamedArg) InsertTemplate[T, U] {
-	t.ident(idents)
-	return t
-}
-
-// Param is Template.Param for an insert's template.
-func (t InsertTemplate[T, U]) Param(params ...sql.NamedArg) InsertTemplate[T, U] {
-	t.param(params)
-	return t
-}
-
-// Values returns the query writing row, with each named argument bound to the
-// value args gives its name. The row is read as it binds, so a change to it
-// after that is not written.
-func (t *InsertTemplate[T, U]) Values(row *T, args ...sql.NamedArg) *Bound[U] {
-	return &Bound[U]{t: &t.Template, args: args, row: row}
-}
-
-// bind fills the named arguments in with args, and the row's columns with
-// row's, encoded for the session they run in, and returns the SQL its
-// IdentSlots take.
-func (t *Template[T]) bind(s *session, args []sql.NamedArg, row any) (string, []any, error) {
-	if t.err != nil {
-		return "", nil, t.err
-	}
-	rv := reflect.ValueOf(row)
-	switch {
-	case len(t.row) > 0 && (row == nil || rv.IsNil()):
-		return "", nil, errors.New("barm: the template writes a row, which Values gives")
-	case len(t.row) == 0 && row != nil:
-		return "", nil, errors.New("barm: the template writes no row of its own, so Values takes none")
-	}
-	if want := len(t.names) - bits.OnesCount64(t.filled); len(args) != want {
-		return "", nil, fmt.Errorf("barm: the template takes %d named arguments, With was given %d", want, len(args))
-	}
-	// which of args each name takes; with as many arguments as names, a name
-	// given once each means none is missing
-	var buf [8]int
-	given := buf[:0]
-	if len(t.names) > len(buf) {
-		given = make([]int, 0, len(t.names))
-	}
-	given = given[:len(t.names)]
-	for i := range given {
-		given[i] = -1
-	}
-	for k, arg := range args {
-		i := slices.Index(t.names, arg.Name)
-		switch {
-		case i < 0:
-			return "", nil, fmt.Errorf("barm: the template has no argument named %q", arg.Name)
-		case given[i] >= 0:
-			return "", nil, fmt.Errorf("barm: With was given %q twice", arg.Name)
-		case i < 64 && t.filled&(1<<i) != 0:
-			return "", nil, fmt.Errorf("barm: the template's %q was filled already, so With takes it no more", arg.Name)
-		}
-		given[i] = k
-	}
-	query := t.query
-	if len(t.idents) > 0 {
-		var err error
-		query, err = t.splice(args, given)
-		if err != nil {
-			return "", nil, err
-		}
-	}
-	out := slices.Clone(t.args)
-	for _, sl := range t.slots {
-		out[sl.at] = args[given[sl.name]].Value
-	}
-	if len(t.row) > 0 {
-		snap := snapshot(rv.Elem()) // one copy, however many columns come off it
-		for _, r := range t.row {
-			v, err := fieldArg(r.f, fieldValue(snap, r.f.index), s.nativeJSON, s.nativeArrays)
-			if err != nil {
-				return "", nil, err
-			}
-			out[r.at] = v
-		}
-	}
-	return query, out, nil
-}
-
-// splice writes the identifiers args gives into the SQL, its buffer sized up
-// front.
-func (t *Template[T]) splice(args []sql.NamedArg, given []int) (string, error) {
-	var vbuf [4]string
-	vals := vbuf[:0]
-	for _, i := range t.inames {
-		if given[i] < 0 { // filled by Ident, and in no slot left
-			vals = append(vals, "")
-			continue
-		}
-		v, err := identValue(args[given[i]])
-		if err != nil {
-			return "", err
-		}
-		vals = append(vals, v)
-	}
-	n := len(t.query)
-	for _, id := range t.idents {
-		n += len(vals[id.name]) + 2 // quoted; a quote or dot inside grows it
-	}
-
-	d := t.h.Dialect() // what the rest of the SQL was rendered for
-	b := make([]byte, 0, n)
-	prev := 0
-	for _, id := range t.idents {
-		b = append(b, t.query[prev:id.at]...)
-		b = d.AppendIdent(b, vals[id.name])
-		prev = id.at
-	}
-	b = append(b, t.query[prev:]...)
-	return unsafe.String(unsafe.SliceData(b), len(b)), nil
-}
-
-// identValue is the identifier an IdentSlot is given: a string, or an Ident.
-func identValue(a sql.NamedArg) (string, error) {
-	var v string
-	switch av := a.Value.(type) {
-	case string:
-		v = av
-	case ident:
-		v = string(av)
-	default:
-		return "", fmt.Errorf("barm: the template's IdentSlot %q takes a string, With gave %T", a.Name, a.Value)
-	}
-	if v == "" {
-		return "", fmt.Errorf("barm: the template's IdentSlot %q was given an empty name", a.Name)
-	}
-	return v, nil
-}
-
-// Bound is a Template's query with its arguments, see Template.
-type Bound[T any] struct {
-	t    *Template[T]
-	h    IDB // Via's, if it was called
-	args []sql.NamedArg
-	row  any // the *T an InsertTemplate writes, nil for any other
-}
-
-// Via runs the query on h. Without it the query runs on the handle in the ctx
-// its terminal is given, see WithIDB, or else where the template was started,
-// which for one built on a NewBuilder DB is nowhere. Unlike a builder's Via it
-// changes q, which With made for this one call.
-func (q *Bound[T]) Via(h IDB) *Bound[T] {
-	q.h = h
-	return q
-}
-
-// One reads the first row as T, or ErrNoRows.
-func (q *Bound[T]) One(ctx context.Context) (T, error) { return q.OneAs[T](ctx) }
-
-// Slice reads every row as T.
-func (q *Bound[T]) Slice(ctx context.Context) ([]T, error) { return q.SliceAs[T](ctx) }
-
-// Seq streams every row as T. See SelectQuery.Seq.
-func (q *Bound[T]) Seq(ctx context.Context) iter.Seq2[T, error] { return q.SeqAs[T](ctx) }
 
 // OneAs reads the first row as U, mapping the columns the query returns by
 // name, or ErrNoRows.
-func (q *Bound[T]) OneAs[U any](ctx context.Context) (U, error) {
-	h := q.on(ctx)
-	query, args, err := q.t.bind(h.sess(), q.args, q.row)
+func (t *Template[P, R]) OneAs[U any](ctx context.Context, args P) (U, error) {
+	return Run[P, R]{t: t}.OneAs[U](ctx, args)
+}
+
+// SliceAs reads every row as U, mapping the columns the query returns by name.
+func (t *Template[P, R]) SliceAs[U any](ctx context.Context, args P) ([]U, error) {
+	return Run[P, R]{t: t}.SliceAs[U](ctx, args)
+}
+
+// SeqAs streams every row as U, mapping the columns the query returns by name.
+func (t *Template[P, R]) SeqAs[U any](ctx context.Context, args P) iter.Seq2[U, error] {
+	return Run[P, R]{t: t}.SeqAs[U](ctx, args)
+}
+
+// Exec runs the query for its row count.
+func (t *Template[P, R]) Exec(ctx context.Context, args P) (sql.Result, error) {
+	return Run[P, R]{t: t}.Exec(ctx, args)
+}
+
+// Build returns the template's SQL with args bound, encoded for the handle the
+// template was started on: it takes no ctx to find another in.
+func (t *Template[P, R]) Build(args P) (string, []any, error) {
+	return t.bind(t.h.sess(), noescape(unsafe.Pointer(&args)), nil)
+}
+
+// Run is a Template running on the handle Via gave it.
+type Run[P, R any] struct {
+	t *Template[P, R]
+	h IDB
+}
+
+// One reads the first row as R, or ErrNoRows.
+func (r Run[P, R]) One(ctx context.Context, args P) (R, error) { return r.OneAs[R](ctx, args) }
+
+// Slice reads every row as R.
+func (r Run[P, R]) Slice(ctx context.Context, args P) ([]R, error) { return r.SliceAs[R](ctx, args) }
+
+// Seq streams every row as R. See SelectQuery.Seq.
+func (r Run[P, R]) Seq(ctx context.Context, args P) iter.Seq2[R, error] {
+	return r.SeqAs[R](ctx, args)
+}
+
+// OneAs reads the first row as U, mapping the columns the query returns by
+// name, or ErrNoRows.
+func (r Run[P, R]) OneAs[U any](ctx context.Context, args P) (U, error) {
+	h := r.on(ctx)
+	query, out, err := r.t.bind(h.sess(), noescape(unsafe.Pointer(&args)), nil)
 	if err != nil {
 		var zero U
 		return zero, err
 	}
-	rn := runner{h, q.t.name}
-	return rn.one[U](ctx, q.t.t, query, args)
+	rn := runner{h, r.t.name}
+	return rn.one[U](ctx, r.t.t, query, out)
 }
 
 // SliceAs reads every row as U, mapping the columns the query returns by name.
-func (q *Bound[T]) SliceAs[U any](ctx context.Context) ([]U, error) {
-	h := q.on(ctx)
-	query, args, err := q.t.bind(h.sess(), q.args, q.row)
+func (r Run[P, R]) SliceAs[U any](ctx context.Context, args P) ([]U, error) {
+	h := r.on(ctx)
+	query, out, err := r.t.bind(h.sess(), noescape(unsafe.Pointer(&args)), nil)
 	if err != nil {
 		return nil, err
 	}
-	rn := runner{h, q.t.name}
-	return rn.slice[U](ctx, q.t.t, query, args, 0)
+	rn := runner{h, r.t.name}
+	return rn.slice[U](ctx, r.t.t, query, out, 0)
 }
 
 // SeqAs streams every row as U, mapping the columns the query returns by name.
-func (q *Bound[T]) SeqAs[U any](ctx context.Context) iter.Seq2[U, error] {
-	h := q.on(ctx)
-	query, args, err := q.t.bind(h.sess(), q.args, q.row)
-	rn := runner{h, q.t.name}
-	return rn.seq[U](ctx, q.t.t, query, args, err)
+func (r Run[P, R]) SeqAs[U any](ctx context.Context, args P) iter.Seq2[U, error] {
+	h := r.on(ctx)
+	query, out, err := r.t.bind(h.sess(), noescape(unsafe.Pointer(&args)), nil)
+	rn := runner{h, r.t.name}
+	return rn.seq[U](ctx, r.t.t, query, out, err)
 }
 
 // Exec runs the query for its row count.
-func (q *Bound[T]) Exec(ctx context.Context) (sql.Result, error) {
-	h := q.on(ctx)
-	query, args, err := q.t.bind(h.sess(), q.args, q.row)
+func (r Run[P, R]) Exec(ctx context.Context, args P) (sql.Result, error) {
+	h := r.on(ctx)
+	query, out, err := r.t.bind(h.sess(), noescape(unsafe.Pointer(&args)), nil)
 	if err != nil {
 		return nil, err
 	}
-	rn := runner{h, q.t.name}
-	return rn.exec(ctx, q.t.t, query, args)
+	rn := runner{h, r.t.name}
+	return rn.exec(ctx, r.t.t, query, out)
 }
 
 // on is the handle the query runs on: Via's, else the one in ctx, else the
 // template's.
-func (q *Bound[T]) on(ctx context.Context) IDB {
-	if q.h != nil {
-		return q.h
+func (r Run[P, R]) on(ctx context.Context) IDB {
+	if r.h != nil {
+		return r.h
 	}
 	if h := IDBFrom(ctx); h != nil {
 		return h
 	}
-	return q.t.h
+	return r.t.h
 }
 
-// Build returns the template's SQL with the arguments bound, encoded for Via's
-// handle, or else the template's: it takes no ctx to find one in.
-func (q *Bound[T]) Build() (string, []any, error) {
-	h := q.h
-	if h == nil {
-		h = q.t.h
+// In returns the template queueing in b.
+func (t *Template[P, R]) In(b *Batch) Queue[P, R] { return Queue[P, R]{t, b} }
+
+// Queue is a Template queueing in the batch In gave it. Its arguments are
+// encoded for the batch's handle, and args is read before a call returns.
+type Queue[P, R any] struct {
+	t *Template[P, R]
+	b *Batch
+}
+
+// One queues the template with args and reads its first row as R, or ErrNoRows.
+func (q Queue[P, R]) One(args P) *BatchResult[R] {
+	query, out, err := q.t.bind(q.b.s, noescape(unsafe.Pointer(&args)), q.last())
+	return queueRow[R](q.b, q.t.t, q.t.name, query, out, err)
+}
+
+// Slice queues the template with args and collects its rows as R.
+func (q Queue[P, R]) Slice(args P) *BatchResult[[]R] {
+	query, out, err := q.t.bind(q.b.s, noescape(unsafe.Pointer(&args)), q.last())
+	return queueSlice[R](q.b, q.t.t, q.t.name, query, out, err, 0)
+}
+
+// Exec queues the template with args for its row count.
+func (q Queue[P, R]) Exec(args P) *BatchResult[ExecResult] {
+	query, out, err := q.t.bind(q.b.s, noescape(unsafe.Pointer(&args)), q.last())
+	return q.b.queueExec(q.t.t, q.t.name, query, out, err)
+}
+
+// last is where the batch keeps the SQL the template's IdentSlots took last,
+// for a template that has any.
+func (q Queue[P, R]) last() *spliced {
+	if len(q.t.idents) == 0 {
+		return nil
 	}
-	return q.buildIn(h.sess())
+	if q.b.last == nil {
+		q.b.last = new(spliced)
+	}
+	return q.b.last
 }
 
-// buildIn is Build for a batch, whose session the arguments are encoded for.
-func (q *Bound[T]) buildIn(s *session) (string, []any, error) {
-	return q.t.bind(s, q.args, q.row)
+// noescape hides p from escape analysis, so a P passed by value stays on its
+// caller's stack: bind reads it only while it runs, and reflect copies what it
+// boxes. It is the runtime's own trick, spelled so vet sees no uintptr turned
+// back into a pointer.
+func noescape(p unsafe.Pointer) unsafe.Pointer {
+	x := *(*uintptr)(unsafe.Pointer(&p))
+	return *(*unsafe.Pointer)(unsafe.Pointer(&x))
 }
 
-func (q *Bound[T]) stmtName() string { return q.t.name }
+// bind fills the query's arguments from the P at p, encoded for the session
+// they run in, and returns the SQL its IdentSlots take. A batch passes where it
+// keeps the SQL its last query from a template spliced.
+func (t *Template[P, R]) bind(s *session, p unsafe.Pointer, last *spliced) (string, []any, error) {
+	if t.err != nil {
+		return "", nil, t.err
+	}
+	query := t.query
+	if len(t.idents) > 0 {
+		var err error
+		query, err = t.splice(p, last)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	if len(t.binds) == 0 {
+		return query, t.args, nil // nothing reads into args but bind
+	}
+	args := slices.Clone(t.args)
+	for _, b := range t.binds {
+		fp := unsafe.Add(p, b.off)
+		switch b.kind {
+		case bindString:
+			args[b.at] = *(*string)(fp)
+		case bindInt64:
+			args[b.at] = *(*int64)(fp)
+		case bindInt:
+			args[b.at] = *(*int)(fp)
+		case bindInt32:
+			args[b.at] = *(*int32)(fp)
+		case bindBool:
+			args[b.at] = *(*bool)(fp)
+		case bindFloat64:
+			args[b.at] = *(*float64)(fp)
+		case bindTime:
+			args[b.at] = *(*time.Time)(fp)
+		case bindBytes:
+			args[b.at] = *(*[]byte)(fp)
+		default:
+			v, err := fieldArg(b.f, fieldValue(reflect.NewAt(t.ptyp, p).Elem(), b.f.index), s.nativeJSON, s.nativeArrays)
+			if err != nil {
+				return "", nil, err
+			}
+			args[b.at] = v
+		}
+	}
+	return query, args, nil
+}
 
-func (*Bound[T]) render(*builder) error { return errTemplateNested }
-func (q *Bound[T]) argCount() int       { return len(q.t.args) }
-func (q *Bound[T]) target() target      { return q.t.t }
+// spliced is the SQL a batch's last query from a template took, kept while
+// its identifiers repeat so the next one takes it rather than splice a copy.
+type spliced struct {
+	t     unsafe.Pointer
+	vals  [4]string
+	query string
+}
+
+// splice writes the identifiers the P at p gives into the SQL, its buffer
+// sized up front, or takes last's SQL when it was spliced from the same ones.
+func (t *Template[P, R]) splice(p unsafe.Pointer, last *spliced) (string, error) {
+	var buf [4]string
+	vals := buf[:0]
+	if len(t.idents) > len(buf) {
+		vals = make([]string, 0, len(t.idents))
+		last = nil
+	}
+	n := len(t.query)
+	for _, id := range t.idents {
+		var v string
+		if id.kind == bindString {
+			v = *(*string)(unsafe.Add(p, id.off))
+		} else {
+			v = fieldValue(reflect.NewAt(t.ptyp, p).Elem(), id.f.index).String()
+		}
+		if v == "" {
+			return "", fmt.Errorf("barm: the template's IdentSlot %q was given an empty name", id.f.name)
+		}
+		vals = append(vals, v)
+		n += len(v) + 2 // quoted; a quote or dot inside grows it
+	}
+	if last != nil && last.t == unsafe.Pointer(t) && slices.Equal(last.vals[:len(vals)], vals) {
+		return last.query, nil
+	}
+	d := t.h.Dialect() // what the rest of the SQL was rendered for
+	b := make([]byte, 0, n)
+	prev := 0
+	for i, id := range t.idents {
+		b = append(b, t.query[prev:id.at]...)
+		b = d.AppendIdent(b, vals[i])
+		prev = id.at
+	}
+	b = append(b, t.query[prev:]...)
+	query := unsafe.String(unsafe.SliceData(b), len(b))
+	if last != nil {
+		last.t, last.query = unsafe.Pointer(t), query
+		copy(last.vals[:], vals)
+	}
+	return query, nil
+}

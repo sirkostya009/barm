@@ -112,7 +112,10 @@ type Batch struct {
 	// connection. They load then, a depth at a time across every query.
 	rels  []relLoad
 	hooks *batchHooks
-	err   error
+	// last is the SQL a template's IdentSlots took for the batch's last query
+	// from it, made with the first such query.
+	last *spliced
+	err  error
 }
 
 // batchHooks are a batch's hooks, with the target of each query queued. They sit
@@ -314,10 +317,10 @@ type asQuery interface {
 	batchAs(m *model, err error, one bool) (string, []any, error)
 }
 
-func buildAs[U any](s *session, q Query, one bool) (string, []any, error) {
+func buildAs[U any](q Query, one bool) (string, []any, error) {
 	a, ok := q.(asQuery)
 	if !ok {
-		return buildIn(s, q)
+		return q.Build()
 	}
 	m, err := modelOf[U]()
 	return a.batchAs(m, err, one)
@@ -332,14 +335,14 @@ func buildAs[U any](s *session, q Query, one bool) (string, []any, error) {
 //
 // A select's relations load through One, so they are an error here.
 func (b *Batch) OneAs[U any](q Query) *BatchResult[U] {
-	query, args, err := buildAs[U](b.s, q, true)
+	query, args, err := buildAs[U](q, true)
 	return queueRow[U](b, targetOf(q), stmtName(q), query, args, err)
 }
 
 // SliceAs queues any query and collects its rows as U, rendered as OneAs
 // renders it, without the LIMIT.
 func (b *Batch) SliceAs[U any](q Query) *BatchResult[[]U] {
-	query, args, err := buildAs[U](b.s, q, false)
+	query, args, err := buildAs[U](q, false)
 	return queueSlice[U](b, targetOf(q), stmtName(q), query, args, err, 0)
 }
 
@@ -486,19 +489,8 @@ func (b *Batch) Exec(q Query) *BatchResult[ExecResult] {
 	if w, ok := q.(returningWrite); ok && w.hasReturning() {
 		return b.queueReturning(q, w)
 	}
-	query, args, err := buildIn(b.s, q)
+	query, args, err := q.Build()
 	return b.queueExec(targetOf(q), stmtName(q), query, args, err)
-}
-
-// buildIn builds q for a batch in session s, which a template's arguments are
-// encoded for.
-func buildIn(s *session, q Query) (string, []any, error) {
-	if t, ok := q.(interface {
-		buildIn(*session) (string, []any, error)
-	}); ok {
-		return t.buildIn(s)
-	}
-	return q.Build()
 }
 
 // stmtName is the name q was given to Prepare, if any.

@@ -1154,128 +1154,126 @@ sequential   547 µs/op     3.2× slower
 
 A query that runs again and again with different values gets built each time: two builders
 and the SQL text, per call, only to throw them away. A template renders it once and keeps
-only the SQL, with where each value goes. A named argument with no value (`sql.Named`, or
-`barm.Named` to skip importing `database/sql`) stands for each, and `With` binds them by
-name. Built on a `NewBuilder` DB, a template needs no connection, so it can live at package
-level and run on whatever handle `Via` names:
+only the SQL, with where each value goes. `barm.Param(name)` stands for each, and every call
+fills them from a struct `P` whose tags name them. Built on a `NewBuilder` DB, a template
+needs no connection, so it can live at package level:
 
 ```go
 var qb = barm.NewBuilder(barm.Postgres)
 
-var insertPost = qb.Insert[CreatePost]().Table("posts").Select(
-	qb.Select[User]().ColumnExpr("u.id, ?, ?", barm.Named("title", nil), barm.Named("body", nil)).
-		Where("u.id = ?", barm.Named("author", nil))).TemplateAs[Post]()
+type NewPost struct {
+	Author int64  `barm:"author"`
+	Title  string `barm:"title"`
+	Body   string `barm:"body"`
+}
 
-func (r *posts) Insert(ctx context.Context, p CreatePost) (Post, error) {
-	return insertPost.With(barm.Named("title", p.Title), barm.Named("body", p.Body),
-		barm.Named("author", p.AuthorID)).Via(r.handle(ctx)).One(ctx)
+var insertPost = qb.Insert[CreatePost]().Table("posts").Select(
+	qb.Select[User]().ColumnExpr("u.id, ?, ?", barm.Param("title"), barm.Param("body")).
+		Where("u.id = ?", barm.Param("author"))).TemplateAs[NewPost, Post]()
+
+func (r *posts) Insert(ctx context.Context, p NewPost) (Post, error) {
+	return insertPost.Via(r.handle(ctx)).One(ctx, p)
 }
 ```
 
-In a batch, a bound template queues as any query does, so a loop pays for its arguments
-alone:
+Binding costs what writing the argument list out by hand does: each field is read through
+its offset, mapped once when the template was made, and `P` stays on the caller's stack. In a
+batch, `In(b)` queues a template with its `P` through `One`, `Slice` and `Exec`, so a loop
+pays for its arguments alone:
 
 ```go
 b := db.Batch()
 for _, p := range posts {
-	rows = append(rows, b.OneAs[Post](insertPost.With(
-		barm.Named("title", p.Title), barm.Named("body", p.Body), barm.Named("author", p.AuthorID))))
+	rows = append(rows, insertPost.In(b).One(p))
 }
 ```
 
-- **The shape is fixed when it renders.** `Template` renders the query as written, and
-  `TemplateAs[U]` as `BuildAs[U]` does: a select narrowed to U's columns, a write returning
-  them. Reading it later maps whatever columns that SQL returns, by name. `One` adds no
-  `LIMIT`. For two result types, make two templates:
+- **A field binds as a model's column does,** its `json`, `array` and `nullzero` tags
+  included, and fields no name takes are left alone. A name `P` has no field for fails the
+  template, and every call reports it. The same name used twice takes its value in both
+  places.
+- **The shape is fixed when it renders.** `Template[P]` renders the query as written, and
+  `TemplateAs[P, U]` as `BuildAs[U]` does: a select narrowed to U's columns, a write
+  returning them. Reading it later maps whatever columns that SQL returns, by name. `One`
+  adds no `LIMIT`. For two result types, make two templates:
 
   ```go
-  func base() *barm.SelectQuery[User] { return qb.Select[User]().Where("age > ?", barm.Named("age", nil)) }
+  func base() *barm.SelectQuery[User] { return qb.Select[User]().Where("age > ?", barm.Param("age")) }
 
-  var namesOver = base().TemplateAs[UserName]()
-  var usersOver = base().TemplateAs[User]()
+  var namesOver = base().TemplateAs[AgeArgs, UserName]()
+  var usersOver = base().Template[AgeArgs]()
   ```
 
   A template keeps nothing of its builder, so a builder made only to be templated is
   garbage once it is.
-- **An insert with no values of its own writes the row `Values` gives.** Its template is an
-  `InsertTemplate[T, U]`: rows go in as `T`, and what it returns reads as `U`. It encodes
-  the row's `json`, `array` and `nullzero` fields for the handle it runs on, as the builder
-  does:
+- **An insert with no values of its own writes `P` as its row.** Each column binds from the
+  field of `P` that column names, so the insert's own type works as `P`, and so does a
+  struct embedding it beside the fields its `Param`s take. It encodes the row's `json`,
+  `array` and `nullzero` fields for the handle it runs on, as the builder does:
 
   ```go
-  var insertUser = qb.Insert[User]().TemplateAs[User]()
+  var insertUser = qb.Insert[User]().TemplateAs[User, User]()
 
-  u, err := insertUser.Values(&User{Name: "ann", Email: "a@x.io"}).Via(db).One(ctx)
+  u, err := insertUser.Via(db).One(ctx, User{Name: "ann", Email: "a@x.io"})
+
+  type Upsert struct {
+  	User
+  	Rename string `barm:"rename"`
+  }
 
   var upsertUser = qb.Insert[User]().On("CONFLICT (email) DO UPDATE").
-  	Set("name = ?", barm.Named("name", nil)).Template()
-
-  _, err = upsertUser.Values(&u, barm.Named("name", "bo")).Via(db).Exec(ctx)
+  	Set("name = ?", barm.Param("rename")).Template[Upsert]()
   ```
 
   It writes one row per call: a batch queueing it per row writes many. Its columns are
   those the builder would write for a row setting every one, so a column with a default is
   written only when `Column` names it, and then written as given, zero or not.
-- **A bound template has `One`, `Slice`, `Seq`, their `As` forms, and `Exec`.** A raw
-  query's template is a `Template[any]`: it has no row type of its own, so it reads through
-  `OneAs`, `SliceAs` and `SeqAs`.
+- **A template has `One`, `Slice`, `Seq`, their `As` forms, and `Exec`,** each taking `P`.
+  A template with nothing to bind takes `struct{}`, `Template[struct{}]()`, and costs nothing
+  to build: its arguments are the ones it rendered.
+  A raw query's `Template[P]` has no row type of its own, so it reads through `OneAs`,
+  `SliceAs` and `SeqAs`, or is made with `TemplateAs[P, U]`.
 - **It runs on `Via`'s handle, else the one its ctx carries, else where its query was
   started.** See [the handle in ctx](#the-handle-in-ctx). On a `NewBuilder` DB that last is
   nowhere, and it reports `ErrNoConn`. The handle should speak the dialect the template was
-  built for. `Build` takes no ctx, so it encodes for `Via`'s handle or the template's.
-- **`barm.IdentSlot` leaves an identifier to `With`,** a schema say, which it writes quoted
-  as `Ident` would, binding nothing:
+  built for. `Build(p)` takes no ctx, so it encodes for the template's handle.
+- **`barm.IdentSlot` leaves an identifier to `P`,** a schema say, which it writes quoted
+  as `Ident` would, binding nothing. Its field is a string, or any type whose kind is one.
+  A slot goes wherever an identifier does: `Schema` on any builder takes one as it takes a
+  name, and so does an insert's, update's or delete's `Table`, so the model's table and alias
+  need not be written out to qualify them:
 
   ```go
-  var postsBy = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
-  	Where("p.author_id = ?", barm.Named("author", nil)).Template()
+  type ByAuthor struct {
+  	Schema string `barm:"schema"`
+  	Author int64  `barm:"author"`
+  }
 
-  posts, err := postsBy.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
+  var postsBy = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
+  	Where("p.author_id = ?", barm.Param("author")).Template[ByAuthor]()
+
+  posts, err := postsBy.Via(db).Slice(ctx, ByAuthor{Schema: tenant, Author: id})
   ```
 
   The identifier is spliced into the SQL on every call, which costs one allocation the
-  size of the query. Each value is SQL of its own, and a `Prepare` name binds to one SQL
-  text, so a prepared template with a slot needs a name per value. `Prepare` on the
-  template returns a copy under another name, leaving the template as it was:
+  size of the query. A batch takes the SQL its last query from the same template spliced
+  again while the identifiers repeat, so a batch for one tenant pays for it once. Each value
+  is SQL of its own, and a `Prepare` name binds to one SQL text, so a prepared template with
+  a slot needs a name per value. `Prepare` returns a copy under another name, leaving the
+  template as it was:
 
   ```go
-  postsBy.Prepare("posts_by_" + tenant).With(barm.Named("schema", tenant), ...)
+  postsBy.Prepare("posts_by_" + tenant).Slice(ctx, ByAuthor{Schema: tenant, ...})
   ```
 
   pgx keeps 512 statements per connection by default, so schemas × templates past that
   evict each other. A database with that many schemas is better served by
   `SET LOCAL search_path` in each transaction.
-
-  A slot goes wherever an identifier does: `Schema` on any builder takes one as it takes
-  a name, and so does an insert's, update's or delete's `Table`, so the model's table and
-  alias need not be written out to qualify them. `Ident` fills a slot once and returns a
-  template with it spliced, leaving the template as it was, so a batch for one tenant
-  pays for each row's values alone:
-
-  ```go
-  var insertPost = qb.Insert[CreatePost]().Schema(barm.IdentSlot("schema")).TemplateAs[Post]()
-
-  posts := insertPost.Ident(barm.Named("schema", tenant))
-  for _, p := range rows {
-  	b.OneAs[Post](posts.Values(&p))
-  }
-  ```
-- **`Param` binds arguments once,** as `Ident` fills slots: it returns a template that
-  no longer takes those names, leaving the template as it was. A value every query in a
-  batch shares stops costing each one its place in `With`:
-
-  ```go
-  posts := insertIfAuthor.Ident(barm.Named("schema", tenant)).
-  	Param(barm.Named("author", author), barm.Named("status", "draft"))
-  ```
-
-- **`With` takes every name once,** in any order. A name used twice in the query takes its
-  value in both places. A missing, unknown or repeated name fails that query.
 - **Relations do not load through a template,** so a select asking for them fails to
   become one, and `Exec` scans no `RETURNING` rows back, since the template has no values
   of its own to scan them into.
-- **A template runs on its own.** One nested in another query is an error, and so is a
-  query with a named argument built any way but through a template.
+- **A `Param` binds only through a template.** A query holding one built any other way is
+  an error.
 - **A template never changes,** so it is safe for any number of goroutines at once.
 
 ### Batches in transactions
@@ -1565,8 +1563,8 @@ ctx = barm.WithIDB(ctx, tx)
 
 Two things read it, and nothing else:
 
-- **A bound template with no `Via`** runs on it, so a package-level template joins the
-  caller's transaction: `insertPost.With(...).One(ctx)`.
+- **A template run with no `Via`** runs on it, so a package-level template joins the
+  caller's transaction: `insertPost.One(ctx, p)`.
 - **`HandleFrom(ctx, fallback)`** returns it as a `Handle`, or the fallback when ctx carries
   none, for starting a builder:
 

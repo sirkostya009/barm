@@ -199,15 +199,14 @@ func (r *fakeDriverRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// A template run straight off With, which needs nothing of the bound query
-// once it returns.
+// A template run with its P, which needs nothing of P once it returns.
 func BenchmarkTemplateOne(b *testing.B) {
 	db := barm.New(barm.SQL(sql.OpenDB(fakeConnector{rows: 1}), barm.Postgres))
-	tp := db.Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	tp := db.Select[User]().Where("id = ?", barm.Param("id")).Template[idIn]()
 	ctx := b.Context()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, err := tp.With(barm.Named("id", 7)).One(ctx)
+		_, err := tp.One(ctx, idIn{7})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -215,10 +214,10 @@ func BenchmarkTemplateOne(b *testing.B) {
 }
 
 func BenchmarkTemplateBuild(b *testing.B) {
-	tp := barm.NewBuilder(barm.Postgres).Select[User]().Where("id = ?", barm.Named("id", nil)).Template()
+	tp := barm.NewBuilder(barm.Postgres).Select[User]().Where("id = ?", barm.Param("id")).Template[idIn]()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _, err := tp.With(barm.Named("id", 7)).Build()
+		_, _, err := tp.Build(idIn{7})
 		if err != nil {
 			b.Fatal(err)
 		}

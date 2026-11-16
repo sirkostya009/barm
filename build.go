@@ -7,7 +7,6 @@
 package barm
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,8 +57,8 @@ type builder struct {
 	// idents is where each IdentSlot sits in the SQL, reported the same way.
 	idents []identAt
 	dedup  bool
-	// named says an argument is a sql.NamedArg, which binds only through a
-	// Template: done reports it, with the query, for a template to take.
+	// named says an argument is a Param, which binds only through a Template:
+	// done reports it, with the query, for a template to take.
 	named bool
 	// Leave json, or array, values to the driver.
 	nativeJSON, nativeArrays bool
@@ -172,7 +171,7 @@ func (b *builder) placeholder(v any) *builder { //nolint:unparam // kept for cha
 	if b.dedup {
 		return b.placeholderDedup(v)
 	}
-	if _, ok := v.(sql.NamedArg); ok {
+	if _, ok := v.(param); ok {
 		b.named = true
 	}
 	b.args = append(b.args, v)
@@ -189,7 +188,7 @@ func (b *builder) placeholderDedup(v any) *builder {
 			return b.placeholderAt(n)
 		}
 	}
-	if _, ok := v.(sql.NamedArg); ok {
+	if _, ok := v.(param); ok {
 		b.named = true
 	}
 	b.args = append(b.args, v)
@@ -370,14 +369,13 @@ func Ident(name string) any { return ident(name) }
 // argument instead, or in Ident.
 func Safe(sql string) any { return safe(sql) }
 
-// IdentSlot stands where an identifier goes in a Template, which With fills by
-// name as Ident would. It goes wherever an identifier does: in SQL as an
-// argument, or to a builder's Schema, or a write's Table:
+// IdentSlot stands where an identifier goes in a Template, filled from the
+// string field of P its tag names, quoted as Ident would. It goes wherever an
+// identifier does: in SQL as an argument, or to a builder's Schema, or a
+// write's Table:
 //
-//	var byAuthor = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
-//		Where("p.author_id = ?", barm.Named("author", nil)).Template()
-//
-//	byAuthor.With(barm.Named("schema", tenant), barm.Named("author", id)).Via(db).Slice(ctx)
+//	var postsBy = qb.Select[Post]().Schema(barm.IdentSlot("schema")).
+//		Where("p.author_id = ?", barm.Param("author")).Template[ByAuthor]()
 //
 // It binds no argument. The identifier is spliced into the template's SQL on
 // every call.
@@ -411,7 +409,7 @@ type identAt struct {
 type identSlotsError []identAt
 
 func (identSlotsError) Error() string {
-	return "barm: an IdentSlot is filled only through a Template's With"
+	return "barm: an IdentSlot is filled only through a Template"
 }
 
 type tuple struct{ v any }

@@ -85,18 +85,18 @@ func (q *InsertQuery[T]) Prepare(name string) *InsertQuery[T] {
 	return q
 }
 
-// Template renders the query once, to run again with new values: a row given
-// to Values when the query has none of its own, and its named arguments. See
-// Template.
-func (q *InsertQuery[T]) Template() *InsertTemplate[T, T] {
+// Template renders the query once, to run again with P as its row when it
+// has none of its own, and its Params and IdentSlots filled from P's fields.
+// See Template.
+func (q *InsertQuery[T]) Template[P any]() *Template[P, T] {
 	query, args, err := q.templated().Build()
-	return &InsertTemplate[T, T]{newTemplate[T](q.runner, q.target(), query, args, err)}
+	return newTemplate[P, T](q.runner, q.target(), query, args, err)
 }
 
 // TemplateAs is Template rendered as BuildAs does, returning U's columns.
-func (q *InsertQuery[T]) TemplateAs[U any]() *InsertTemplate[T, U] {
+func (q *InsertQuery[T]) TemplateAs[P, U any]() *Template[P, U] {
 	query, args, err := q.templated().BuildAs[U]()
-	return &InsertTemplate[T, U]{newTemplate[U](q.runner, q.target(), query, args, err)}
+	return newTemplate[P, U](q.runner, q.target(), query, args, err)
 }
 
 // templated is the query a template renders: one row to be given, unless it

@@ -101,20 +101,19 @@ func (q *UpdateQuery[T]) Prepare(name string) *UpdateQuery[T] {
 	return q
 }
 
-// Template renders the query once, to run again with new values for its named
-// arguments. See Template.
-func (q *UpdateQuery[T]) Template() *Template[T] {
+// Template renders the query once, to run again with its Params and
+// IdentSlots filled from the fields of a P. See Template.
+func (q *UpdateQuery[T]) Template[P any]() *Template[P, T] {
 	query, args, err := q.Build()
-	tp := newTemplate[T](q.runner, q.target(), query, args, err)
-	return &tp
+	return newTemplate[P, T](q.runner, q.target(), query, args, err)
 }
 
-// TemplateAs renders the query once as BuildAs does, to run again with new
-// values for its named arguments, its rows read as U. See Template.
-func (q *UpdateQuery[T]) TemplateAs[U any]() *Template[U] {
+// TemplateAs renders the query once as BuildAs does, returning U's columns,
+// to run again with its Params and IdentSlots filled from the fields of a P.
+// See Template.
+func (q *UpdateQuery[T]) TemplateAs[P, U any]() *Template[P, U] {
 	query, args, err := q.BuildAs[U]()
-	tp := newTemplate[U](q.runner, q.target(), query, args, err)
-	return &tp
+	return newTemplate[P, U](q.runner, q.target(), query, args, err)
 }
 
 // Value binds the struct whose columns are written. It picks no rows: that is
